@@ -1,6 +1,6 @@
 "use client";
 
-import { Component, useCallback, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
 import {
   Area,
   AreaChart,
@@ -18,46 +18,59 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  Bookmark,
+  Briefcase,
   CheckCircle2,
   ClipboardList,
   Download,
   FileText,
+  Home,
   Info,
   Loader2,
+  Lock,
+  MessageSquareText,
   Plus,
+  Send,
   ShieldAlert,
+  ShieldCheck,
+  Sparkles,
   Trash2,
   Trophy,
   Upload,
   X,
 } from "lucide-react";
-import { clsx } from "clsx";
-import { twMerge } from "tailwind-merge";
 import {
-  BUSINESS_TYPES,
+  BUSINESS_ONLY_TYPES,
   BUSINESS_TYPE_LABELS,
   CATEGORY_TEMPLATES,
-  isFinancialAnalysis,
+  MODE_COPY,
+  PRICING,
+  applyScenario,
+  isAnalysisResponse,
+  modeOf,
   sum,
+  type AnalysisAccess,
+  type AnalysisResponse,
   type BusinessType,
   type FinancialAnalysis,
+  type SavedScenario,
+  type ScenarioBaseline,
+  type ScenarioPlan,
+  type ScenarioResult,
   type Severity,
+  type WorkspaceMode,
 } from "@/lib/schemas";
-
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-const cn = (...inputs: Parameters<typeof clsx>) => twMerge(clsx(inputs));
-
-const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
-const usdCompact = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 1 });
-const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
+import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
+import { useApp } from "@/components/AppProvider";
+import { ProfileMenu } from "@/components/ProfileMenu";
+import { LEGAL_DISCLAIMER } from "@/components/Footer";
+import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
 
 // Chart colors: validated categorical slots 1–3 for a dark surface.
-const COLOR = { revenue: "#3987e5", expenses: "#d95926", cash: "#199e70" } as const;
+const COLOR = { revenue: "#3987e5", expenses: "#d95926", cash: "#199e70", baseline: "#94a3b8" } as const;
 
-const glass = "rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.35)]";
+const PRIVACY_BADGE = "🔒 256-Bit Encrypted | Zero File Retention — Your financial data is parsed in memory and never stored.";
+const PENDING_UNLOCK_KEY = "lp:pendingUnlock";
 
 // ---------------------------------------------------------------------------
 // Error boundary
@@ -77,10 +90,7 @@ class PanelBoundary extends Component<{ title: string; children: ReactNode }, { 
         <div className={cn(glass, "p-6 text-sm text-slate-300")} role="alert">
           <p className="font-medium text-slate-100">{this.props.title} couldn&apos;t be displayed.</p>
           <p className="mt-1 text-slate-400">The rest of your dashboard is unaffected.</p>
-          <button
-            onClick={() => this.setState({ error: null })}
-            className="mt-3 rounded-lg border border-white/15 px-3 py-1.5 text-slate-200 hover:bg-white/10"
-          >
+          <button onClick={() => this.setState({ error: null })} className="mt-3 rounded-lg border border-white/15 px-3 py-1.5 text-slate-200 hover:bg-white/10">
             Try again
           </button>
         </div>
@@ -91,37 +101,171 @@ class PanelBoundary extends Component<{ title: string; children: ReactNode }, { 
 }
 
 // ---------------------------------------------------------------------------
+// Paywall plumbing
+// ---------------------------------------------------------------------------
+
+interface Paywall {
+  access: AnalysisAccess;
+  isPro: boolean;
+  busy: "report" | "pro" | "unlock" | null;
+  message: string | null;
+  checkout: (kind: "report" | "pro") => void;
+  unlock: () => void;
+}
+
+function safeSession<T>(fn: (s: Storage) => T): T | null {
+  try {
+    return fn(window.sessionStorage);
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
 type InputTab = "form" | "upload";
 
 export default function DashboardPage() {
+  const app = useApp();
+  const wsKey = app.activeWorkspace?.id ?? "guest";
+  const defaultMode: WorkspaceMode = app.activeWorkspace?.mode ?? (app.profile?.planCategory === "PERSONAL_FAMILY" ? "PERSONAL" : "BUSINESS");
+
+  const [modeByWs, setModeByWs] = useState<Record<string, WorkspaceMode>>({});
+  const mode = modeByWs[wsKey] ?? defaultMode;
+  const setMode = (m: WorkspaceMode) => setModeByWs((cur) => ({ ...cur, [wsKey]: m }));
+
+  // Results live in memory only, per workspace, for this browser tab.
+  const [results, setResults] = useState<Record<string, AnalysisResponse>>({});
+  const current = results[wsKey] ?? null;
+
   const [tab, setTab] = useState<InputTab>("form");
-  const [analysis, setAnalysis] = useState<FinancialAnalysis | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [paywallBusy, setPaywallBusy] = useState<Paywall["busy"]>(null);
+  const [paywallMsg, setPaywallMsg] = useState<string | null>(null);
+  const [pendingUnlock, setPendingUnlock] = useState<{ sealed: string; wsKey: string } | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
-  const runAnalysis = useCallback(async (init: RequestInit) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/analyze", { method: "POST", ...init });
-      const data: unknown = await res.json().catch(() => null);
-      if (!res.ok) {
-        const msg = data && typeof data === "object" && "error" in data ? String((data as { error: unknown }).error) : `Request failed (${res.status})`;
-        throw new Error(msg);
+  const { setUiHints, refreshProfile } = app;
+  useEffect(() => setUiHints({ mode, hasAnalysis: !!current }), [mode, current, setUiHints]);
+
+  // Returning from Stripe Checkout: offer to unlock the analysis that was run before leaving.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const stored = safeSession((s) => s.getItem(PENDING_UNLOCK_KEY));
+    if (params.get("checkout") === "success" && stored) {
+      let parsed: { sealed: string; wsKey: string } | null = null;
+      try {
+        parsed = JSON.parse(stored);
+      } catch {
+        /* ignore malformed */
       }
-      if (!isFinancialAnalysis(data)) throw new Error("Received an unexpected response from the analysis service.");
-      setAnalysis(data);
-      requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong.");
-    } finally {
-      setLoading(false);
+      // Refresh first so the new tier / unlock credit is reflected before we offer the unlock.
+      void refreshProfile().then(() => parsed?.sealed && setPendingUnlock(parsed));
     }
+    if (params.has("checkout")) window.history.replaceState(null, "", window.location.pathname);
+  }, [refreshProfile]);
+
+  const post = useCallback(async (init: RequestInit) => {
+    const auth = await authHeaders();
+    return fetch("/api/analyze", { method: "POST", ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...auth } });
   }, []);
+
+  const runAnalysis = useCallback(
+    async (init: RequestInit) => {
+      setLoading(true);
+      setError(null);
+      setPaywallMsg(null);
+      try {
+        const res = await post(init);
+        if (!res.ok) throw new Error(await errorMessage(res));
+        const data: unknown = await res.json();
+        if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
+        setResults((r) => ({ ...r, [wsKey]: data }));
+        requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Something went wrong.");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [post, wsKey],
+  );
+
+  const unlockSealed = useCallback(
+    async (sealed: string, targetWs: string) => {
+      setPaywallBusy("unlock");
+      setPaywallMsg(null);
+      try {
+        const res = await post({ headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "unlock", sealed }) });
+        if (res.status === 402) throw new Error("Your payment is still processing. Give it a few seconds and try again.");
+        if (!res.ok) throw new Error(await errorMessage(res));
+        const data: unknown = await res.json();
+        if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response.");
+        setResults((r) => ({ ...r, [targetWs]: data }));
+        safeSession((s) => s.removeItem(PENDING_UNLOCK_KEY));
+        setPendingUnlock(null);
+        void refreshProfile();
+      } catch (e) {
+        setPaywallMsg(e instanceof Error ? e.message : "Couldn't unlock.");
+      } finally {
+        setPaywallBusy(null);
+      }
+    },
+    [post, refreshProfile],
+  );
+
+  const checkout = useCallback(
+    async (kind: "report" | "pro") => {
+      if (!app.user) {
+        app.openAuth("signup");
+        return;
+      }
+      setPaywallBusy(kind);
+      setPaywallMsg(null);
+      try {
+        const res = await fetch("/api/billing/checkout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+          body: JSON.stringify({ kind }),
+        });
+        if (!res.ok) throw new Error(await errorMessage(res));
+        const { url } = (await res.json()) as { url?: string };
+        if (!url) throw new Error("Checkout is unavailable right now.");
+        // Keep only the encrypted token across the redirect — never the plaintext analysis.
+        if (current?.access.sealed) safeSession((s) => s.setItem(PENDING_UNLOCK_KEY, JSON.stringify({ sealed: current.access.sealed, wsKey })));
+        window.location.assign(url);
+      } catch (e) {
+        setPaywallMsg(e instanceof Error ? e.message : "Checkout failed.");
+        setPaywallBusy(null);
+      }
+    },
+    [app, current, wsKey],
+  );
+
+  const isPro = app.profile?.tier === "pro";
+  const paywall: Paywall | null = current
+    ? {
+        access: current.access,
+        isPro,
+        busy: paywallBusy,
+        message: paywallMsg,
+        checkout,
+        unlock: () => {
+          if (!app.user) return app.openAuth("signin");
+          if (current.access.sealed) void unlockSealed(current.access.sealed, wsKey);
+          else setPaywallMsg("Run the analysis again to unlock it.");
+        },
+      }
+    : null;
+
+  const analysis = current?.analysis ?? null;
+  const teaser = current?.access.level === "teaser";
+  const copy = MODE_COPY[mode];
+  const ws = app.activeWorkspace;
+  const formDefaultType: BusinessType = mode === "PERSONAL" ? "PERSONAL_FAMILY" : ws && ws.mode === "BUSINESS" ? ws.businessType : "REAL_ESTATE";
 
   return (
     <div className="relative min-h-screen overflow-x-hidden bg-slate-950 text-slate-100">
@@ -131,24 +275,59 @@ export default function DashboardPage() {
         <div className="absolute top-1/3 -right-24 h-[24rem] w-[24rem] rounded-full bg-emerald-500/10 blur-[120px]" />
       </div>
 
-      <main className="relative mx-auto max-w-7xl px-4 py-10 sm:px-6 lg:px-8">
-        <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+      <main className="relative mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <header className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <p className="text-sm font-medium tracking-wide text-indigo-300">LedgerPulse</p>
-            <h1 className="mt-1 text-3xl font-semibold tracking-tight">Cash flow &amp; runway forecast</h1>
+            <h1 className="mt-1 text-3xl font-semibold tracking-tight">{mode === "PERSONAL" ? "Household budget & savings forecast" : "Cash flow & runway forecast"}</h1>
             <p className="mt-2 max-w-2xl text-slate-400">
-              Enter your numbers or upload a bank statement / P&amp;L. We&apos;ll audit it and project the next 12 months with seasonality and inflation.
+              {mode === "PERSONAL"
+                ? "Enter your household income and spending or upload a bank statement. We'll audit your budget and project the next 12 months."
+                : "Enter your numbers or upload a bank statement / P&L. We'll audit it and project the next 12 months with seasonality and inflation."}
+            </p>
+            <p className="mt-3 inline-flex items-center gap-2 text-sm text-slate-300">
+              {ws ? (
+                <>
+                  {ws.mode === "PERSONAL" ? <Home className="h-4 w-4 text-slate-400" /> : <Briefcase className="h-4 w-4 text-slate-400" />}
+                  Workspace: <span className="font-medium text-slate-100">{ws.name}</span>
+                  <span className="text-slate-500">· {BUSINESS_TYPE_LABELS[ws.businessType]}</span>
+                </>
+              ) : (
+                <span className="text-slate-500">Guest workspace — sign in to save workspaces.</span>
+              )}
             </p>
           </div>
-          {analysis && (
-            <button
-              onClick={() => downloadExecutiveReport(analysis)}
-              className="inline-flex items-center gap-2 rounded-xl bg-indigo-500 px-4 py-2.5 text-sm font-medium text-white shadow-lg shadow-indigo-500/25 transition hover:bg-indigo-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-300"
-            >
-              <Download className="h-4 w-4" /> Download Executive Report
-            </button>
-          )}
+          <div className="flex items-center gap-3 self-end sm:self-start">
+            <ModeToggle mode={mode} onChange={setMode} />
+            <ProfileMenu />
+          </div>
         </header>
+
+        <div className="mb-6 flex items-start gap-2 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.07] px-4 py-2.5 text-sm text-emerald-100" role="note">
+          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />
+          <span>{PRIVACY_BADGE}</span>
+        </div>
+
+        {pendingUnlock && (
+          <div className="mb-6 flex flex-wrap items-center gap-3 rounded-xl border border-indigo-400/30 bg-indigo-500/10 px-4 py-3 text-sm" role="status">
+            <CheckCircle2 className="h-4 w-4 text-indigo-300" />
+            <span className="flex-1">Thanks for your purchase! Unlock the full audit for the analysis you ran before checkout.</span>
+            <button onClick={() => unlockSealed(pendingUnlock.sealed, pendingUnlock.wsKey)} disabled={paywallBusy === "unlock"} className={primaryBtn}>
+              {paywallBusy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} Unlock now
+            </button>
+            <button
+              onClick={() => {
+                safeSession((s) => s.removeItem(PENDING_UNLOCK_KEY));
+                setPendingUnlock(null);
+              }}
+              aria-label="Dismiss"
+              className="text-slate-400 hover:text-white"
+            >
+              <X className="h-4 w-4" />
+            </button>
+            {paywallMsg && <p className="w-full text-amber-200">{paywallMsg}</p>}
+          </div>
+        )}
 
         {/* Input selector: tabs on small screens, side-by-side on large */}
         <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden")}>
@@ -163,10 +342,7 @@ export default function DashboardPage() {
               role="tab"
               aria-selected={tab === key}
               onClick={() => setTab(key)}
-              className={cn(
-                "inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm transition",
-                tab === key ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200",
-              )}
+              className={cn("inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm transition", tab === key ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200")}
             >
               <Icon className="h-4 w-4" /> {label}
             </button>
@@ -176,12 +352,18 @@ export default function DashboardPage() {
         <section className="grid gap-6 lg:grid-cols-2">
           <div className={cn(tab !== "form" && "hidden lg:block")}>
             <PanelBoundary title="Guided form">
-              <GuidedForm disabled={loading} onSubmit={(payload) => runAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })} />
+              <GuidedForm
+                key={`${wsKey}-${mode}`}
+                mode={mode}
+                defaultType={formDefaultType}
+                disabled={loading}
+                onSubmit={(payload) => runAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })}
+              />
             </PanelBoundary>
           </div>
           <div className={cn(tab !== "upload" && "hidden lg:block")}>
             <PanelBoundary title="Statement upload">
-              <StatementUploader disabled={loading} onSubmit={runAnalysis} />
+              <StatementUploader key={`${wsKey}-${mode}`} mode={mode} disabled={loading} onSubmit={runAnalysis} />
             </PanelBoundary>
           </div>
         </section>
@@ -189,7 +371,7 @@ export default function DashboardPage() {
         {loading && (
           <div className={cn(glass, "mt-6 flex items-center gap-3 p-5 text-slate-300")} role="status">
             <Loader2 className="h-5 w-5 animate-spin text-indigo-300" />
-            Analyzing your financials — large statements can take a minute.
+            Analyzing in memory — large statements can take a minute.
           </div>
         )}
         {error && (
@@ -202,15 +384,41 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {analysis && (
+        {analysis && paywall && (
           <div ref={resultsRef} className="mt-10 scroll-mt-6 space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-xl font-semibold">Results</h2>
+              {teaser ? (
+                <button onClick={() => paywall.checkout("report")} className={cn(secondaryBtn, "text-slate-300")} title="Unlock the full audit to download">
+                  <Lock className="h-4 w-4" /> Download Executive PDF Report
+                </button>
+              ) : (
+                <button onClick={() => printExecutiveReport(analysis)} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
+                  <Download className="h-4 w-4" /> Download Executive PDF Report
+                </button>
+              )}
+            </div>
+
+            {teaser && <TeaserBanner paywall={paywall} />}
+
             <PanelBoundary title="Summary">
-              <KpiRow analysis={analysis} />
+              <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} />
             </PanelBoundary>
             <div className="grid gap-6 xl:grid-cols-3">
               <div className="space-y-6 xl:col-span-2">
                 <PanelBoundary title="Projection chart">
-                  <ProjectionCharts analysis={analysis} />
+                  {teaser ? (
+                    <LockedSection title="12-Month Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
+                  ) : (
+                    <ProjectionCharts analysis={analysis} />
+                  )}
+                </PanelBoundary>
+                <PanelBoundary title="Scenario forecasting">
+                  {isPro && !teaser ? (
+                    <ScenarioPanel analysis={analysis} workspaceId={ws?.id ?? null} />
+                  ) : (
+                    <LockedSection title="Interactive Scenario Forecasting" paywall={paywall} proOnly placeholder={<FakeScenarioChat mode={mode} />} />
+                  )}
                 </PanelBoundary>
                 <PanelBoundary title="Line items">
                   <LineItems analysis={analysis} />
@@ -218,16 +426,43 @@ export default function DashboardPage() {
               </div>
               <div className="space-y-6">
                 <PanelBoundary title="Audit Mode">
-                  <AuditPanel analysis={analysis} />
+                  <AuditPanel analysis={analysis} paywall={paywall} />
                 </PanelBoundary>
                 <PanelBoundary title="Winner insight">
-                  <WinnerCard analysis={analysis} />
+                  <WinnerCard analysis={analysis} label={copy.revenue} />
                 </PanelBoundary>
               </div>
             </div>
           </div>
         )}
       </main>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Mode toggle
+// ---------------------------------------------------------------------------
+
+function ModeToggle({ mode, onChange }: { mode: WorkspaceMode; onChange: (m: WorkspaceMode) => void }) {
+  return (
+    <div role="radiogroup" aria-label="Finance mode" className={cn(glass, "inline-flex rounded-xl p-1 text-sm")}>
+      {(
+        [
+          ["BUSINESS", "Business", Briefcase],
+          ["PERSONAL", "Personal", Home],
+        ] as const
+      ).map(([m, label, Icon]) => (
+        <button
+          key={m}
+          role="radio"
+          aria-checked={mode === m}
+          onClick={() => onChange(m)}
+          className={cn("inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 transition", mode === m ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200")}
+        >
+          <Icon className="h-4 w-4" /> {label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -261,36 +496,40 @@ const newId = () => nextId++;
 
 function templateRows(bt: BusinessType) {
   const t = CATEGORY_TEMPLATES[bt];
+  const essentials = t.expenses.filter((e) => e.essential);
+  // Custom businesses have no essentials: start with two blank lines to fill in.
+  const seed = bt === "OTHER_CUSTOM" ? [{ category: "" }, { category: "" }] : bt === "PERSONAL_FAMILY" ? t.expenses.slice(0, 6) : essentials;
   return {
-    revenue: t.revenue.slice(0, 2).map<FormRevenue>((label) => ({ id: newId(), label, amount: "", margin: "" })),
-    expenses: t.expenses.filter((e) => e.essential).map<FormExpense>((e) => ({ id: newId(), label: e.category, amount: "", category: e.category })),
+    revenue: t.revenue.slice(0, bt === "OTHER_CUSTOM" ? 1 : 2).map<FormRevenue>((label) => ({ id: newId(), label: bt === "OTHER_CUSTOM" ? "" : label, amount: "", margin: "" })),
+    expenses: seed.map<FormExpense>((e) => ({ id: newId(), label: e.category, amount: "", category: e.category })),
   };
 }
 
-const STEPS = ["Business", "Revenue", "Expenses", "Review"] as const;
+const STEPS = ["Type", "Income", "Expenses", "Review"] as const;
 
-function GuidedForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (p: FormPayload) => void }) {
+function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: WorkspaceMode; defaultType: BusinessType; disabled: boolean; onSubmit: (p: FormPayload) => void }) {
+  const personal = mode === "PERSONAL";
+  const copy = MODE_COPY[mode];
   const [step, setStep] = useState(0);
-  const [businessType, setBusinessType] = useState<BusinessType>("REAL_ESTATE");
-  const [revenue, setRevenue] = useState<FormRevenue[]>(() => templateRows("REAL_ESTATE").revenue);
-  const [expenses, setExpenses] = useState<FormExpense[]>(() => templateRows("REAL_ESTATE").expenses);
-  const [touchedType, setTouchedType] = useState(false);
+  const [businessType, setBusinessType] = useState<BusinessType>(defaultType);
+  const [revenue, setRevenue] = useState<FormRevenue[]>(() => templateRows(defaultType).revenue);
+  const [expenses, setExpenses] = useState<FormExpense[]>(() => templateRows(defaultType).expenses);
 
   const chooseType = (bt: BusinessType) => {
     setBusinessType(bt);
-    // Re-seed templates only until the user starts editing lines.
-    const pristine = [...revenue, ...expenses].every((r) => !r.amount);
-    if (pristine || !touchedType) {
+    // Re-seed templates only while no amounts have been entered.
+    if ([...revenue, ...expenses].every((r) => !r.amount)) {
       const rows = templateRows(bt);
       setRevenue(rows.revenue);
       setExpenses(rows.expenses);
     }
-    setTouchedType(true);
   };
 
+  const custom = businessType === "OTHER_CUSTOM";
   const validRevenue = revenue.filter((r) => r.label.trim() && Number(r.amount) > 0);
   const validExpenses = expenses.filter((e) => e.label.trim() && Number(e.amount) > 0);
   const canNext = step === 0 || (step === 1 ? validRevenue.length > 0 : true);
+  const stepLabels = STEPS.map((s, i) => (i === 0 ? (personal ? "Household" : "Business") : i === 1 ? copy.revenue : s));
 
   const submit = () =>
     onSubmit({
@@ -299,12 +538,13 @@ function GuidedForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (p: F
       revenue: validRevenue.map((r) => ({
         label: r.label.trim(),
         amount: Number(r.amount),
-        ...(r.margin !== "" && Number.isFinite(Number(r.margin)) ? { margin: Math.min(100, Math.max(0, Number(r.margin))) / 100 } : {}),
+        ...(!personal && r.margin !== "" && Number.isFinite(Number(r.margin)) ? { margin: Math.min(100, Math.max(0, Number(r.margin))) / 100 } : {}),
       })),
-      expenses: validExpenses.map((e) => ({ label: e.label.trim(), amount: Number(e.amount), category: e.category || "Uncategorized" })),
+      expenses: validExpenses.map((e) => ({ label: e.label.trim(), amount: Number(e.amount), category: e.category.trim() || "Uncategorized" })),
     });
 
   const categoryOptions = CATEGORY_TEMPLATES[businessType].expenses.map((e) => e.category);
+  const datalistId = `cats-${businessType}`;
 
   return (
     <div className={cn(glass, "flex h-full flex-col p-6")}>
@@ -314,7 +554,7 @@ function GuidedForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (p: F
       </div>
 
       <ol className="mt-5 flex gap-2" aria-label="Progress">
-        {STEPS.map((s, i) => (
+        {stepLabels.map((s, i) => (
           <li key={s} className="flex-1">
             <div className={cn("h-1 rounded-full", i <= step ? "bg-indigo-400" : "bg-white/10")} />
             <span className={cn("mt-1.5 block text-xs", i === step ? "text-slate-100" : "text-slate-500")}>{s}</span>
@@ -323,36 +563,48 @@ function GuidedForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (p: F
       </ol>
 
       <div className="mt-6 flex-1">
-        {step === 0 && (
-          <fieldset className="space-y-3">
-            <legend className="mb-2 text-sm text-slate-400">What kind of business is this?</legend>
-            {BUSINESS_TYPES.map((bt) => (
-              <label
-                key={bt}
-                className={cn(
-                  "flex cursor-pointer items-center gap-3 rounded-xl border p-4 transition",
-                  businessType === bt ? "border-indigo-400/60 bg-indigo-500/10" : "border-white/10 hover:bg-white/5",
-                )}
-              >
-                <input type="radio" name="bt" className="accent-indigo-400" checked={businessType === bt} onChange={() => chooseType(bt)} />
-                <span className="text-sm">{BUSINESS_TYPE_LABELS[bt]}</span>
-              </label>
-            ))}
-          </fieldset>
-        )}
+        {step === 0 &&
+          (personal ? (
+            <div className="space-y-3 text-sm">
+              <p className="text-slate-400">Personal Finance mode uses household categories and the 50/30/20 budgeting guideline.</p>
+              <div className="flex flex-wrap gap-2">
+                {CATEGORY_TEMPLATES.PERSONAL_FAMILY.expenses.map((e) => (
+                  <span key={e.category} className="rounded-md border border-white/10 bg-white/[0.03] px-2 py-1 text-xs text-slate-300">
+                    {e.category}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <fieldset className="space-y-3">
+              <legend className="mb-2 text-sm text-slate-400">What kind of business is this?</legend>
+              {BUSINESS_ONLY_TYPES.map((bt) => (
+                <label
+                  key={bt}
+                  className={cn("flex cursor-pointer items-center gap-3 rounded-xl border p-4 transition", businessType === bt ? "border-indigo-400/60 bg-indigo-500/10" : "border-white/10 hover:bg-white/5")}
+                >
+                  <input type="radio" name="bt" className="accent-indigo-400" checked={businessType === bt} onChange={() => chooseType(bt)} />
+                  <span className="text-sm">
+                    {BUSINESS_TYPE_LABELS[bt]}
+                    {bt === "OTHER_CUSTOM" && <span className="block text-xs text-slate-500">Define your own revenue and expense line items.</span>}
+                  </span>
+                </label>
+              ))}
+            </fieldset>
+          ))}
 
         {step === 1 && (
           <RowEditor
-            hint="Average monthly amounts. Margin is optional — we'll estimate it if blank."
-            columns={["Revenue stream", "Monthly $", "Margin %"]}
+            hint={personal ? "Average monthly take-home income from each source." : "Average monthly amounts. Margin is optional — we'll estimate it if blank."}
+            columns={personal ? [copy.revenueLines, "Monthly $"] : [copy.revenueLines, "Monthly $", "Margin %"]}
             rows={revenue}
             onAdd={() => setRevenue((r) => [...r, { id: newId(), label: "", amount: "", margin: "" }])}
             onRemove={(id) => setRevenue((r) => r.filter((x) => x.id !== id))}
             render={(row) => (
               <>
-                <TextInput aria-label="Revenue stream" value={row.label} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, label: v } : x)))} />
+                <TextInput aria-label={copy.revenueLines} value={row.label} placeholder={custom ? "e.g. Catering orders" : undefined} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, label: v } : x)))} />
                 <NumInput aria-label="Monthly amount" value={row.amount} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, amount: v } : x)))} />
-                <NumInput aria-label="Margin percent" value={row.margin} placeholder="auto" onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, margin: v } : x)))} />
+                {!personal && <NumInput aria-label="Margin percent" value={row.margin} placeholder="auto" onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, margin: v } : x)))} />}
               </>
             )}
           />
@@ -360,8 +612,14 @@ function GuidedForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (p: F
 
         {step === 2 && (
           <RowEditor
-            hint="We pre-filled the essentials for your business type. Leave a line at 0 if it truly doesn't apply — we'll flag it."
-            columns={["Expense", "Monthly $", "Category"]}
+            hint={
+              custom
+                ? "Add your own expense lines and name the categories however you like."
+                : personal
+                  ? "We pre-filled common household categories. Remove what doesn't apply."
+                  : "We pre-filled the essentials for your business type. Leave a line at 0 if it truly doesn't apply — we'll flag it."
+            }
+            columns={[personal ? "Spending" : "Expense", "Monthly $", "Category"]}
             rows={expenses}
             onAdd={() => setExpenses((r) => [...r, { id: newId(), label: "", amount: "", category: "" }])}
             onRemove={(id) => setExpenses((r) => r.filter((x) => x.id !== id))}
@@ -369,58 +627,61 @@ function GuidedForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (p: F
               <>
                 <TextInput aria-label="Expense" value={row.label} onChange={(v) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, label: v } : x)))} />
                 <NumInput aria-label="Monthly amount" value={row.amount} onChange={(v) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, amount: v } : x)))} />
-                <select
-                  aria-label="Category"
-                  value={row.category}
-                  onChange={(ev) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, category: ev.target.value } : x)))}
-                  className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-2 py-2 text-sm text-slate-100 focus:border-indigo-400 focus:outline-none"
-                >
-                  <option value="">Auto-classify</option>
-                  {categoryOptions.map((c) => (
-                    <option key={c}>{c}</option>
-                  ))}
-                  <option>Other</option>
-                </select>
+                {custom ? (
+                  <input
+                    aria-label="Category"
+                    list={datalistId}
+                    value={row.category}
+                    placeholder="Your category"
+                    onChange={(ev) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, category: ev.target.value } : x)))}
+                    className={cn(inputCls, "px-2")}
+                  />
+                ) : (
+                  <select
+                    aria-label="Category"
+                    value={row.category}
+                    onChange={(ev) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, category: ev.target.value } : x)))}
+                    className={cn(inputCls, "px-2")}
+                  >
+                    <option value="">Auto-classify</option>
+                    {categoryOptions.map((c) => (
+                      <option key={c}>{c}</option>
+                    ))}
+                    <option>Other</option>
+                  </select>
+                )}
               </>
             )}
           />
         )}
+        {custom && (
+          <datalist id={datalistId}>
+            {categoryOptions.map((c) => (
+              <option key={c} value={c} />
+            ))}
+          </datalist>
+        )}
 
         {step === 3 && (
           <dl className="space-y-3 text-sm">
-            <ReviewRow label="Business type" value={BUSINESS_TYPE_LABELS[businessType]} />
-            <ReviewRow label={`Revenue (${validRevenue.length} lines)`} value={usd.format(sum(validRevenue, (r) => Number(r.amount)))} />
-            <ReviewRow label={`Expenses (${validExpenses.length} lines)`} value={usd.format(sum(validExpenses, (e) => Number(e.amount)))} />
-            <ReviewRow
-              label="Net per month"
-              value={usd.format(sum(validRevenue, (r) => Number(r.amount)) - sum(validExpenses, (e) => Number(e.amount)))}
-            />
+            <ReviewRow label={personal ? "Mode" : "Business type"} value={BUSINESS_TYPE_LABELS[businessType]} />
+            <ReviewRow label={`${copy.revenue} (${validRevenue.length} lines)`} value={usd.format(sum(validRevenue, (r) => Number(r.amount)))} />
+            <ReviewRow label={`${copy.expenses} (${validExpenses.length} lines)`} value={usd.format(sum(validExpenses, (e) => Number(e.amount)))} />
+            <ReviewRow label={copy.net} value={usd.format(sum(validRevenue, (r) => Number(r.amount)) - sum(validExpenses, (e) => Number(e.amount)))} />
           </dl>
         )}
       </div>
 
       <div className="mt-6 flex items-center justify-between">
-        <button
-          onClick={() => setStep((s) => Math.max(0, s - 1))}
-          disabled={step === 0}
-          className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-white/5 disabled:opacity-30"
-        >
+        <button onClick={() => setStep((s) => Math.max(0, s - 1))} disabled={step === 0} className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-white/5 disabled:opacity-30">
           <ArrowLeft className="h-4 w-4" /> Back
         </button>
         {step < STEPS.length - 1 ? (
-          <button
-            onClick={() => setStep((s) => s + 1)}
-            disabled={!canNext}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 disabled:opacity-40"
-          >
+          <button onClick={() => setStep((s) => s + 1)} disabled={!canNext} className="inline-flex items-center gap-1.5 rounded-lg bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 disabled:opacity-40">
             Next <ArrowRight className="h-4 w-4" />
           </button>
         ) : (
-          <button
-            onClick={submit}
-            disabled={disabled || validRevenue.length === 0}
-            className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-400 disabled:opacity-50"
-          >
+          <button onClick={submit} disabled={disabled || validRevenue.length === 0} className={primaryBtn}>
             {disabled && <Loader2 className="h-4 w-4 animate-spin" />} Analyze
           </button>
         )}
@@ -431,16 +692,17 @@ function GuidedForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (p: F
 
 function RowEditor<T extends { id: number }>(props: {
   hint: string;
-  columns: [string, string, string];
+  columns: string[];
   rows: T[];
   onAdd: () => void;
   onRemove: (id: number) => void;
   render: (row: T) => ReactNode;
 }) {
+  const grid = props.columns.length === 2 ? "grid-cols-[1fr_7.5rem_2rem]" : "grid-cols-[1fr_6.5rem_7.5rem_2rem]";
   return (
     <div>
       <p className="mb-3 text-sm text-slate-400">{props.hint}</p>
-      <div className="grid grid-cols-[1fr_6.5rem_7.5rem_2rem] gap-2 px-1 pb-1 text-xs uppercase tracking-wide text-slate-500">
+      <div className={cn("grid gap-2 px-1 pb-1 text-xs uppercase tracking-wide text-slate-500", grid)}>
         {props.columns.map((c) => (
           <span key={c}>{c}</span>
         ))}
@@ -448,7 +710,7 @@ function RowEditor<T extends { id: number }>(props: {
       </div>
       <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
         {props.rows.map((row) => (
-          <div key={row.id} className="grid grid-cols-[1fr_6.5rem_7.5rem_2rem] items-center gap-2">
+          <div key={row.id} className={cn("grid items-center gap-2", grid)}>
             {props.render(row)}
             <button onClick={() => props.onRemove(row.id)} aria-label="Remove line" className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-white/5 hover:text-rose-300">
               <Trash2 className="h-4 w-4" />
@@ -463,9 +725,7 @@ function RowEditor<T extends { id: number }>(props: {
   );
 }
 
-const inputCls = "w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-indigo-400 focus:outline-none";
-
-function TextInput({ value, onChange, ...rest }: { value: string; onChange: (v: string) => void; "aria-label": string }) {
+function TextInput({ value, onChange, ...rest }: { value: string; onChange: (v: string) => void; placeholder?: string; "aria-label": string }) {
   return <input {...rest} value={value} onChange={(e) => onChange(e.target.value)} className={inputCls} />;
 }
 
@@ -488,18 +748,19 @@ function ReviewRow({ label, value }: { label: string; value: string }) {
 
 const ACCEPT = ".pdf,.txt,.csv,application/pdf,text/plain,text/csv";
 
-function StatementUploader({ disabled, onSubmit }: { disabled: boolean; onSubmit: (init: RequestInit) => void }) {
+function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; disabled: boolean; onSubmit: (init: RequestInit) => void }) {
+  const personal = mode === "PERSONAL";
   const [file, setFile] = useState<File | null>(null);
   const [pasted, setPasted] = useState("");
-  const [mode, setMode] = useState<"file" | "paste">("file");
-  const [businessType, setBusinessType] = useState<BusinessType | "">("");
+  const [input, setInput] = useState<"file" | "paste">("file");
+  const [businessType, setBusinessType] = useState<BusinessType | "">(personal ? "PERSONAL_FAMILY" : "");
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const ready = mode === "file" ? !!file : pasted.trim().length > 0;
+  const ready = input === "file" ? !!file : pasted.trim().length > 0;
 
   const submit = () => {
-    if (mode === "file" && file) {
+    if (input === "file" && file) {
       const fd = new FormData();
       fd.append("file", file);
       if (businessType) fd.append("businessType", businessType);
@@ -516,20 +777,20 @@ function StatementUploader({ disabled, onSubmit }: { disabled: boolean; onSubmit
     <div className={cn(glass, "flex h-full flex-col p-6")}>
       <div className="flex items-center gap-2">
         <Upload className="h-5 w-5 text-indigo-300" />
-        <h2 className="text-lg font-semibold">Upload Bank / P&amp;L Statement</h2>
+        <h2 className="text-lg font-semibold">{personal ? "Upload Bank / Card Statement" : "Upload Bank / P&L Statement"}</h2>
       </div>
       <p className="mt-1 text-sm text-slate-400">PDF, CSV or plain text. Scanned PDFs work too.</p>
 
       <div className="mt-5 inline-flex self-start rounded-lg border border-white/10 p-0.5 text-sm">
         {(["file", "paste"] as const).map((m) => (
-          <button key={m} onClick={() => setMode(m)} className={cn("rounded-md px-3 py-1.5", mode === m ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200")}>
+          <button key={m} onClick={() => setInput(m)} className={cn("rounded-md px-3 py-1.5", input === m ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200")}>
             {m === "file" ? "Upload file" : "Paste text"}
           </button>
         ))}
       </div>
 
       <div className="mt-4 flex-1">
-        {mode === "file" ? (
+        {input === "file" ? (
           <div
             onDragOver={(e) => {
               e.preventDefault();
@@ -572,35 +833,144 @@ function StatementUploader({ disabled, onSubmit }: { disabled: boolean; onSubmit
           <textarea
             value={pasted}
             onChange={(e) => setPasted(e.target.value)}
-            placeholder={"Paste transactions or a P&L…\n03/02  Home Depot   -412.18\n03/05  Rent - Unit 2B  2,150.00"}
+            placeholder={personal ? "Paste transactions…\n03/01  PAYROLL DEPOSIT  3,250.00\n03/04  KROGER  -142.18" : "Paste transactions or a P&L…\n03/02  Home Depot   -412.18\n03/05  Rent - Unit 2B  2,150.00"}
             className={cn(inputCls, "h-full min-h-48 resize-y font-mono text-xs")}
           />
         )}
       </div>
 
-      <label className="mt-4 block text-sm">
-        <span className="text-slate-400">Business type (optional)</span>
-        <select
-          value={businessType}
-          onChange={(e) => setBusinessType(e.target.value as BusinessType | "")}
-          className="mt-1 w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none"
-        >
-          <option value="">Detect automatically</option>
-          {BUSINESS_TYPES.map((bt) => (
-            <option key={bt} value={bt}>
-              {BUSINESS_TYPE_LABELS[bt]}
-            </option>
-          ))}
-        </select>
-      </label>
+      {!personal && (
+        <label className="mt-4 block text-sm">
+          <span className="text-slate-400">Business type (optional)</span>
+          <select value={businessType} onChange={(e) => setBusinessType(e.target.value as BusinessType | "")} className={cn(inputCls, "mt-1")}>
+            <option value="">Detect automatically</option>
+            {BUSINESS_ONLY_TYPES.map((bt) => (
+              <option key={bt} value={bt}>
+                {BUSINESS_TYPE_LABELS[bt]}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
 
-      <button
-        onClick={submit}
-        disabled={disabled || !ready}
-        className="mt-5 inline-flex items-center justify-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-medium text-white hover:bg-indigo-400 disabled:opacity-50"
-      >
+      <p className="mt-4 flex items-start gap-1.5 text-xs text-slate-500">
+        <Lock className="mt-0.5 h-3 w-3 shrink-0" /> Encrypted in transit and parsed in memory. LedgerPulse never writes your file to disk or a database.
+      </p>
+
+      <button onClick={submit} disabled={disabled || !ready} className={cn(primaryBtn, "mt-4 py-2.5")}>
         {disabled && <Loader2 className="h-4 w-4 animate-spin" />} Analyze statement
       </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Paywall UI
+// ---------------------------------------------------------------------------
+
+function PaywallButtons({ paywall, proOnly = false }: { paywall: Paywall; proOnly?: boolean }) {
+  const { access, busy } = paywall;
+  const canSpendCredit = !proOnly && access.signedIn && access.reportUnlocks > 0 && !!access.sealed;
+  return (
+    <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-center">
+      {canSpendCredit ? (
+        <button onClick={paywall.unlock} disabled={!!busy} className={primaryBtn}>
+          {busy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} Use 1 of {access.reportUnlocks} report unlocks
+        </button>
+      ) : (
+        !proOnly &&
+        !paywall.isPro && (
+          <button onClick={() => paywall.checkout("report")} disabled={!!busy} className={primaryBtn}>
+            {busy === "report" && <Loader2 className="h-4 w-4 animate-spin" />} Unlock Full Audit &amp; Report (${PRICING.reportUnlockUsd})
+          </button>
+        )
+      )}
+      {!paywall.isPro && (
+        <button
+          onClick={() => paywall.checkout("pro")}
+          disabled={!!busy}
+          className={cn(proOnly ? primaryBtn : secondaryBtn, !proOnly && "border-amber-300/30 text-amber-100 hover:bg-amber-400/10")}
+        >
+          {busy === "pro" && <Loader2 className="h-4 w-4 animate-spin" />} Upgrade to Pro Subscription (${PRICING.proMonthlyUsd}/mo)
+        </button>
+      )}
+      {paywall.isPro && access.level === "teaser" && (
+        <button onClick={paywall.unlock} disabled={!!busy} className={primaryBtn}>
+          {busy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} Unlock with Pro
+        </button>
+      )}
+    </div>
+  );
+}
+
+function TeaserBanner({ paywall }: { paywall: Paywall }) {
+  const { access } = paywall;
+  return (
+    <div className={cn(glass, "flex flex-col gap-4 border-indigo-400/20 bg-gradient-to-r from-indigo-500/10 to-transparent p-5 lg:flex-row lg:items-center lg:justify-between")}>
+      <div>
+        <p className="flex items-center gap-2 font-medium">
+          <Sparkles className="h-4 w-4 text-indigo-300" /> You&apos;re viewing the free preview
+        </p>
+        <p className="mt-1 text-sm text-slate-400">
+          {access.lockedFlagCount > 0 ? `${access.lockedFlagCount} more audit flag${access.lockedFlagCount === 1 ? "" : "s"}, ` : ""}
+          the potential-savings total, the 12-month projection and the executive report are locked.
+        </p>
+        {paywall.message && <p className="mt-2 text-sm text-amber-200">{paywall.message}</p>}
+      </div>
+      <PaywallButtons paywall={paywall} />
+    </div>
+  );
+}
+
+/** Blurred, non-interactive placeholder with an overlay CTA. Placeholders contain no real data. */
+function LockedSection({ title, paywall, placeholder, proOnly = false }: { title: string; paywall: Paywall; placeholder: ReactNode; proOnly?: boolean }) {
+  return (
+    <div className={cn(glass, "relative overflow-hidden p-6")}>
+      <h2 className="flex items-center gap-2 text-lg font-semibold">
+        <Lock className="h-4 w-4 text-slate-400" /> {title}
+      </h2>
+      <div aria-hidden inert className="pointer-events-none mt-4 select-none blur-md">
+        {placeholder}
+      </div>
+      <div className="absolute inset-0 top-14 grid place-items-center p-4">
+        <div className={cn(glass, "max-w-md bg-slate-900/85 p-5 text-center")}>
+          <Lock className="mx-auto h-6 w-6 text-indigo-300" />
+          <p className="mt-2 font-medium">{proOnly ? "Scenario forecasting is a Pro feature" : "Unlock your full forecast"}</p>
+          <p className="mt-1 text-sm text-slate-400">
+            {proOnly ? "Ask \"what if\" in plain English and see your adjusted 12-month runway." : "See every month of your seasonality- and inflation-adjusted cash flow."}
+          </p>
+          <div className="mt-4">
+            <PaywallButtons paywall={paywall} proOnly={proOnly} />
+          </div>
+          {paywall.message && <p className="mt-3 text-sm text-amber-200">{paywall.message}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const FAKE_ROWS = Array.from({ length: 12 }, (_, i) => ({ m: i, a: 50 + 18 * Math.sin(i / 1.8), b: 42 + 10 * Math.cos(i / 2.3) }));
+
+function FakeChart() {
+  return (
+    <div className="h-72">
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={FAKE_ROWS}>
+          <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+          <Line dataKey="a" stroke={COLOR.revenue} strokeWidth={2} dot={false} isAnimationActive={false} />
+          <Line dataKey="b" stroke={COLOR.expenses} strokeWidth={2} dot={false} isAnimationActive={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function FakeScenarioChat({ mode }: { mode: WorkspaceMode }) {
+  return (
+    <div className="space-y-3">
+      <p className="ml-auto max-w-[80%] rounded-2xl bg-indigo-500/70 px-3 py-2 text-sm">{scenarioExamples(mode)[0]}</p>
+      <p className="max-w-[80%] rounded-2xl bg-white/[0.06] px-3 py-2 text-sm">Adjusted runway compared to baseline over the next 12 months…</p>
+      <FakeChart />
     </div>
   );
 }
@@ -629,28 +999,34 @@ function useDerived(a: FinancialAnalysis) {
   }, [a]);
 }
 
-function KpiRow({ analysis }: { analysis: FinancialAnalysis }) {
+function KpiRow({ analysis, mode, locked }: { analysis: FinancialAnalysis; mode: WorkspaceMode; locked: boolean }) {
   const d = useDerived(analysis);
-  const tiles = [
-    { label: "Monthly revenue", value: usd.format(analysis.monthlyRevenue) },
-    { label: "Monthly expenses", value: usd.format(d.monthlyExpenses) },
-    { label: "Net / month", value: usd.format(d.net), tone: d.net >= 0 ? "good" : "bad" },
-    {
-      label: "12-mo projected net",
-      value: usd.format(d.annualNet),
-      sub: d.firstNegative ? `Cash turns negative in ${d.firstNegative}` : `After ${pct(analysis.inflationRateAssumed)} inflation`,
-      tone: d.annualNet >= 0 ? "good" : "bad",
-    },
-  ] as const;
+  const copy = MODE_COPY[mode];
+  const tiles: { label: string; value: string; sub?: string; bad?: boolean; locked?: boolean }[] = [
+    { label: `Monthly ${copy.revenue.toLowerCase()}`, value: usd.format(analysis.monthlyRevenue) },
+    { label: `Monthly ${copy.expenses.toLowerCase()}`, value: usd.format(d.monthlyExpenses) },
+    { label: copy.net, value: usd.format(d.net), bad: d.net < 0 },
+    locked
+      ? { label: "12-mo projected net", value: "Locked", sub: "Unlock to see your forecast", locked: true }
+      : {
+          label: "12-mo projected net",
+          value: usd.format(d.annualNet),
+          sub: d.firstNegative ? `Cash turns negative in ${d.firstNegative}` : `After ${pct(analysis.inflationRateAssumed)} inflation`,
+          bad: d.annualNet < 0,
+        },
+  ];
   return (
     <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
       {tiles.map((t) => (
         <div key={t.label} className={cn(glass, "p-5")}>
           <p className="text-xs uppercase tracking-wide text-slate-400">{t.label}</p>
-          <p className="mt-2 text-2xl font-semibold tabular-nums text-slate-50">{t.value}</p>
-          {"sub" in t && (
-            <p className={cn("mt-1 flex items-center gap-1 text-xs", "tone" in t && t.tone === "bad" ? "text-rose-300" : "text-slate-400")}>
-              {"tone" in t && t.tone === "bad" && <AlertTriangle className="h-3 w-3" />}
+          <p className={cn("mt-2 flex items-center gap-2 text-2xl font-semibold tabular-nums text-slate-50", t.locked && "text-slate-500")}>
+            {t.locked && <Lock className="h-5 w-5" />}
+            {t.value}
+          </p>
+          {t.sub && (
+            <p className={cn("mt-1 flex items-center gap-1 text-xs", t.bad ? "text-rose-300" : "text-slate-400")}>
+              {t.bad && <AlertTriangle className="h-3 w-3" />}
               {t.sub}
             </p>
           )}
@@ -681,6 +1057,7 @@ const axisProps = { stroke: "#64748b", tick: { fill: "#94a3b8", fontSize: 12 }, 
 function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
   const { rows } = useDerived(analysis);
   const [showTable, setShowTable] = useState(false);
+  const copy = MODE_COPY[modeOf(analysis.businessType)];
 
   return (
     <div className={cn(glass, "p-6")}>
@@ -702,8 +1079,8 @@ function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
             <thead className="text-left text-xs uppercase text-slate-500">
               <tr>
                 <th className="py-2 font-medium">Month</th>
-                <th className="py-2 text-right font-medium">Revenue</th>
-                <th className="py-2 text-right font-medium">Expenses</th>
+                <th className="py-2 text-right font-medium">{copy.revenue}</th>
+                <th className="py-2 text-right font-medium">{copy.expenses}</th>
                 <th className="py-2 text-right font-medium">Net</th>
                 <th className="py-2 text-right font-medium">Cumulative</th>
               </tr>
@@ -731,8 +1108,8 @@ function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
                 <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
                 <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
                 <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
-                <Line name="Projected revenue" type="monotone" dataKey="projectedRevenue" stroke={COLOR.revenue} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
-                <Line name="Projected expenses" type="monotone" dataKey="projectedExpenses" stroke={COLOR.expenses} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
+                <Line name={`Projected ${copy.revenue.toLowerCase()}`} type="monotone" dataKey="projectedRevenue" stroke={COLOR.revenue} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
+                <Line name={`Projected ${copy.expenses.toLowerCase()}`} type="monotone" dataKey="projectedExpenses" stroke={COLOR.expenses} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -762,28 +1139,304 @@ function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Scenario forecasting (Pro)
+// ---------------------------------------------------------------------------
+
+function scenarioExamples(mode: WorkspaceMode) {
+  return mode === "PERSONAL"
+    ? ["What if groceries go up 10% and I put an extra $300/month into investments?", "What if rent rises 5% in month 6?", "What if I pay off my car loan in 4 months?"]
+    : ["What if fuel costs increase by 15% and I gain 2 new clients next quarter?", "What if I hire a $4,000/month technician starting in month 3?", "What if revenue drops 20% for the next 3 months?"];
+}
+
+interface ScenarioEntry {
+  id: number;
+  prompt: string;
+  plan?: ScenarioPlan;
+  result?: ScenarioResult;
+  error?: string;
+  saved?: boolean;
+}
+
+function ScenarioPanel({ analysis, workspaceId }: { analysis: FinancialAnalysis; workspaceId: string | null }) {
+  const mode = modeOf(analysis.businessType);
+  const [entries, setEntries] = useState<ScenarioEntry[]>([]);
+  const [selected, setSelected] = useState<number | null>(null);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState<SavedScenario[]>([]);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const baseline: ScenarioBaseline = useMemo(
+    () => ({
+      businessType: analysis.businessType,
+      itemizedRevenue: analysis.itemizedRevenue.map(({ label, amount }) => ({ label, amount })),
+      itemizedExpenses: analysis.itemizedExpenses.map(({ label, amount, category }) => ({ label, amount, category })),
+      inflationRateAssumed: analysis.inflationRateAssumed,
+    }),
+    [analysis],
+  );
+
+  useEffect(() => {
+    if (!workspaceId) return;
+    let cancelled = false;
+    listScenarios(workspaceId)
+      .then((s) => !cancelled && setSaved(s))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+  }, [entries]);
+
+  const ask = async (text: string) => {
+    const prompt = text.trim();
+    if (!prompt || busy) return;
+    const id = Date.now();
+    setEntries((e) => [...e, { id, prompt }]);
+    setDraft("");
+    setBusy(true);
+    try {
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+        body: JSON.stringify({ mode: "scenario", prompt, baseline }),
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      const { scenario } = (await res.json()) as { scenario: ScenarioPlan };
+      const result = applyScenario(baseline, scenario.adjustments);
+      setEntries((e) => e.map((x) => (x.id === id ? { ...x, plan: scenario, result } : x)));
+      setSelected(id);
+    } catch (err) {
+      setEntries((e) => e.map((x) => (x.id === id ? { ...x, error: err instanceof Error ? err.message : "Scenario failed." } : x)));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const loadSaved = (s: SavedScenario) => {
+    const id = Date.now();
+    const plan: ScenarioPlan = { prompt: s.prompt, adjustments: s.adjustments, assumptions: [], explanation: s.summary.explanation };
+    setEntries((e) => [...e, { id, prompt: s.prompt, plan, result: applyScenario(baseline, s.adjustments), saved: true }]);
+    setSelected(id);
+  };
+
+  const save = async (entry: ScenarioEntry) => {
+    if (!workspaceId || !entry.plan || !entry.result) return;
+    setSaveError(null);
+    try {
+      await saveScenario({
+        workspaceId,
+        prompt: entry.prompt,
+        adjustments: entry.plan.adjustments,
+        summary: { baselineAnnualNet: entry.result.baselineAnnualNet, adjustedAnnualNet: entry.result.adjustedAnnualNet, delta: entry.result.delta, explanation: entry.plan.explanation },
+      });
+      setEntries((e) => e.map((x) => (x.id === entry.id ? { ...x, saved: true } : x)));
+      setSaved(await listScenarios(workspaceId));
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "Couldn't save.");
+    }
+  };
+
+  const active = entries.find((e) => e.id === selected && e.result);
+  const firstNegative = active?.result?.points.find((p) => p.adjustedCumulative < 0)?.month ?? null;
+
+  return (
+    <div className={cn(glass, "p-6")}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-semibold">
+            <MessageSquareText className="h-5 w-5 text-indigo-300" /> Scenario Forecasting
+          </h2>
+          <p className="text-sm text-slate-400">Describe a change in plain English. We model it on top of your baseline projection.</p>
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-6 lg:grid-cols-5">
+        {/* Chat */}
+        <div className="flex flex-col lg:col-span-2">
+          <div ref={listRef} className="max-h-80 min-h-40 flex-1 space-y-3 overflow-y-auto pr-1 text-sm" aria-live="polite">
+            {entries.length === 0 && (
+              <div className="space-y-2">
+                <p className="text-slate-500">Try one of these:</p>
+                {scenarioExamples(mode).map((ex) => (
+                  <button key={ex} onClick={() => ask(ex)} className="block w-full rounded-xl border border-white/10 px-3 py-2 text-left text-slate-300 hover:bg-white/5">
+                    {ex}
+                  </button>
+                ))}
+              </div>
+            )}
+            {entries.map((e) => (
+              <div key={e.id} className="space-y-2">
+                <p className="ml-auto max-w-[90%] rounded-2xl rounded-br-sm bg-indigo-500/80 px-3 py-2 text-white">{e.prompt}</p>
+                {e.error ? (
+                  <p className="max-w-[90%] rounded-2xl rounded-bl-sm bg-rose-500/10 px-3 py-2 text-rose-200">{e.error}</p>
+                ) : e.plan && e.result ? (
+                  <button
+                    onClick={() => setSelected(e.id)}
+                    className={cn("block max-w-[90%] rounded-2xl rounded-bl-sm px-3 py-2 text-left", selected === e.id ? "bg-white/[0.1] ring-1 ring-indigo-400/40" : "bg-white/[0.06] hover:bg-white/[0.08]")}
+                  >
+                    <span className="text-slate-200">{e.plan.explanation || "Scenario modeled."}</span>
+                    <span className={cn("mt-1 block text-xs font-medium tabular-nums", e.result.delta >= 0 ? "text-emerald-300" : "text-rose-300")}>
+                      {e.result.delta >= 0 ? "+" : ""}
+                      {usd.format(e.result.delta)} over 12 months
+                    </span>
+                  </button>
+                ) : (
+                  <p className="inline-flex items-center gap-2 rounded-2xl bg-white/[0.06] px-3 py-2 text-slate-400">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Modeling…
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void ask(draft);
+            }}
+            className="mt-3 flex gap-2"
+          >
+            <input value={draft} onChange={(e) => setDraft(e.target.value)} maxLength={500} placeholder="What if…" aria-label="Scenario" className={inputCls} />
+            <button type="submit" disabled={busy || !draft.trim()} aria-label="Run scenario" className="grid h-9 w-10 shrink-0 place-items-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-400 disabled:opacity-40">
+              <Send className="h-4 w-4" />
+            </button>
+          </form>
+
+          {saved.length > 0 && (
+            <div className="mt-4 border-t border-white/10 pt-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Saved in this workspace</p>
+              <ul className="mt-2 space-y-1 text-sm">
+                {saved.slice(0, 6).map((s) => (
+                  <li key={s.id}>
+                    <button onClick={() => loadSaved(s)} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-slate-300 hover:bg-white/5">
+                      <Bookmark className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                      <span className="flex-1 truncate">{s.prompt}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        {/* Chart */}
+        <div className="lg:col-span-3">
+          {active?.result && active.plan ? (
+            <>
+              <div className="grid grid-cols-3 gap-3 text-sm">
+                <Stat label="Baseline 12-mo net" value={usd.format(active.result.baselineAnnualNet)} />
+                <Stat label="Adjusted 12-mo net" value={usd.format(active.result.adjustedAnnualNet)} tone={active.result.adjustedAnnualNet < 0 ? "bad" : undefined} />
+                <Stat label="Change" value={`${active.result.delta >= 0 ? "+" : ""}${usd.format(active.result.delta)}`} tone={active.result.delta >= 0 ? "good" : "bad"} />
+              </div>
+              <div className="mt-4 h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={active.result.points} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
+                    <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                    <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0]} />
+                    <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
+                    <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" />
+                    <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
+                    <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
+                    <Line name="Baseline runway" type="monotone" dataKey="baselineCumulative" stroke={COLOR.baseline} strokeDasharray="5 4" strokeWidth={2} dot={false} />
+                    <Line name="Adjusted runway" type="monotone" dataKey="adjustedCumulative" stroke={COLOR.cash} strokeWidth={2.5} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+              {firstNegative && (
+                <p className="mt-2 flex items-center gap-1.5 text-xs text-rose-300">
+                  <AlertTriangle className="h-3 w-3" /> Under this scenario, cumulative cash turns negative in {firstNegative}.
+                </p>
+              )}
+              <div className="mt-4 space-y-2 text-sm">
+                <ul className="space-y-1">
+                  {active.plan.adjustments.map((a, i) => (
+                    <li key={i} className="flex items-start gap-2 text-slate-300">
+                      <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-300" />
+                      {a.description} <span className="text-slate-500">(from month {a.startMonth})</span>
+                    </li>
+                  ))}
+                </ul>
+                {active.result.unmatched.length > 0 && (
+                  <p className="text-xs text-amber-200">No matching line items for: {active.result.unmatched.join("; ")}. Those changes had no effect.</p>
+                )}
+                {active.plan.assumptions.length > 0 && (
+                  <details className="text-xs text-slate-400">
+                    <summary className="cursor-pointer text-slate-300">Assumptions</summary>
+                    <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                      {active.plan.assumptions.map((s, i) => (
+                        <li key={i}>{s}</li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </div>
+              <div className="mt-4 flex items-center gap-3">
+                {workspaceId ? (
+                  <button onClick={() => save(active)} disabled={active.saved} className={cn(secondaryBtn, "py-1.5 text-xs")}>
+                    <Bookmark className="h-3.5 w-3.5" /> {active.saved ? "Saved" : "Save scenario"}
+                  </button>
+                ) : (
+                  <p className="text-xs text-slate-500">Create a workspace to save scenarios.</p>
+                )}
+                {saveError && <p className="text-xs text-rose-300">{saveError}</p>}
+              </div>
+              <p className="mt-2 text-[11px] text-slate-500">Saving stores only the question, the adjustment parameters and the headline totals — never your statements.</p>
+            </>
+          ) : (
+            <div className="grid h-full min-h-64 place-items-center rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-slate-500">
+              Your baseline vs adjusted runway will appear here.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, tone }: { label: string; value: string; tone?: "good" | "bad" }) {
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+      <p className="text-[11px] uppercase tracking-wide text-slate-500">{label}</p>
+      <p className={cn("mt-1 font-semibold tabular-nums", tone === "good" && "text-emerald-300", tone === "bad" && "text-rose-300")}>{value}</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
 const SEVERITY_STYLE: Record<Severity, { badge: string; Icon: typeof ShieldAlert }> = {
   HIGH: { badge: "border-rose-400/40 bg-rose-500/15 text-rose-200", Icon: ShieldAlert },
   MEDIUM: { badge: "border-amber-400/40 bg-amber-500/15 text-amber-200", Icon: AlertTriangle },
   LOW: { badge: "border-sky-400/40 bg-sky-500/15 text-sky-200", Icon: Info },
 };
 
-function AuditPanel({ analysis }: { analysis: FinancialAnalysis }) {
+function AuditPanel({ analysis, paywall }: { analysis: FinancialAnalysis; paywall: Paywall }) {
   const [showAll, setShowAll] = useState(false);
+  const teaser = paywall.access.level === "teaser";
   const flags = analysis.auditFlags;
-  const visible = showAll ? flags : flags.filter((f) => f.severity !== "LOW").slice(0, 6);
+  const visible = showAll || teaser ? flags : flags.filter((f) => f.severity !== "LOW").slice(0, 6);
   const savings = sum(flags, (f) => f.potentialSavings);
+  const locked = paywall.access.lockedFlagCount;
 
   return (
     <div className={cn(glass, "p-6")}>
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <h2 className="flex items-center gap-2 text-lg font-semibold">
           <ShieldAlert className="h-5 w-5 text-rose-300" /> Audit Mode
         </h2>
-        {savings > 0 && (
-          <span className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-200">
-            ~{usd.format(savings)}/mo potential
+        {teaser ? (
+          <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-400">
+            <Lock className="h-3 w-3" /> Savings total locked
           </span>
+        ) : (
+          savings > 0 && <span className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-200">~{usd.format(savings)}/mo potential</span>
         )}
       </div>
 
@@ -810,7 +1463,32 @@ function AuditPanel({ analysis }: { analysis: FinancialAnalysis }) {
           })}
         </ul>
       )}
-      {flags.length > visible.length && (
+
+      {teaser && locked > 0 && (
+        <div className="relative mt-3">
+          <ul aria-hidden inert className="pointer-events-none select-none space-y-3 blur-sm">
+            {Array.from({ length: Math.min(locked, 3) }, (_, i) => (
+              <li key={i} className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+                <div className="h-3 w-2/3 rounded bg-white/15" />
+                <div className="mt-3 h-2.5 w-full rounded bg-white/10" />
+                <div className="mt-2 h-2.5 w-4/5 rounded bg-white/10" />
+              </li>
+            ))}
+          </ul>
+          <div className="absolute inset-0 grid place-items-center">
+            <div className="rounded-xl border border-white/10 bg-slate-900/90 px-4 py-3 text-center text-sm shadow-xl">
+              <p className="flex items-center justify-center gap-1.5 font-medium">
+                <Lock className="h-4 w-4 text-indigo-300" /> {locked} more flag{locked === 1 ? "" : "s"} locked
+              </p>
+              <button onClick={paywall.access.reportUnlocks > 0 && paywall.access.sealed ? paywall.unlock : () => paywall.checkout("report")} className="mt-2 text-xs text-indigo-300 hover:text-indigo-200">
+                {paywall.access.reportUnlocks > 0 && paywall.access.sealed ? "Use a report unlock" : `Unlock full audit ($${PRICING.reportUnlockUsd})`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!teaser && flags.length > visible.length && (
         <button onClick={() => setShowAll(true)} className="mt-3 text-sm text-indigo-300 hover:text-indigo-200">
           Show all {flags.length} flags
         </button>
@@ -832,12 +1510,13 @@ function AuditPanel({ analysis }: { analysis: FinancialAnalysis }) {
   );
 }
 
-function WinnerCard({ analysis }: { analysis: FinancialAnalysis }) {
+function WinnerCard({ analysis, label }: { analysis: FinancialAnalysis; label: string }) {
   const { topService, message } = analysis.winnerInsight;
+  const personal = analysis.businessType === "PERSONAL_FAMILY";
   return (
     <div className={cn(glass, "border-emerald-400/20 bg-gradient-to-br from-emerald-500/10 to-transparent p-6")}>
       <h2 className="flex items-center gap-2 text-sm font-medium text-emerald-200">
-        <Trophy className="h-4 w-4" /> Top performer
+        <Trophy className="h-4 w-4" /> {personal ? "Biggest budget lever" : `Top ${label.toLowerCase()} performer`}
       </h2>
       <p className="mt-2 text-xl font-semibold">{topService}</p>
       <p className="mt-2 text-sm text-slate-300">{message}</p>
@@ -846,23 +1525,25 @@ function WinnerCard({ analysis }: { analysis: FinancialAnalysis }) {
 }
 
 function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
+  const personal = analysis.businessType === "PERSONAL_FAMILY";
+  const copy = MODE_COPY[modeOf(analysis.businessType)];
   return (
     <div className={cn(glass, "grid gap-6 p-6 md:grid-cols-2")}>
       <div>
-        <h3 className="text-sm font-medium text-slate-300">Revenue</h3>
+        <h3 className="text-sm font-medium text-slate-300">{copy.revenue}</h3>
         <ul className="mt-3 divide-y divide-white/5 text-sm">
           {analysis.itemizedRevenue.map((r) => (
             <li key={r.label} className="flex justify-between gap-3 py-2">
               <span className="text-slate-300">{r.label}</span>
               <span className="tabular-nums">
-                {usd.format(r.amount)} <span className="text-xs text-slate-500">· {pct(r.margin)} margin</span>
+                {usd.format(r.amount)} {!personal && <span className="text-xs text-slate-500">· {pct(r.margin)} margin</span>}
               </span>
             </li>
           ))}
         </ul>
       </div>
       <div>
-        <h3 className="text-sm font-medium text-slate-300">Expenses</h3>
+        <h3 className="text-sm font-medium text-slate-300">{copy.expenses}</h3>
         <ul className="mt-3 divide-y divide-white/5 text-sm">
           {analysis.itemizedExpenses.map((e, i) => (
             <li key={`${e.label}-${i}`} className="py-2">
@@ -886,14 +1567,15 @@ function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
 }
 
 // ---------------------------------------------------------------------------
-// Executive report (self-contained, printable HTML)
+// Executive report → browser print dialog ("Save as PDF"). Rendered client-side only.
 // ---------------------------------------------------------------------------
 
 function esc(s: string) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
-function downloadExecutiveReport(a: FinancialAnalysis) {
+function reportHtml(a: FinancialAnalysis) {
+  const copy = MODE_COPY[modeOf(a.businessType)];
   const monthlyExpenses = sum(a.itemizedExpenses, (e) => e.amount);
   const net = a.monthlyRevenue - monthlyExpenses;
   const rows = projectionRows(a);
@@ -905,15 +1587,12 @@ function downloadExecutiveReport(a: FinancialAnalysis) {
     )
     .join("");
   const flags = a.auditFlags
-    .map(
-      (f) =>
-        `<li><strong>[${f.severity}] ${esc(f.title)}</strong> — ${esc(f.message)}${f.potentialSavings > 0 ? ` <em>(~${usd.format(f.potentialSavings)}/mo)</em>` : ""}</li>`,
-    )
+    .map((f) => `<li><strong>[${f.severity}] ${esc(f.title)}</strong> — ${esc(f.message)}${f.potentialSavings > 0 ? ` <em>(~${usd.format(f.potentialSavings)}/mo)</em>` : ""}</li>`)
     .join("");
   const generated = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
 
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LedgerPulse Executive Report</title>
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LedgerPulse Executive Report ${new Date().toISOString().slice(0, 10)}</title>
 <style>
 body{font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#111;max-width:860px;margin:40px auto;padding:0 20px}
 h1{font-size:24px;margin:0}h2{font-size:16px;margin:28px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
@@ -921,30 +1600,39 @@ h1{font-size:24px;margin:0}h2{font-size:16px;margin:28px 0 8px;border-bottom:1px
 .kpi{border:1px solid #ddd;border-radius:8px;padding:12px}.kpi b{display:block;font-size:18px;font-variant-numeric:tabular-nums}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}td,th{padding:6px 8px;border-bottom:1px solid #eee;text-align:right}
 td:first-child,th:first-child{text-align:left}.neg{color:#b42318}li{margin-bottom:6px}
-@media print{body{margin:0}}
+@page{margin:16mm}@media print{body{margin:0;max-width:none}}
 </style></head><body>
 <h1>LedgerPulse Executive Report</h1>
 <p class="muted">${esc(BUSINESS_TYPE_LABELS[a.businessType])} · Generated ${esc(generated)} · ${pct(a.inflationRateAssumed)} inflation assumed</p>
 <div class="kpis">
-<div class="kpi">Monthly revenue<b>${usd.format(a.monthlyRevenue)}</b></div>
-<div class="kpi">Monthly expenses<b>${usd.format(monthlyExpenses)}</b></div>
-<div class="kpi">Net / month<b class="${net < 0 ? "neg" : ""}">${usd.format(net)}</b></div>
+<div class="kpi">Monthly ${esc(copy.revenue.toLowerCase())}<b>${usd.format(a.monthlyRevenue)}</b></div>
+<div class="kpi">Monthly ${esc(copy.expenses.toLowerCase())}<b>${usd.format(monthlyExpenses)}</b></div>
+<div class="kpi">${esc(copy.net)}<b class="${net < 0 ? "neg" : ""}">${usd.format(net)}</b></div>
 <div class="kpi">12-mo projected net<b class="${cumulative < 0 ? "neg" : ""}">${usd.format(cumulative)}</b></div>
 </div>
-<h2>Top performer: ${esc(a.winnerInsight.topService)}</h2><p>${esc(a.winnerInsight.message)}</p>
+<h2>${a.businessType === "PERSONAL_FAMILY" ? "Biggest budget lever" : "Top performer"}: ${esc(a.winnerInsight.topService)}</h2><p>${esc(a.winnerInsight.message)}</p>
 <h2>Priority actions</h2>${flags ? `<ol>${flags}</ol>` : "<p>No issues found.</p>"}
 ${a.missingCategories.length ? `<h2>Missing categories</h2><p>${a.missingCategories.map(esc).join(", ")}</p>` : ""}
 <h2>12-month projection</h2>
-<table><thead><tr><th>Month</th><th>Revenue</th><th>Expenses</th><th>Net</th><th>Cumulative</th></tr></thead><tbody>${projRows}</tbody></table>
-<p class="muted" style="margin-top:24px;font-size:12px">Projections apply business-type seasonality and inflation to current monthly averages. They are estimates, not financial advice.</p>
+<table><thead><tr><th>Month</th><th>${esc(copy.revenue)}</th><th>${esc(copy.expenses)}</th><th>Net</th><th>Cumulative</th></tr></thead><tbody>${projRows}</tbody></table>
+<p class="muted" style="margin-top:24px;font-size:12px">Projections apply seasonality and inflation to current monthly averages. ${esc(LEGAL_DISCLAIMER)}</p>
 </body></html>`;
+}
 
-  const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `LedgerPulse-Executive-Report-${new Date().toISOString().slice(0, 10)}.html`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+/** Opens the browser's print dialog on a hidden iframe so the user can save a PDF. */
+function printExecutiveReport(a: FinancialAnalysis) {
+  const frame = document.createElement("iframe");
+  frame.setAttribute("aria-hidden", "true");
+  frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
+  frame.srcdoc = reportHtml(a);
+  frame.onload = () => {
+    const w = frame.contentWindow;
+    if (!w) return frame.remove();
+    w.addEventListener("afterprint", () => setTimeout(() => frame.remove(), 0));
+    w.focus();
+    w.print();
+    // Fallback cleanup for browsers that don't fire afterprint.
+    setTimeout(() => frame.isConnected && frame.remove(), 60_000);
+  };
+  document.body.appendChild(frame);
 }

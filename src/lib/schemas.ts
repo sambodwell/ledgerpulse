@@ -10,8 +10,24 @@
 // Core types
 // ---------------------------------------------------------------------------
 
-export const BUSINESS_TYPES = ["REAL_ESTATE", "FIELD_SERVICE", "AGENCY_FREELANCE"] as const;
+export const BUSINESS_TYPES = ["REAL_ESTATE", "FIELD_SERVICE", "AGENCY_FREELANCE", "OTHER_CUSTOM", "PERSONAL_FAMILY"] as const;
 export type BusinessType = (typeof BUSINESS_TYPES)[number];
+
+/** Dashboard mode. PERSONAL_FAMILY is the only personal type; everything else is a business. */
+export const WORKSPACE_MODES = ["BUSINESS", "PERSONAL"] as const;
+export type WorkspaceMode = (typeof WORKSPACE_MODES)[number];
+
+export const BUSINESS_ONLY_TYPES = BUSINESS_TYPES.filter((t) => t !== "PERSONAL_FAMILY") as Exclude<BusinessType, "PERSONAL_FAMILY">[];
+
+export function modeOf(bt: BusinessType): WorkspaceMode {
+  return bt === "PERSONAL_FAMILY" ? "PERSONAL" : "BUSINESS";
+}
+
+/** User-facing vocabulary that differs between business and personal mode. */
+export const MODE_COPY: Record<WorkspaceMode, { revenue: string; revenueLines: string; expenses: string; net: string }> = {
+  BUSINESS: { revenue: "Revenue", revenueLines: "Revenue stream", expenses: "Expenses", net: "Net / month" },
+  PERSONAL: { revenue: "Income", revenueLines: "Income source", expenses: "Spending", net: "Left over / month" },
+};
 
 export const SEVERITIES = ["HIGH", "MEDIUM", "LOW"] as const;
 export type Severity = (typeof SEVERITIES)[number];
@@ -35,11 +51,16 @@ export interface MacroProjection {
   projectedExpenses: number;
 }
 
+export const AUDIT_FLAG_SOURCES = ["MODEL", "MISSING_CATEGORY", "BUDGET_RULE"] as const;
+export type AuditFlagSource = (typeof AUDIT_FLAG_SOURCES)[number];
+
 export interface AuditFlag {
   title: string;
   severity: Severity;
   message: string;
   potentialSavings: number; // monthly $
+  /** Where the flag came from; absent on payloads produced before Phase 2. */
+  source?: AuditFlagSource;
 }
 
 export interface WinnerInsight {
@@ -63,6 +84,8 @@ export const BUSINESS_TYPE_LABELS: Record<BusinessType, string> = {
   REAL_ESTATE: "Real Estate / Rental Property",
   FIELD_SERVICE: "Field Service (HVAC, plumbing, landscaping…)",
   AGENCY_FREELANCE: "Agency / Freelance",
+  OTHER_CUSTOM: "Other / Custom Business",
+  PERSONAL_FAMILY: "Personal / Family Budget",
 };
 
 export function isBusinessType(value: unknown): value is BusinessType {
@@ -140,7 +163,137 @@ export const CATEGORY_TEMPLATES: Record<BusinessType, BusinessTemplate> = {
       { category: "Equipment", keywords: ["laptop", "computer", "equipment", "monitor"], essential: false },
     ],
   },
+  // "Other / Custom": owners define their own lines; nothing is essential, so no missing-category warnings.
+  OTHER_CUSTOM: {
+    revenue: ["Sales", "Services", "Other Income"],
+    expenses: [
+      { category: "Cost of Goods Sold", keywords: ["cogs", "inventory", "wholesale", "materials"], essential: false },
+      { category: "Payroll", keywords: ["payroll", "salary", "wage", "gusto"], essential: false },
+      { category: "Rent & Facilities", keywords: ["rent", "lease", "office", "warehouse"], essential: false },
+      { category: "Software & SaaS", keywords: ["software", "saas", "subscription"], essential: false },
+      { category: "Insurance", keywords: ["insurance", "liability"], essential: false },
+      { category: "Marketing", keywords: ["marketing", "ads", "advertising"], essential: false },
+      { category: "Taxes & Fees", keywords: ["tax", "fee", "license", "permit"], essential: false },
+      { category: "Other", keywords: [], essential: false },
+    ],
+  },
+  PERSONAL_FAMILY: {
+    revenue: ["Salary / Wages", "Partner Income", "Side Income", "Benefits / Support", "Investment Income"],
+    expenses: [
+      { category: "Household Rent/Mortgage", keywords: ["rent", "mortgage", "landlord", "hoa", "property tax"], essential: true, rationale: "Housing is usually the largest line; keep it near 30% of take-home pay." },
+      { category: "Groceries", keywords: ["grocer", "supermarket", "costco", "walmart", "kroger", "aldi", "trader joe", "whole foods", "safeway"], essential: true, rationale: "Food at home is a core need and a common place to find savings." },
+      { category: "Utilities", keywords: ["utilit", "electric", "water", "gas bill", "internet", "phone", "wireless", "comcast", "verizon", "at&t"], essential: true, rationale: "Power, water, internet and phone are fixed needs that are easy to under-budget." },
+      { category: "Subscriptions", keywords: ["netflix", "spotify", "hulu", "disney", "subscription", "prime", "apple.com", "youtube", "gym"], essential: false },
+      { category: "Investments", keywords: ["401k", "ira", "roth", "brokerage", "vanguard", "fidelity", "schwab", "savings transfer", "invest"], essential: true, rationale: "Paying yourself first (aim for 15–20% of income) is how budgets build wealth." },
+      { category: "Debt", keywords: ["loan", "credit card", "card payment", "student loan", "car payment", "auto loan", "minimum payment"], essential: false },
+      { category: "Insurance", keywords: ["insurance", "geico", "state farm", "progressive", "premium"], essential: false },
+      { category: "Transportation", keywords: ["fuel", "gas station", "uber", "lyft", "transit", "parking", "toll"], essential: false },
+      { category: "Childcare & Education", keywords: ["daycare", "childcare", "tuition", "school"], essential: false },
+      { category: "Dining & Entertainment", keywords: ["restaurant", "doordash", "ubereats", "grubhub", "bar", "cinema", "concert"], essential: false },
+    ],
+  },
 };
+
+// ---------------------------------------------------------------------------
+// Personal budget rules (50/30/20 + housing / debt / subscription guardrails)
+// ---------------------------------------------------------------------------
+
+export type BudgetBucket = "NEEDS" | "WANTS" | "SAVINGS";
+
+/** Which 50/30/20 bucket each personal category falls in. Unknown categories count as WANTS. */
+export const PERSONAL_BUCKETS: Record<string, BudgetBucket> = {
+  "Household Rent/Mortgage": "NEEDS",
+  Groceries: "NEEDS",
+  Utilities: "NEEDS",
+  Insurance: "NEEDS",
+  Transportation: "NEEDS",
+  "Childcare & Education": "NEEDS",
+  Debt: "NEEDS", // minimum payments are obligations; extra payments are savings, but we can't tell them apart
+  Subscriptions: "WANTS",
+  "Dining & Entertainment": "WANTS",
+  Investments: "SAVINGS",
+};
+
+export const PERSONAL_BUDGET_RULES = {
+  needsMaxShare: 0.5,
+  wantsMaxShare: 0.3,
+  savingsMinShare: 0.2,
+  housingMaxShare: 0.3,
+  debtMaxShare: 0.15,
+  subscriptionsMaxShare: 0.03,
+} as const;
+
+/** Deterministic budget-health flags for PERSONAL_FAMILY analyses. */
+export function evaluatePersonalBudget(monthlyIncome: number, expenses: Pick<ExpenseLine, "category" | "amount">[]): AuditFlag[] {
+  if (monthlyIncome <= 0) return [];
+  const r = PERSONAL_BUDGET_RULES;
+  const byCat = (c: string) => sum(expenses.filter((e) => e.category === c), (e) => e.amount);
+  const bucket = (b: BudgetBucket) => sum(expenses.filter((e) => (PERSONAL_BUCKETS[e.category] ?? "WANTS") === b), (e) => e.amount);
+  const share = (n: number) => n / monthlyIncome;
+  const p = (n: number) => `${Math.round(n * 100)}%`;
+  const flags: AuditFlag[] = [];
+
+  const housing = byCat("Household Rent/Mortgage");
+  if (share(housing) > r.housingMaxShare) {
+    flags.push({
+      title: "Housing above 30% of income",
+      severity: share(housing) > 0.4 ? "HIGH" : "MEDIUM",
+      message: `Housing takes ${p(share(housing))} of income. Above ~30%, the rest of the budget gets squeezed; refinancing, a roommate, or renegotiating at renewal are the usual levers.`,
+      potentialSavings: 0,
+      source: "BUDGET_RULE",
+    });
+  }
+
+  const debt = byCat("Debt");
+  if (share(debt) > r.debtMaxShare) {
+    flags.push({
+      title: "High debt payments",
+      severity: share(debt) > 0.25 ? "HIGH" : "MEDIUM",
+      message: `Debt payments are ${p(share(debt))} of income. Target the highest-APR balance first and check whether a lower-rate consolidation is available.`,
+      potentialSavings: round2(debt * 0.1),
+      source: "BUDGET_RULE",
+    });
+  }
+
+  const subs = byCat("Subscriptions");
+  if (share(subs) > r.subscriptionsMaxShare) {
+    flags.push({
+      title: "Subscription creep",
+      severity: "MEDIUM",
+      message: `Subscriptions cost ${p(share(subs))} of income. Cancel anything unused in the last 30 days and rotate streaming services instead of stacking them.`,
+      potentialSavings: round2(subs - monthlyIncome * r.subscriptionsMaxShare),
+      source: "BUDGET_RULE",
+    });
+  }
+
+  const savings = bucket("SAVINGS");
+  const leftover = monthlyIncome - sum(expenses, (e) => e.amount);
+  if (share(savings + Math.max(0, leftover)) < r.savingsMinShare) {
+    flags.push({
+      title: "Saving less than 20%",
+      severity: leftover < 0 ? "HIGH" : "MEDIUM",
+      message:
+        leftover < 0
+          ? `Spending exceeds income by ${Math.round(-leftover).toLocaleString("en-US")} a month. Cover the gap before adding savings goals.`
+          : `Savings plus unspent income is ${p(share(savings + leftover))} of income. Automate a transfer on payday to reach the 20% guideline.`,
+      potentialSavings: 0,
+      source: "BUDGET_RULE",
+    });
+  }
+
+  const wants = bucket("WANTS");
+  if (share(wants) > r.wantsMaxShare) {
+    flags.push({
+      title: "Discretionary spending above 30%",
+      severity: "LOW",
+      message: `Wants (dining, entertainment, subscriptions) are ${p(share(wants))} of income versus the 30% guideline.`,
+      potentialSavings: round2(wants - monthlyIncome * r.wantsMaxShare),
+      source: "BUDGET_RULE",
+    });
+  }
+
+  return flags;
+}
 
 // ---------------------------------------------------------------------------
 // Macro multiplier rules
@@ -166,6 +319,16 @@ export const SEASONALITY: Record<BusinessType, { revenue: number[]; expenses: nu
     revenue: [0.88, 0.93, 1.02, 1.03, 1.04, 0.98, 0.9, 0.9, 1.04, 1.08, 1.1, 1.1],
     expenses: [1.02, 0.98, 1.0, 1.0, 1.0, 0.99, 0.98, 0.98, 1.0, 1.01, 1.02, 1.02],
   },
+  // Unknown business: no seasonal assumption.
+  OTHER_CUSTOM: {
+    revenue: Array(12).fill(1),
+    expenses: Array(12).fill(1),
+  },
+  // Households: steady pay; winter heating, summer cooling, back-to-school and holiday spending.
+  PERSONAL_FAMILY: {
+    revenue: Array(12).fill(1),
+    expenses: [1.02, 0.97, 0.97, 0.96, 0.97, 1.0, 1.02, 1.04, 0.99, 0.97, 1.0, 1.09],
+  },
 };
 
 /**
@@ -176,6 +339,8 @@ export const INFLATION_PASS_THROUGH: Record<BusinessType, number> = {
   REAL_ESTATE: 0.5, // leases reprice only at renewal
   FIELD_SERVICE: 0.8, // job pricing adjusts quickly
   AGENCY_FREELANCE: 0.6, // retainers lag
+  OTHER_CUSTOM: 0.6,
+  PERSONAL_FAMILY: 0.7, // wage growth trails inflation
 };
 
 const MONTH_FMT = new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric", timeZone: "UTC" });
@@ -200,22 +365,230 @@ export function buildMacroProjections(params: {
     startDate = new Date(),
     months = PROJECTION_MONTHS,
   } = params;
+  return projectionFactors({ businessType, inflationRate, startDate, months }).map((f) => ({
+    month: f.month,
+    projectedRevenue: round2(monthlyRevenue * f.revenue),
+    projectedExpenses: round2(monthlyExpenses * f.expenses),
+  }));
+}
+
+/** Per-month seasonality × inflation multipliers shared by baseline and scenario projections. */
+export function projectionFactors(params: {
+  businessType: BusinessType;
+  inflationRate?: number;
+  startDate?: Date;
+  months?: number;
+}): { month: string; revenue: number; expenses: number }[] {
+  const { businessType, inflationRate = DEFAULT_INFLATION_RATE, startDate = new Date(), months = PROJECTION_MONTHS } = params;
   const season = SEASONALITY[businessType];
   const passThrough = INFLATION_PASS_THROUGH[businessType];
-
-  const out: MacroProjection[] = [];
+  const out: { month: string; revenue: number; expenses: number }[] = [];
   for (let i = 1; i <= months; i++) {
     const d = new Date(Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth() + i, 1));
     const monthIdx = d.getUTCMonth();
-    const expenseInflation = Math.pow(1 + inflationRate, i / 12);
-    const revenueInflation = Math.pow(1 + inflationRate * passThrough, i / 12);
     out.push({
       month: MONTH_FMT.format(d),
-      projectedRevenue: round2(monthlyRevenue * season.revenue[monthIdx] * revenueInflation),
-      projectedExpenses: round2(monthlyExpenses * season.expenses[monthIdx] * expenseInflation),
+      revenue: season.revenue[monthIdx] * Math.pow(1 + inflationRate * passThrough, i / 12),
+      expenses: season.expenses[monthIdx] * Math.pow(1 + inflationRate, i / 12),
     });
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario forecasting
+// ---------------------------------------------------------------------------
+
+/**
+ * One structured change parsed from a natural-language "what if".
+ * `startMonth` is 1-based into the 12-month projection (1 = next month).
+ * `match` is matched case-insensitively against line category and label; null = all lines.
+ */
+export type ScenarioAdjustment =
+  | { type: "REVENUE_PCT" | "EXPENSE_PCT"; match: string | null; pct: number; startMonth: number; description: string }
+  | { type: "REVENUE_ADD" | "EXPENSE_ADD"; label: string; amount: number; startMonth: number; description: string };
+
+export interface ScenarioPlan {
+  prompt: string;
+  adjustments: ScenarioAdjustment[];
+  assumptions: string[];
+  explanation: string;
+}
+
+export interface ScenarioPoint {
+  month: string;
+  baselineNet: number;
+  adjustedNet: number;
+  baselineCumulative: number;
+  adjustedCumulative: number;
+  adjustedRevenue: number;
+  adjustedExpenses: number;
+}
+
+export interface ScenarioResult {
+  points: ScenarioPoint[];
+  baselineAnnualNet: number;
+  adjustedAnnualNet: number;
+  delta: number;
+  /** Adjustments whose `match` hit no line items, so they changed nothing. */
+  unmatched: string[];
+}
+
+export interface ScenarioBaseline {
+  businessType: BusinessType;
+  itemizedRevenue: Pick<RevenueLine, "label" | "amount">[];
+  itemizedExpenses: Pick<ExpenseLine, "label" | "amount" | "category">[];
+  inflationRateAssumed: number;
+}
+
+const matches = (needle: string | null, ...hay: string[]) => {
+  if (!needle) return true;
+  const n = needle.toLowerCase();
+  return hay.some((h) => {
+    const s = h.trim().toLowerCase();
+    return s.length > 0 && (s.includes(n) || n.includes(s));
+  });
+};
+
+/** Applies scenario adjustments on top of the baseline line items and projects 12 months. */
+export function applyScenario(base: ScenarioBaseline, adjustments: ScenarioAdjustment[], startDate = new Date()): ScenarioResult {
+  const factors = projectionFactors({ businessType: base.businessType, inflationRate: base.inflationRateAssumed, startDate });
+  const baseRev = sum(base.itemizedRevenue, (r) => r.amount);
+  const baseExp = sum(base.itemizedExpenses, (e) => e.amount);
+
+  const unmatched = adjustments
+    .filter((a) => (a.type === "REVENUE_PCT" || a.type === "EXPENSE_PCT") && a.match)
+    .filter((a) => {
+      const m = (a as Extract<ScenarioAdjustment, { match: string | null }>).match;
+      return a.type === "REVENUE_PCT"
+        ? !base.itemizedRevenue.some((r) => matches(m, r.label))
+        : !base.itemizedExpenses.some((e) => matches(m, e.category, e.label));
+    })
+    .map((a) => a.description);
+
+  const points: ScenarioPoint[] = [];
+  factors.forEach((f, idx) => {
+    const m = idx + 1;
+    const active = adjustments.filter((a) => m >= clampMonth(a.startMonth));
+    let rev = 0;
+    for (const r of base.itemizedRevenue) {
+      const mult = active.filter((a) => a.type === "REVENUE_PCT" && matches(a.match, r.label)).reduce((acc, a) => acc * (1 + (a as { pct: number }).pct), 1);
+      rev += r.amount * mult;
+    }
+    let exp = 0;
+    for (const e of base.itemizedExpenses) {
+      const mult = active.filter((a) => a.type === "EXPENSE_PCT" && matches(a.match, e.category, e.label)).reduce((acc, a) => acc * (1 + (a as { pct: number }).pct), 1);
+      exp += e.amount * mult;
+    }
+    rev += sum(active.filter((a) => a.type === "REVENUE_ADD"), (a) => (a as { amount: number }).amount);
+    exp += sum(active.filter((a) => a.type === "EXPENSE_ADD"), (a) => (a as { amount: number }).amount);
+
+    const adjustedRevenue = round2(rev * f.revenue);
+    const adjustedExpenses = round2(exp * f.expenses);
+    const baselineNet = round2(baseRev * f.revenue - baseExp * f.expenses);
+    const adjustedNet = round2(adjustedRevenue - adjustedExpenses);
+    const prev = points.at(-1);
+    points.push({
+      month: f.month,
+      baselineNet,
+      adjustedNet,
+      adjustedRevenue,
+      adjustedExpenses,
+      baselineCumulative: round2((prev?.baselineCumulative ?? 0) + baselineNet),
+      adjustedCumulative: round2((prev?.adjustedCumulative ?? 0) + adjustedNet),
+    });
+  });
+
+  const baselineAnnualNet = points.at(-1)?.baselineCumulative ?? 0;
+  const adjustedAnnualNet = points.at(-1)?.adjustedCumulative ?? 0;
+  return { points, baselineAnnualNet, adjustedAnnualNet, delta: round2(adjustedAnnualNet - baselineAnnualNet), unmatched };
+}
+
+function clampMonth(m: number) {
+  return Number.isFinite(m) ? Math.min(PROJECTION_MONTHS, Math.max(1, Math.round(m))) : 1;
+}
+
+export function isScenarioAdjustment(v: unknown): v is ScenarioAdjustment {
+  if (!v || typeof v !== "object") return false;
+  const a = v as Record<string, unknown>;
+  if (typeof a.startMonth !== "number" || typeof a.description !== "string") return false;
+  if (a.type === "REVENUE_PCT" || a.type === "EXPENSE_PCT") return typeof a.pct === "number" && (a.match === null || typeof a.match === "string");
+  if (a.type === "REVENUE_ADD" || a.type === "EXPENSE_ADD") return typeof a.amount === "number" && typeof a.label === "string";
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Accounts, workspaces & paywall
+// ---------------------------------------------------------------------------
+
+export const PLAN_CATEGORIES = ["PERSONAL_FAMILY", "SMALL_BUSINESS"] as const;
+export type PlanCategory = (typeof PLAN_CATEGORIES)[number];
+export const PLAN_CATEGORY_LABELS: Record<PlanCategory, string> = {
+  PERSONAL_FAMILY: "Personal / Family",
+  SMALL_BUSINESS: "Small Business",
+};
+
+export type SubscriptionTier = "free" | "pro";
+
+export interface UserProfile {
+  id: string;
+  email: string | null;
+  planCategory: PlanCategory;
+  tier: SubscriptionTier;
+  subscriptionStatus: string | null;
+  reportUnlocks: number;
+  hasStripeCustomer: boolean;
+  defaultWorkspaceId: string | null;
+}
+
+export interface WorkspaceProfile {
+  id: string;
+  name: string;
+  mode: WorkspaceMode;
+  businessType: BusinessType;
+  createdAt: string;
+}
+
+export interface SavedScenario {
+  id: string;
+  workspaceId: string;
+  prompt: string;
+  adjustments: ScenarioAdjustment[];
+  summary: { baselineAnnualNet: number; adjustedAnnualNet: number; delta: number; explanation: string };
+  createdAt: string;
+}
+
+export const PRICING = {
+  reportUnlockUsd: 29,
+  proMonthlyUsd: 39,
+} as const;
+
+/**
+ * What the API tells the client about access. In "teaser" mode the analysis
+ * payload has been redacted server-side: only the top HIGH flag, no projections,
+ * no per-line flags. `sealed` is an encrypted copy of the full analysis that
+ * only the server can open, so an unlock doesn't require re-running the model.
+ */
+export interface AnalysisAccess {
+  level: "full" | "teaser";
+  tier: SubscriptionTier;
+  signedIn: boolean;
+  totalFlagCount: number;
+  lockedFlagCount: number;
+  reportUnlocks: number;
+  sealed: string | null;
+}
+
+export interface AnalysisResponse {
+  analysis: FinancialAnalysis;
+  access: AnalysisAccess;
+}
+
+export function isAnalysisResponse(value: unknown): value is AnalysisResponse {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  const a = v.access as Record<string, unknown> | undefined;
+  return isFinancialAnalysis(v.analysis) && !!a && (a.level === "full" || a.level === "teaser") && typeof a.lockedFlagCount === "number";
 }
 
 // ---------------------------------------------------------------------------
