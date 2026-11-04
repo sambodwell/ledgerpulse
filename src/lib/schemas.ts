@@ -34,15 +34,27 @@ export type Severity = (typeof SEVERITIES)[number];
 
 export interface RevenueLine {
   label: string;
-  amount: number; // monthly
+  amount: number; // monthly (or the single amount when oneTime)
   margin: number; // 0..1 gross margin
+  /** A single, non-repeating amount (e.g. a bonus). Absent/false = recurring every month. */
+  oneTime?: boolean;
 }
 
 export interface ExpenseLine {
   label: string;
-  amount: number; // monthly
+  amount: number; // monthly (or the single amount when oneTime)
   category: string;
   flag?: string;
+  /** A single, non-repeating charge (e.g. a late fee or one purchase). Absent/false = recurring every month. */
+  oneTime?: boolean;
+}
+
+/** Recurring monthly total and one-time total of a set of line items. */
+export function splitTotals(lines: { amount: number; oneTime?: boolean }[]): { recurring: number; oneTime: number } {
+  return {
+    recurring: round2(sum(lines.filter((l) => !l.oneTime), (l) => l.amount)),
+    oneTime: round2(sum(lines.filter((l) => l.oneTime), (l) => l.amount)),
+  };
 }
 
 export interface MacroProjection {
@@ -403,11 +415,15 @@ const MONTH_FMT = new Intl.DateTimeFormat("en-US", { month: "short", year: "nume
 /**
  * Builds a 12-month projection starting next month.
  * month m (1-based) compounds inflation as (1 + rate)^(m/12).
+ * Recurring amounts get seasonality × inflation every month; one-time amounts land
+ * once, as-is, in month 1.
  */
 export function buildMacroProjections(params: {
   businessType: BusinessType;
   monthlyRevenue: number;
   monthlyExpenses: number;
+  oneTimeRevenue?: number;
+  oneTimeExpenses?: number;
   inflationRate?: number;
   startDate?: Date;
   months?: number;
@@ -416,14 +432,16 @@ export function buildMacroProjections(params: {
     businessType,
     monthlyRevenue,
     monthlyExpenses,
+    oneTimeRevenue = 0,
+    oneTimeExpenses = 0,
     inflationRate = DEFAULT_INFLATION_RATE,
     startDate = new Date(),
     months = PROJECTION_MONTHS,
   } = params;
-  return projectionFactors({ businessType, inflationRate, startDate, months }).map((f) => ({
+  return projectionFactors({ businessType, inflationRate, startDate, months }).map((f, i) => ({
     month: f.month,
-    projectedRevenue: round2(monthlyRevenue * f.revenue),
-    projectedExpenses: round2(monthlyExpenses * f.expenses),
+    projectedRevenue: round2(monthlyRevenue * f.revenue + (i === 0 ? oneTimeRevenue : 0)),
+    projectedExpenses: round2(monthlyExpenses * f.expenses + (i === 0 ? oneTimeExpenses : 0)),
   }));
 }
 
@@ -491,8 +509,8 @@ export interface ScenarioResult {
 
 export interface ScenarioBaseline {
   businessType: BusinessType;
-  itemizedRevenue: Pick<RevenueLine, "label" | "amount">[];
-  itemizedExpenses: Pick<ExpenseLine, "label" | "amount" | "category">[];
+  itemizedRevenue: Pick<RevenueLine, "label" | "amount" | "oneTime">[];
+  itemizedExpenses: Pick<ExpenseLine, "label" | "amount" | "category" | "oneTime">[];
   inflationRateAssumed: number;
 }
 
@@ -508,8 +526,11 @@ const matches = (needle: string | null, ...hay: string[]) => {
 /** Applies scenario adjustments on top of the baseline line items and projects 12 months. */
 export function applyScenario(base: ScenarioBaseline, adjustments: ScenarioAdjustment[], startDate = new Date()): ScenarioResult {
   const factors = projectionFactors({ businessType: base.businessType, inflationRate: base.inflationRateAssumed, startDate });
-  const baseRev = sum(base.itemizedRevenue, (r) => r.amount);
-  const baseExp = sum(base.itemizedExpenses, (e) => e.amount);
+  const revTotals = splitTotals(base.itemizedRevenue);
+  const expTotals = splitTotals(base.itemizedExpenses);
+  // One-time lines only happen in month 1, untouched by scenario adjustments, seasonality or inflation.
+  const recurringRevenue = base.itemizedRevenue.filter((r) => !r.oneTime);
+  const recurringExpenses = base.itemizedExpenses.filter((e) => !e.oneTime);
 
   const unmatched = adjustments
     .filter((a) => (a.type === "REVENUE_PCT" || a.type === "EXPENSE_PCT") && a.match)
@@ -526,21 +547,22 @@ export function applyScenario(base: ScenarioBaseline, adjustments: ScenarioAdjus
     const m = idx + 1;
     const active = adjustments.filter((a) => m >= clampMonth(a.startMonth));
     let rev = 0;
-    for (const r of base.itemizedRevenue) {
+    for (const r of recurringRevenue) {
       const mult = active.filter((a) => a.type === "REVENUE_PCT" && matches(a.match, r.label)).reduce((acc, a) => acc * (1 + (a as { pct: number }).pct), 1);
       rev += r.amount * mult;
     }
     let exp = 0;
-    for (const e of base.itemizedExpenses) {
+    for (const e of recurringExpenses) {
       const mult = active.filter((a) => a.type === "EXPENSE_PCT" && matches(a.match, e.category, e.label)).reduce((acc, a) => acc * (1 + (a as { pct: number }).pct), 1);
       exp += e.amount * mult;
     }
     rev += sum(active.filter((a) => a.type === "REVENUE_ADD"), (a) => (a as { amount: number }).amount);
     exp += sum(active.filter((a) => a.type === "EXPENSE_ADD"), (a) => (a as { amount: number }).amount);
 
-    const adjustedRevenue = round2(rev * f.revenue);
-    const adjustedExpenses = round2(exp * f.expenses);
-    const baselineNet = round2(baseRev * f.revenue - baseExp * f.expenses);
+    const oneTimeNet = m === 1 ? revTotals.oneTime - expTotals.oneTime : 0;
+    const adjustedRevenue = round2(rev * f.revenue + (m === 1 ? revTotals.oneTime : 0));
+    const adjustedExpenses = round2(exp * f.expenses + (m === 1 ? expTotals.oneTime : 0));
+    const baselineNet = round2(revTotals.recurring * f.revenue - expTotals.recurring * f.expenses + oneTimeNet);
     const adjustedNet = round2(adjustedRevenue - adjustedExpenses);
     const prev = points.at(-1);
     points.push({
@@ -672,6 +694,19 @@ export function isAnalysisResponse(value: unknown): value is AnalysisResponse {
 // ---------------------------------------------------------------------------
 // Validators
 // ---------------------------------------------------------------------------
+
+/** Line items parsed from an uploaded statement, returned for review before the report is generated. */
+export interface ExtractedLineItems {
+  businessType: BusinessType;
+  revenue: RevenueLine[];
+  expenses: ExpenseLine[];
+}
+
+export function isExtractedLineItems(value: unknown): value is ExtractedLineItems {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return isBusinessType(v.businessType) && Array.isArray(v.revenue) && Array.isArray(v.expenses);
+}
 
 export interface MissingCategoryWarning {
   category: string;

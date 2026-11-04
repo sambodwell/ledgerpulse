@@ -1,6 +1,6 @@
 "use client";
 
-import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
+import { Component, useCallback, useEffect, useId, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import {
   Area,
@@ -31,6 +31,8 @@ import {
   Lock,
   MessageSquareText,
   Plus,
+  Repeat,
+  Repeat1,
   Send,
   ShieldAlert,
   ShieldCheck,
@@ -50,12 +52,16 @@ import {
   PRICING,
   applyScenario,
   isAnalysisResponse,
+  isExtractedLineItems,
   isBusinessType,
   modeOf,
+  splitTotals,
   sum,
   type AnalysisAccess,
   type AnalysisResponse,
   type BusinessType,
+  type ExpenseLine,
+  type RevenueLine,
   type FinancialAnalysis,
   type SavedScenario,
   type ScenarioBaseline,
@@ -66,6 +72,7 @@ import {
 } from "@/lib/schemas";
 import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
+import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
 import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu } from "@/components/ProfileMenu";
@@ -302,7 +309,7 @@ export default function DashboardPage() {
     [app, current, wsKey],
   );
 
-  const isPro = app.profile?.tier === "pro";
+  const isPro = DEV_UNLOCK || app.profile?.tier === "pro";
   const paywall: Paywall | null = current
     ? {
         access: current.access,
@@ -560,23 +567,58 @@ interface FormRevenue {
   label: string;
   amount: string;
   margin: string; // percent, 0–100
+  /** Every line starts recurring; the owner can flip single amounts (a bonus, a refund) to one-time. */
+  oneTime: boolean;
 }
 interface FormExpense {
   id: number;
   label: string;
   amount: string;
   category: string;
+  /** Every line starts recurring; the owner can flip single charges (a late fee, one purchase) to one-time. */
+  oneTime: boolean;
 }
 
 type FormPayload = {
   mode: "form";
   businessType: BusinessType;
-  revenue: { label: string; amount: number; margin?: number }[];
-  expenses: { label: string; amount: number; category: string }[];
+  revenue: { label: string; amount: number; margin?: number; oneTime?: true }[];
+  expenses: { label: string; amount: number; category: string; oneTime?: true }[];
+  /** "statement" = parsed from an upload and reviewed by the owner. */
+  origin?: "manual" | "statement";
 };
 
 let nextId = 1;
 const newId = () => nextId++;
+
+const blankRevenue = (label = ""): FormRevenue => ({ id: newId(), label, amount: "", margin: "", oneTime: false });
+const blankExpense = (category = ""): FormExpense => ({ id: newId(), label: "", amount: "", category, oneTime: false });
+
+const validRevenueRows = (rows: FormRevenue[]) => rows.filter((r) => r.label.trim() && Number(r.amount) > 0);
+const validExpenseRows = (rows: FormExpense[]) => rows.filter((e) => expenseLabel(e) && Number(e.amount) > 0);
+
+/** Form rows → API payload lines. Only valid rows are sent; `oneTime` is sent only when set. */
+function toPayloadLines(revenue: FormRevenue[], expenses: FormExpense[], personal: boolean): Pick<FormPayload, "revenue" | "expenses"> {
+  return {
+    revenue: validRevenueRows(revenue).map((r) => ({
+      label: r.label.trim(),
+      amount: Number(r.amount),
+      ...(!personal && r.margin !== "" && Number.isFinite(Number(r.margin)) ? { margin: Math.min(100, Math.max(0, Number(r.margin))) / 100 } : {}),
+      ...(r.oneTime ? { oneTime: true as const } : {}),
+    })),
+    expenses: validExpenseRows(expenses).map((e) => ({
+      label: expenseLabel(e),
+      amount: Number(e.amount),
+      category: e.category.trim() || "Uncategorized",
+      ...(e.oneTime ? { oneTime: true as const } : {}),
+    })),
+  };
+}
+
+/** Recurring-per-month and one-time totals of the valid rows. */
+function rowTotals(rows: { amount: string; oneTime: boolean }[]) {
+  return splitTotals(rows.map((r) => ({ amount: Number(r.amount) || 0, oneTime: r.oneTime })));
+}
 
 function templateRows(bt: BusinessType) {
   const t = CATEGORY_TEMPLATES[bt];
@@ -584,9 +626,9 @@ function templateRows(bt: BusinessType) {
   // Custom businesses have no essentials: start with two blank lines to fill in.
   const seed = bt === "OTHER_CUSTOM" ? [{ category: "" }, { category: "" }] : bt === "PERSONAL_FAMILY" ? t.expenses.slice(0, 6) : essentials;
   return {
-    revenue: t.revenue.slice(0, bt === "OTHER_CUSTOM" ? 1 : 2).map<FormRevenue>((label) => ({ id: newId(), label: bt === "OTHER_CUSTOM" ? "" : label, amount: "", margin: "" })),
+    revenue: t.revenue.slice(0, bt === "OTHER_CUSTOM" ? 1 : 2).map((label) => blankRevenue(bt === "OTHER_CUSTOM" ? "" : label)),
     // Category is chosen first; the line item is a distinct description (left blank, with an example placeholder).
-    expenses: seed.map<FormExpense>((e) => ({ id: newId(), label: "", amount: "", category: e.category })),
+    expenses: seed.map((e) => blankExpense(e.category)),
   };
 }
 
@@ -595,18 +637,28 @@ const expenseLabel = (e: FormExpense) => e.label.trim() || e.category.trim();
 
 const STEPS = ["Type", "Income", "Expenses", "Review"] as const;
 
+/** Drafts saved before the recurring toggle existed have no `oneTime`; those rows load as recurring. */
+const optionalBool = (v: unknown) => v === undefined || typeof v === "boolean";
 const isFormRevenue = (r: unknown): r is FormRevenue =>
-  !!r && typeof r === "object" && typeof (r as FormRevenue).id === "number" && ["label", "amount", "margin"].every((k) => typeof (r as unknown as Record<string, unknown>)[k] === "string");
+  !!r &&
+  typeof r === "object" &&
+  typeof (r as FormRevenue).id === "number" &&
+  ["label", "amount", "margin"].every((k) => typeof (r as unknown as Record<string, unknown>)[k] === "string") &&
+  optionalBool((r as FormRevenue).oneTime);
 const isFormExpense = (e: unknown): e is FormExpense =>
-  !!e && typeof e === "object" && typeof (e as FormExpense).id === "number" && ["label", "amount", "category"].every((k) => typeof (e as unknown as Record<string, unknown>)[k] === "string");
+  !!e &&
+  typeof e === "object" &&
+  typeof (e as FormExpense).id === "number" &&
+  ["label", "amount", "category"].every((k) => typeof (e as unknown as Record<string, unknown>)[k] === "string") &&
+  optionalBool((e as FormExpense).oneTime);
 
 /** Reads a saved draft for this form, validating its shape and keeping row ids unique. Client-only (the form never SSRs). */
 function restoreDraft(key: string, mode: WorkspaceMode) {
   const d = loadDraft<unknown, unknown>(key);
   if (!d || !isBusinessType(d.businessType) || modeOf(d.businessType) !== mode) return null;
   if (!d.revenue.every(isFormRevenue) || !d.expenses.every(isFormExpense)) return null;
-  const revenue = d.revenue as FormRevenue[];
-  const expenses = d.expenses as FormExpense[];
+  const revenue = (d.revenue as FormRevenue[]).map((r) => ({ ...r, oneTime: r.oneTime === true }));
+  const expenses = (d.expenses as FormExpense[]).map((e) => ({ ...e, oneTime: e.oneTime === true }));
   nextId = Math.max(nextId, ...revenue.map((r) => r.id + 1), ...expenses.map((e) => e.id + 1));
   return { step: Math.min(Math.max(0, Math.trunc(d.step)), STEPS.length - 1), businessType: d.businessType, revenue, expenses };
 }
@@ -665,27 +717,17 @@ function GuidedForm({
   };
 
   const custom = businessType === "OTHER_CUSTOM";
-  const validRevenue = revenue.filter((r) => r.label.trim() && Number(r.amount) > 0);
-  const validExpenses = expenses.filter((e) => expenseLabel(e) && Number(e.amount) > 0);
+  const validRevenue = validRevenueRows(revenue);
+  const validExpenses = validExpenseRows(expenses);
 
   // Household tab: each category chip toggles its expense line on or off.
   const isCategoryOn = (c: string) => expenses.some((e) => e.category === c);
-  const toggleCategory = (c: string) =>
-    setExpenses((rows) => (rows.some((e) => e.category === c) ? rows.filter((e) => e.category !== c) : [...rows, { id: newId(), label: "", amount: "", category: c }]));
+  const toggleCategory = (c: string) => setExpenses((rows) => (rows.some((e) => e.category === c) ? rows.filter((e) => e.category !== c) : [...rows, blankExpense(c)]));
   const canNext = step === 0 || (step === 1 ? validRevenue.length > 0 : true);
   const stepLabels = STEPS.map((s, i) => (i === 0 ? (personal ? "Household" : "Business") : i === 1 ? copy.revenue : s));
 
   const submit = async () => {
-    const ok = await onSubmit({
-      mode: "form",
-      businessType,
-      revenue: validRevenue.map((r) => ({
-        label: r.label.trim(),
-        amount: Number(r.amount),
-        ...(!personal && r.margin !== "" && Number.isFinite(Number(r.margin)) ? { margin: Math.min(100, Math.max(0, Number(r.margin))) / 100 } : {}),
-      })),
-      expenses: validExpenses.map((e) => ({ label: expenseLabel(e), amount: Number(e.amount), category: e.category.trim() || "Uncategorized" })),
-    });
+    const ok = await onSubmit({ mode: "form", businessType, ...toPayloadLines(revenue, expenses, personal) });
     // The report was generated: the draft has served its purpose. Further edits start a new draft.
     if (ok) {
       clearDraft(storageKey);
@@ -693,9 +735,6 @@ function GuidedForm({
       setRestored(false);
     }
   };
-
-  const categoryOptions = CATEGORY_TEMPLATES[businessType].expenses.map((e) => e.category);
-  const datalistId = `cats-${businessType}`;
 
   return (
     <div className={cn(glass, "flex h-full flex-col p-6")} onClickCapture={markTouched} onChangeCapture={markTouched}>
@@ -780,90 +819,32 @@ function GuidedForm({
           ))}
 
         {step === 1 && (
-          <RowEditor
-            hint={personal ? "Average monthly take-home income from each source." : "Average monthly amounts. Margin is optional — we'll estimate it if blank."}
-            columns={personal ? [copy.revenueLines, "Monthly $"] : [copy.revenueLines, "Monthly $", "Margin %"]}
+          <RevenueRowsEditor
             rows={revenue}
-            onAdd={() => setRevenue((r) => [...r, { id: newId(), label: "", amount: "", margin: "" }])}
-            onRemove={(id) => setRevenue((r) => r.filter((x) => x.id !== id))}
-            render={(row) => (
-              <>
-                <TextInput aria-label={copy.revenueLines} value={row.label} placeholder={custom ? "e.g. Catering orders" : undefined} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, label: v } : x)))} />
-                <MoneyInput aria-label="Monthly amount" value={row.amount} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, amount: v } : x)))} />
-                {!personal && <NumInput aria-label="Margin percent" value={row.margin} placeholder="auto" onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, margin: v } : x)))} />}
-              </>
-            )}
+            setRows={setRevenue}
+            mode={mode}
+            custom={custom}
+            hint={personal ? "Take-home income from each source. Lines repeat monthly unless you mark them one-time." : "Monthly amounts; mark single payments one-time. Margin is optional — we'll estimate it if blank."}
           />
         )}
 
         {step === 2 && (
-          <RowEditor
+          <ExpenseRowsEditor
+            rows={expenses}
+            setRows={setExpenses}
+            mode={mode}
+            businessType={businessType}
             hint={
               custom
-                ? "Add your own expense lines and name the categories however you like."
+                ? "Add your own expense lines and name the categories however you like. Mark single charges (a late fee, one purchase) as one-time."
                 : personal
-                  ? "Pick a category, then optionally describe the specific item (e.g. which card or service). Add several lines per category if needed."
-                  : "We pre-filled the essential categories for your business type. Describe each line item, or leave a line at 0 if it truly doesn't apply — we'll flag it."
+                  ? "Pick a category, then optionally describe the specific item (e.g. which card or service). Lines repeat monthly unless you mark them one-time."
+                  : "We pre-filled the essential categories for your business type. Describe each line item, or leave a line at 0 if it truly doesn't apply — we'll flag it. Mark single charges as one-time."
             }
-            columns={["Category", personal ? "What it's for" : "Line item", "Monthly $"]}
-            variant="cards"
-            rows={expenses}
-            onAdd={() => setExpenses((r) => [...r, { id: newId(), label: "", amount: "", category: "" }])}
-            onRemove={(id) => setExpenses((r) => r.filter((x) => x.id !== id))}
-            render={(row, removeButton) => {
-              const update = (patch: Partial<FormExpense>) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, ...patch } : x)));
-              const help = personal ? CATEGORY_HELP[row.category] : undefined;
-              return (
-                <>
-                  <div className="flex items-center gap-2">
-                    {custom ? (
-                      <input aria-label="Category" list={datalistId} value={row.category} placeholder="Your category" title={row.category || undefined} onChange={(ev) => update({ category: ev.target.value })} className={cn(inputCls, "min-w-0 flex-1")} />
-                    ) : (
-                      <select aria-label="Category" value={row.category} title={row.category || "Auto-classify"} onChange={(ev) => update({ category: ev.target.value })} className={cn(inputCls, "min-w-0 flex-1 pr-8")}>
-                        <option value="">Auto-classify from description</option>
-                        {categoryOptions.map((c) => (
-                          <option key={c}>{c}</option>
-                        ))}
-                        {!categoryOptions.includes("Other") && <option>Other</option>}
-                      </select>
-                    )}
-                    {removeButton}
-                  </div>
-                  <div className="grid grid-cols-[minmax(0,1fr)_7.5rem] gap-2">
-                    <TextInput
-                      aria-label={personal ? "What it's for" : "Line item"}
-                      value={row.label}
-                      placeholder={CATEGORY_LINE_HINTS[row.category] ?? (row.category ? "Optional description" : "Describe the expense")}
-                      onChange={(v) => update({ label: v })}
-                    />
-                    <MoneyInput aria-label="Monthly amount" value={row.amount} onChange={(v) => update({ amount: v })} />
-                  </div>
-                  {help && (
-                    <p className="flex items-start gap-1.5 text-xs text-slate-400">
-                      <Info className="mt-0.5 h-3 w-3 shrink-0" /> {help}
-                    </p>
-                  )}
-                </>
-              );
-            }}
           />
         )}
-        {custom && (
-          <datalist id={datalistId}>
-            {categoryOptions.map((c) => (
-              <option key={c} value={c} />
-            ))}
-          </datalist>
-        )}
 
-        {step === 3 && (
-          <dl className="space-y-3 text-sm">
-            <ReviewRow label={personal ? "Mode" : "Business type"} value={BUSINESS_TYPE_LABELS[businessType]} />
-            <ReviewRow label={`${copy.revenue} (${validRevenue.length} lines)`} value={usd.format(sum(validRevenue, (r) => Number(r.amount)))} />
-            <ReviewRow label={`${copy.expenses} (${validExpenses.length} lines)`} value={usd.format(sum(validExpenses, (e) => Number(e.amount)))} />
-            <ReviewRow label={copy.net} value={usd.format(sum(validRevenue, (r) => Number(r.amount)) - sum(validExpenses, (e) => Number(e.amount)))} />
-          </dl>
-        )}
+        {step === 3 && <ReviewSummary mode={mode} businessType={businessType} revenue={validRevenue} expenses={validExpenses} />}
       </div>
 
       <div className="mt-6 flex items-center justify-between">
@@ -884,18 +865,212 @@ function GuidedForm({
   );
 }
 
+/** Editable revenue / income lines. Shared by the guided form and the post-upload review. */
+function RevenueRowsEditor({
+  rows,
+  setRows,
+  mode,
+  custom = false,
+  hint,
+}: {
+  rows: FormRevenue[];
+  setRows: (fn: (rows: FormRevenue[]) => FormRevenue[]) => void;
+  mode: WorkspaceMode;
+  custom?: boolean;
+  hint: string;
+}) {
+  const personal = mode === "PERSONAL";
+  const copy = MODE_COPY[mode];
+  return (
+    <RowEditor
+      hint={hint}
+      columns={personal ? [copy.revenueLines, "Amount", "Recurring / one-time"] : [copy.revenueLines, "Amount", "Margin %", "Recurring / one-time"]}
+      rows={rows}
+      onAdd={() => setRows((r) => [...r, blankRevenue()])}
+      onRemove={(id) => setRows((r) => r.filter((x) => x.id !== id))}
+      render={(row, removeButton) => {
+        const update = (patch: Partial<FormRevenue>) => setRows((r) => r.map((x) => (x.id === row.id ? { ...x, ...patch } : x)));
+        return (
+          <>
+            <div className="flex items-center gap-2">
+              <div className="min-w-0 flex-1">
+                <TextInput aria-label={copy.revenueLines} value={row.label} placeholder={custom ? "e.g. Catering orders" : "Describe the source"} onChange={(v) => update({ label: v })} />
+              </div>
+              {removeButton}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="w-[7.5rem]">
+                <MoneyInput aria-label={row.oneTime ? "One-time amount" : "Monthly amount"} value={row.amount} onChange={(v) => update({ amount: v })} />
+              </div>
+              {!personal && (
+                <div className="w-[7.5rem]">
+                  <NumInput aria-label="Margin percent" value={row.margin} placeholder="Margin % (auto)" onChange={(v) => update({ margin: v })} />
+                </div>
+              )}
+              <RecurrenceToggle oneTime={row.oneTime} onChange={(oneTime) => update({ oneTime })} />
+            </div>
+          </>
+        );
+      }}
+    />
+  );
+}
+
+/** Editable expense / spending lines. Shared by the guided form and the post-upload review. */
+function ExpenseRowsEditor({
+  rows,
+  setRows,
+  mode,
+  businessType,
+  hint,
+}: {
+  rows: FormExpense[];
+  setRows: (fn: (rows: FormExpense[]) => FormExpense[]) => void;
+  mode: WorkspaceMode;
+  businessType: BusinessType;
+  hint: string;
+}) {
+  const personal = mode === "PERSONAL";
+  const custom = businessType === "OTHER_CUSTOM";
+  const datalistId = useId();
+  const templateCategories = CATEGORY_TEMPLATES[businessType].expenses.map((e) => e.category);
+  // Parsed statements can carry categories outside the template; keep them selectable.
+  const categoryOptions = Array.from(new Set([...templateCategories, ...rows.map((r) => r.category.trim()).filter(Boolean)]));
+  return (
+    <>
+      <RowEditor
+        hint={hint}
+        columns={["Category", personal ? "What it's for" : "Line item", "Amount", "Recurring / one-time"]}
+        rows={rows}
+        onAdd={() => setRows((r) => [...r, blankExpense()])}
+        onRemove={(id) => setRows((r) => r.filter((x) => x.id !== id))}
+        render={(row, removeButton) => {
+          const update = (patch: Partial<FormExpense>) => setRows((r) => r.map((x) => (x.id === row.id ? { ...x, ...patch } : x)));
+          const help = personal ? CATEGORY_HELP[row.category] : undefined;
+          return (
+            <>
+              <div className="flex items-center gap-2">
+                {custom ? (
+                  <input aria-label="Category" list={datalistId} value={row.category} placeholder="Your category" title={row.category || undefined} onChange={(ev) => update({ category: ev.target.value })} className={cn(inputCls, "min-w-0 flex-1")} />
+                ) : (
+                  <select aria-label="Category" value={row.category} title={row.category || "Auto-classify"} onChange={(ev) => update({ category: ev.target.value })} className={cn(inputCls, "min-w-0 flex-1 pr-8")}>
+                    <option value="">Auto-classify from description</option>
+                    {categoryOptions.map((c) => (
+                      <option key={c}>{c}</option>
+                    ))}
+                    {!categoryOptions.includes("Other") && <option>Other</option>}
+                  </select>
+                )}
+                {removeButton}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="min-w-[10rem] flex-1">
+                  <TextInput
+                    aria-label={personal ? "What it's for" : "Line item"}
+                    value={row.label}
+                    placeholder={CATEGORY_LINE_HINTS[row.category] ?? (row.category ? "Optional description" : "Describe the expense")}
+                    onChange={(v) => update({ label: v })}
+                  />
+                </div>
+                <div className="w-[7.5rem]">
+                  <MoneyInput aria-label={row.oneTime ? "One-time amount" : "Monthly amount"} value={row.amount} onChange={(v) => update({ amount: v })} />
+                </div>
+                <RecurrenceToggle oneTime={row.oneTime} onChange={(oneTime) => update({ oneTime })} />
+              </div>
+              {help && (
+                <p className="flex items-start gap-1.5 text-xs text-slate-400">
+                  <Info className="mt-0.5 h-3 w-3 shrink-0" /> {help}
+                </p>
+              )}
+            </>
+          );
+        }}
+      />
+      {custom && (
+        <datalist id={datalistId}>
+          {categoryOptions.map((c) => (
+            <option key={c} value={c} />
+          ))}
+        </datalist>
+      )}
+    </>
+  );
+}
+
+/** Recurring (default) ↔ one-time switch for a single line item. */
+function RecurrenceToggle({ oneTime, onChange }: { oneTime: boolean; onChange: (oneTime: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={oneTime}
+      aria-label="One-time amount"
+      title={oneTime ? "One-time: counted once, in the first projected month. Click to make it recurring." : "Recurring: repeats every month. Click to mark it one-time."}
+      onClick={() => onChange(!oneTime)}
+      className={cn(
+        "inline-flex h-[38px] shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300",
+        oneTime ? "border-amber-300/40 bg-amber-400/10 text-amber-100 hover:bg-amber-400/15" : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.07]",
+      )}
+    >
+      {oneTime ? <Repeat1 className="h-3.5 w-3.5" /> : <Repeat className="h-3.5 w-3.5 text-slate-400" />}
+      {oneTime ? "One-time" : "Recurring"}
+    </button>
+  );
+}
+
+/** Totals before submitting: recurring per month, with one-time amounts listed separately. */
+function ReviewSummary({ mode, businessType, revenue, expenses }: { mode: WorkspaceMode; businessType: BusinessType; revenue: FormRevenue[]; expenses: FormExpense[] }) {
+  const copy = MODE_COPY[mode];
+  const rev = rowTotals(revenue);
+  const exp = rowTotals(expenses);
+  const oneTimeRev = revenue.filter((r) => r.oneTime).length;
+  const oneTimeExp = expenses.filter((e) => e.oneTime).length;
+  return (
+    <dl className="space-y-3 text-sm">
+      <ReviewRow label={mode === "PERSONAL" ? "Mode" : "Business type"} value={BUSINESS_TYPE_LABELS[businessType]} />
+      <ReviewRow label={`${copy.revenue} / month (${revenue.length - oneTimeRev} recurring)`} value={usd.format(rev.recurring)} />
+      <ReviewRow label={`${copy.expenses} / month (${expenses.length - oneTimeExp} recurring)`} value={usd.format(exp.recurring)} />
+      <ReviewRow label={copy.net} value={usd.format(rev.recurring - exp.recurring)} />
+      {(oneTimeRev > 0 || oneTimeExp > 0) && (
+        <ReviewRow
+          label={`One-time (${oneTimeRev + oneTimeExp} line${oneTimeRev + oneTimeExp === 1 ? "" : "s"}, first month only)`}
+          value={`${rev.oneTime - exp.oneTime >= 0 ? "+" : ""}${usd.format(rev.oneTime - exp.oneTime)}`}
+        />
+      )}
+    </dl>
+  );
+}
+
+const prefersReducedMotion = () => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
 function RowEditor<T extends { id: number }>(props: {
   hint: string;
   columns: string[];
   rows: T[];
   onAdd: () => void;
   onRemove: (id: number) => void;
-  /** "table": one grid row per line. "cards": stacked rows, so long labels (e.g. category names) get full width. */
-  variant?: "table" | "cards";
+  /** Rendered inside a stacked card per line, so long labels (e.g. category names) get full width. */
   render: (row: T, removeButton: ReactNode) => ReactNode;
 }) {
-  const grid = props.columns.length === 2 ? "grid-cols-[minmax(0,1fr)_7.5rem_2rem]" : "grid-cols-[minmax(0,1fr)_6.5rem_6.5rem_2rem]";
-  const cards = props.variant === "cards";
+  const listRef = useRef<HTMLDivElement>(null);
+  const scrollToNew = useRef(false);
+  const count = props.rows.length;
+
+  // After "Add line": bring the new (last) row into view inside the scrolling list and the page, then focus its first field.
+  useEffect(() => {
+    if (!scrollToNew.current) return;
+    scrollToNew.current = false;
+    const row = listRef.current?.lastElementChild as HTMLElement | null;
+    if (!row) return;
+    row.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "nearest" });
+    row.querySelector<HTMLElement>("input, select")?.focus({ preventScroll: true });
+  }, [count]);
+
+  const add = () => {
+    scrollToNew.current = true;
+    props.onAdd();
+  };
+
   const remove = (id: number) => (
     <button type="button" onClick={() => props.onRemove(id)} aria-label="Remove line" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-500 hover:bg-white/5 hover:text-rose-300">
       <Trash2 className="h-4 w-4" />
@@ -904,31 +1079,15 @@ function RowEditor<T extends { id: number }>(props: {
   return (
     <div>
       <p className="mb-3 text-sm text-slate-400">{props.hint}</p>
-      {cards ? (
-        <p className="px-1 pb-1 text-xs uppercase tracking-wide text-slate-500">{props.columns.join(" → ")}</p>
-      ) : (
-        <div className={cn("grid gap-2 px-1 pb-1 text-xs uppercase tracking-wide text-slate-500", grid)}>
-          {props.columns.map((c) => (
-            <span key={c}>{c}</span>
-          ))}
-          <span />
-        </div>
-      )}
-      <div className={cn("max-h-80 overflow-y-auto pr-1", cards ? "space-y-3" : "space-y-2")}>
-        {props.rows.map((row) =>
-          cards ? (
-            <div key={row.id} className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
-              {props.render(row, remove(row.id))}
-            </div>
-          ) : (
-            <div key={row.id} className={cn("grid items-center gap-2", grid)}>
-              {props.render(row, null)}
-              {remove(row.id)}
-            </div>
-          ),
-        )}
+      <p className="px-1 pb-1 text-xs uppercase tracking-wide text-slate-500">{props.columns.join(" → ")}</p>
+      <div ref={listRef} className="max-h-80 space-y-3 overflow-y-auto scroll-py-2 pr-1">
+        {props.rows.map((row) => (
+          <div key={row.id} className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
+            {props.render(row, remove(row.id))}
+          </div>
+        ))}
       </div>
-      <button onClick={props.onAdd} className="mt-3 inline-flex items-center gap-1.5 text-sm text-indigo-300 hover:text-indigo-200">
+      <button type="button" onClick={add} className="mt-3 inline-flex items-center gap-1.5 text-sm text-indigo-300 hover:text-indigo-200">
         <Plus className="h-4 w-4" /> Add line
       </button>
     </div>
@@ -1000,30 +1159,88 @@ function ReviewRow({ label, value }: { label: string; value: string }) {
 
 const ACCEPT = ".pdf,.txt,.csv,application/pdf,text/plain,text/csv";
 
-function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; disabled: boolean; onSubmit: (init: RequestInit) => void }) {
+interface UploadReviewState {
+  businessType: BusinessType;
+  revenue: FormRevenue[];
+  expenses: FormExpense[];
+}
+
+/** Parsed statement lines → editable form rows. Amounts are shown with cents; margins as percents. */
+function toReviewState(items: { businessType: BusinessType; revenue: RevenueLine[]; expenses: ExpenseLine[] }, mode: WorkspaceMode): UploadReviewState {
+  const personal = mode === "PERSONAL";
+  // A business workspace always gets a business analysis, even if the statement looked personal.
+  const businessType: BusinessType = personal ? "PERSONAL_FAMILY" : items.businessType === "PERSONAL_FAMILY" ? "OTHER_CUSTOM" : items.businessType;
+  return {
+    businessType,
+    revenue: items.revenue.map((r) => ({
+      ...blankRevenue(r.label),
+      amount: r.amount.toFixed(2),
+      margin: personal || !Number.isFinite(r.margin) ? "" : String(Math.round(r.margin * 100)),
+      oneTime: r.oneTime === true,
+    })),
+    expenses: items.expenses.map((e) => ({ ...blankExpense(e.category), label: e.label, amount: e.amount.toFixed(2), oneTime: e.oneTime === true })),
+  };
+}
+
+function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; disabled: boolean; onSubmit: (init: RequestInit) => Promise<boolean> }) {
   const personal = mode === "PERSONAL";
   const [file, setFile] = useState<File | null>(null);
   const [pasted, setPasted] = useState("");
   const [input, setInput] = useState<"file" | "paste">("file");
   const [businessType, setBusinessType] = useState<BusinessType | "">(personal ? "PERSONAL_FAMILY" : "");
   const [dragOver, setDragOver] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [extractError, setExtractError] = useState<string | null>(null);
+  const [review, setReview] = useState<UploadReviewState | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const ready = input === "file" ? !!file : pasted.trim().length > 0;
+  const busy = disabled || extracting;
 
-  const submit = () => {
+  /** Same document payload for both paths; "extract" returns line items only, "text"/file runs the full analysis. */
+  const documentInit = (extract: boolean): RequestInit => {
     if (input === "file" && file) {
       const fd = new FormData();
       fd.append("file", file);
       if (businessType) fd.append("businessType", businessType);
-      onSubmit({ body: fd });
-    } else {
-      onSubmit({
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "text", rawText: pasted, ...(businessType ? { businessType } : {}) }),
-      });
+      if (extract) fd.append("mode", "extract");
+      return { body: fd };
+    }
+    return {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: extract ? "extract" : "text", rawText: pasted, ...(businessType ? { businessType } : {}) }),
+    };
+  };
+
+  const extract = async () => {
+    setExtracting(true);
+    setExtractError(null);
+    try {
+      const init = documentInit(true);
+      const res = await fetch("/api/analyze", { method: "POST", ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...(await authHeaders()) } });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      const data = (await res.json()) as { items?: unknown };
+      if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response from the analysis service.");
+      setReview(toReviewState(data.items, mode));
+    } catch (e) {
+      setExtractError(e instanceof Error ? e.message : "Couldn't read the statement.");
+    } finally {
+      setExtracting(false);
     }
   };
+
+  if (review) {
+    return (
+      <UploadReview
+        mode={mode}
+        review={review}
+        setReview={setReview}
+        disabled={disabled}
+        onBack={() => setReview(null)}
+        onGenerate={(payload) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })}
+      />
+    );
+  }
 
   return (
     <div className={cn(glass, "flex h-full flex-col p-6")}>
@@ -1109,9 +1326,101 @@ function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; 
         <Lock className="mt-0.5 h-3 w-3 shrink-0" /> Encrypted in transit and parsed in memory. LedgerPulse never writes your file to disk or a database.
       </p>
 
-      <button onClick={submit} disabled={disabled || !ready} className={cn(primaryBtn, "mt-4 py-2.5")}>
-        {disabled && <Loader2 className="h-4 w-4 animate-spin" />} Analyze statement
+      {extractError && (
+        <p role="alert" className="mt-4 flex items-start gap-1.5 text-sm text-rose-200">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> {extractError}
+        </p>
+      )}
+
+      <button onClick={extract} disabled={busy || !ready} className={cn(primaryBtn, "mt-4 py-2.5")}>
+        {extracting && <Loader2 className="h-4 w-4 animate-spin" />} {extracting ? "Reading line items…" : "Extract & review line items"}
       </button>
+      <button type="button" onClick={() => void onSubmit(documentInit(false))} disabled={busy || !ready} className="mt-2 self-center text-xs text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline disabled:opacity-40">
+        Skip review and analyze directly
+      </button>
+    </div>
+  );
+}
+
+/** Post-upload step: the owner edits, re-categorizes, deletes or adds parsed lines, then generates the report. */
+function UploadReview({
+  mode,
+  review,
+  setReview,
+  disabled,
+  onBack,
+  onGenerate,
+}: {
+  mode: WorkspaceMode;
+  review: UploadReviewState;
+  setReview: (fn: (r: UploadReviewState | null) => UploadReviewState | null) => void;
+  disabled: boolean;
+  onBack: () => void;
+  onGenerate: (payload: FormPayload) => Promise<boolean>;
+}) {
+  const personal = mode === "PERSONAL";
+  const copy = MODE_COPY[mode];
+  const { businessType, revenue, expenses } = review;
+  const validRevenue = validRevenueRows(revenue);
+  const validExpenses = validExpenseRows(expenses);
+  const setRevenue = (fn: (rows: FormRevenue[]) => FormRevenue[]) => setReview((r) => r && { ...r, revenue: fn(r.revenue) });
+  const setExpenses = (fn: (rows: FormExpense[]) => FormExpense[]) => setReview((r) => r && { ...r, expenses: fn(r.expenses) });
+
+  return (
+    <div className={cn(glass, "flex h-full flex-col p-6")}>
+      <div className="flex items-center gap-2">
+        <ClipboardList className="h-5 w-5 text-indigo-300" />
+        <h2 className="text-lg font-semibold">Review parsed line items</h2>
+      </div>
+      <p className="mt-1 text-sm text-slate-400">
+        We read {revenue.length + expenses.length} line{revenue.length + expenses.length === 1 ? "" : "s"} from your statement. Fix amounts or categories, delete anything that doesn&apos;t belong,
+        add what&apos;s missing, and mark single charges one-time — then generate the report.
+      </p>
+
+      {!personal && (
+        <label className="mt-4 block text-sm">
+          <span className="text-slate-400">Business type</span>
+          <select value={businessType} onChange={(e) => setReview((r) => r && { ...r, businessType: e.target.value as BusinessType })} className={cn(inputCls, "mt-1")}>
+            {BUSINESS_ONLY_TYPES.map((bt) => (
+              <option key={bt} value={bt}>
+                {BUSINESS_TYPE_LABELS[bt]}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
+      <div className="mt-5 flex-1 space-y-6">
+        <section aria-label={copy.revenue}>
+          <h3 className="mb-2 text-sm font-medium text-slate-200">{copy.revenue}</h3>
+          <RevenueRowsEditor rows={revenue} setRows={setRevenue} mode={mode} custom={businessType === "OTHER_CUSTOM"} hint="Recurring lines are average monthly amounts; one-time lines are the full single amount." />
+        </section>
+        <section aria-label={copy.expenses}>
+          <h3 className="mb-2 text-sm font-medium text-slate-200">{copy.expenses}</h3>
+          <ExpenseRowsEditor rows={expenses} setRows={setExpenses} mode={mode} businessType={businessType} hint="Change a category if it was misread; a blank category is auto-classified." />
+        </section>
+        <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+          <ReviewSummary mode={mode} businessType={businessType} revenue={validRevenue} expenses={validExpenses} />
+        </div>
+      </div>
+
+      {validRevenue.length === 0 && (
+        <p className="mt-4 text-sm text-amber-200">Add at least one {personal ? "income" : "revenue"} line with an amount to generate the report.</p>
+      )}
+
+      <div className="mt-6 flex items-center justify-between">
+        <button type="button" onClick={onBack} disabled={disabled} className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-white/5 disabled:opacity-30">
+          <ArrowLeft className="h-4 w-4" /> Back to upload
+        </button>
+        <button
+          type="button"
+          onClick={() => void onGenerate({ mode: "form", businessType, origin: "statement", ...toPayloadLines(revenue, expenses, personal) })}
+          disabled={disabled || validRevenue.length === 0}
+          className={primaryBtn}
+        >
+          {disabled && <Loader2 className="h-4 w-4 animate-spin" />} Generate report
+        </button>
+      </div>
     </div>
   );
 }
@@ -1248,12 +1557,15 @@ function projectionRows(a: FinancialAnalysis) {
 
 function useDerived(a: FinancialAnalysis) {
   return useMemo(() => {
-    const monthlyExpenses = sum(a.itemizedExpenses, (e) => e.amount);
+    // Monthly figures are recurring-only; one-time lines are shown separately and land in month 1 of the projection.
+    const monthlyExpenses = splitTotals(a.itemizedExpenses).recurring;
+    const oneTimeRevenue = splitTotals(a.itemizedRevenue).oneTime;
+    const oneTimeExpenses = splitTotals(a.itemizedExpenses).oneTime;
     const net = a.monthlyRevenue - monthlyExpenses;
     const rows = projectionRows(a);
     const annualNet = rows.at(-1)?.cumulative ?? 0;
     const firstNegative = rows.find((r) => r.cumulative < 0)?.month ?? null;
-    return { monthlyExpenses, net, rows, annualNet, firstNegative };
+    return { monthlyExpenses, oneTimeRevenue, oneTimeExpenses, net, rows, annualNet, firstNegative };
   }, [a]);
 }
 
@@ -1261,8 +1573,8 @@ function KpiRow({ analysis, mode, locked }: { analysis: FinancialAnalysis; mode:
   const d = useDerived(analysis);
   const copy = MODE_COPY[mode];
   const tiles: { label: string; value: string; sub?: string; bad?: boolean; locked?: boolean }[] = [
-    { label: `Monthly ${copy.revenue.toLowerCase()}`, value: usd.format(analysis.monthlyRevenue) },
-    { label: `Monthly ${copy.expenses.toLowerCase()}`, value: usd.format(d.monthlyExpenses) },
+    { label: `Monthly ${copy.revenue.toLowerCase()}`, value: usd.format(analysis.monthlyRevenue), sub: d.oneTimeRevenue > 0 ? `+ ${usd.format(d.oneTimeRevenue)} one-time` : undefined },
+    { label: `Monthly ${copy.expenses.toLowerCase()}`, value: usd.format(d.monthlyExpenses), sub: d.oneTimeExpenses > 0 ? `+ ${usd.format(d.oneTimeExpenses)} one-time` : undefined },
     { label: copy.net, value: usd.format(d.net), bad: d.net < 0 },
     locked
       ? { label: "12-mo projected net", value: "Locked", sub: "Unlock to see your forecast", locked: true }
@@ -1429,8 +1741,8 @@ function ScenarioPanel({ analysis, workspaceId }: { analysis: FinancialAnalysis;
   const baseline: ScenarioBaseline = useMemo(
     () => ({
       businessType: analysis.businessType,
-      itemizedRevenue: analysis.itemizedRevenue.map(({ label, amount }) => ({ label, amount })),
-      itemizedExpenses: analysis.itemizedExpenses.map(({ label, amount, category }) => ({ label, amount, category })),
+      itemizedRevenue: analysis.itemizedRevenue.map(({ label, amount, oneTime }) => ({ label, amount, oneTime })),
+      itemizedExpenses: analysis.itemizedExpenses.map(({ label, amount, category, oneTime }) => ({ label, amount, category, oneTime })),
       inflationRateAssumed: analysis.inflationRateAssumed,
     }),
     [analysis],
@@ -1782,6 +2094,14 @@ function WinnerCard({ analysis, label }: { analysis: FinancialAnalysis; label: s
   );
 }
 
+function OneTimeBadge() {
+  return (
+    <span className="ml-2 inline-flex items-center gap-1 rounded-md border border-amber-300/30 bg-amber-400/10 px-1.5 py-0.5 align-middle text-[11px] text-amber-100" title="Counted once, in the first projected month">
+      <Repeat1 className="h-3 w-3" /> One-time
+    </span>
+  );
+}
+
 function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
   const personal = analysis.businessType === "PERSONAL_FAMILY";
   const copy = MODE_COPY[modeOf(analysis.businessType)];
@@ -1792,7 +2112,10 @@ function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
         <ul className="mt-3 divide-y divide-white/5 text-sm">
           {analysis.itemizedRevenue.map((r) => (
             <li key={r.label} className="flex justify-between gap-3 py-2">
-              <span className="text-slate-300">{r.label}</span>
+              <span className="text-slate-300">
+                {r.label}
+                {r.oneTime && <OneTimeBadge />}
+              </span>
               <span className="tabular-nums">
                 {usd.format(r.amount)} {!personal && <span className="text-xs text-slate-500">· {pct(r.margin)} margin</span>}
               </span>
@@ -1809,6 +2132,7 @@ function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
                 <span className="text-slate-300">
                   {e.label}
                   {e.category && e.category.toLowerCase() !== e.label.toLowerCase() && <span className="text-xs text-slate-500"> · {e.category}</span>}
+                  {e.oneTime && <OneTimeBadge />}
                 </span>
                 <span className="tabular-nums">{usd.format(e.amount)}</span>
               </div>
@@ -1835,7 +2159,7 @@ function esc(s: string) {
 
 function reportHtml(a: FinancialAnalysis) {
   const copy = MODE_COPY[modeOf(a.businessType)];
-  const monthlyExpenses = sum(a.itemizedExpenses, (e) => e.amount);
+  const monthlyExpenses = splitTotals(a.itemizedExpenses).recurring;
   const net = a.monthlyRevenue - monthlyExpenses;
   const rows = projectionRows(a);
   const cumulative = rows.at(-1)?.cumulative ?? 0;
@@ -1874,7 +2198,7 @@ td:first-child,th:first-child{text-align:left}.neg{color:#b42318}li{margin-botto
 ${a.missingCategories.length ? `<h2>Missing categories</h2><p>${a.missingCategories.map(esc).join(", ")}</p>` : ""}
 <h2>12-month projection</h2>
 <table><thead><tr><th>Month</th><th>${esc(copy.revenue)}</th><th>${esc(copy.expenses)}</th><th>Net</th><th>Cumulative</th></tr></thead><tbody>${projRows}</tbody></table>
-<p class="muted" style="margin-top:24px;font-size:12px">Projections apply seasonality and inflation to current monthly averages. ${esc(LEGAL_DISCLAIMER)}</p>
+<p class="muted" style="margin-top:24px;font-size:12px">Projections apply seasonality and inflation to current recurring monthly averages; one-time items are counted once, in the first month. ${esc(LEGAL_DISCLAIMER)}</p>
 </body></html>`;
 }
 

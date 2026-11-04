@@ -11,8 +11,9 @@ import {
   isBusinessType,
   projectionFactors,
   round2,
-  sum,
+  splitTotals,
   type AnalysisResponse,
+  type ExtractedLineItems,
   type AuditFlag,
   type BusinessType,
   type ExpenseLine,
@@ -32,7 +33,10 @@ import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, reso
  * Accepts one of:
  *   - multipart/form-data: `file` (PDF or .txt/.csv) + optional `businessType`
  *   - application/json:    { mode: "text", rawText, businessType? }
- *   - application/json:    { mode: "form", businessType, revenue: RevenueLine[], expenses: ExpenseLine[] }
+ *   - multipart `mode=extract` or JSON { mode: "extract", rawText, businessType? }
+ *                          → { items: ExtractedLineItems } only (no audit), so the owner can review
+ *                            and edit the parsed lines, then submit them back as mode "form"
+ *   - application/json:    { mode: "form", businessType, revenue: RevenueLine[], expenses: ExpenseLine[], origin? }
  *   - application/json:    { mode: "unlock", sealed }                 (signed-in; Pro or 1 report unlock)
  *   - application/json:    { mode: "scenario", prompt, baseline }     (Pro)
  *
@@ -94,20 +98,25 @@ class HttpError extends Error {
   }
 }
 
-type AnalysisInput =
+type DocumentInput =
   | { kind: "text"; text: string; businessType?: BusinessType; source: string }
-  | { kind: "pdf"; base64: string; businessType?: BusinessType; source: string }
-  | { kind: "form"; businessType: BusinessType; revenue: FormRevenueLine[]; expenses: ExpenseLine[] };
+  | { kind: "pdf"; base64: string; businessType?: BusinessType; source: string };
+
+type AnalysisInput =
+  | DocumentInput
+  /** `origin: "statement"` = lines parsed from an upload and then reviewed by the owner. */
+  | { kind: "form"; businessType: BusinessType; revenue: FormRevenueLine[]; expenses: ExpenseLine[]; origin: "manual" | "statement" };
 
 type RequestInput =
   | AnalysisInput
+  | { kind: "extract"; document: DocumentInput }
   | { kind: "unlock"; sealed: string }
   | { kind: "scenario"; prompt: string; baseline: ScenarioBaseline };
 
 /** Owner-entered revenue; margin is optional and estimated by the model when absent. */
 type FormRevenueLine = Omit<RevenueLine, "margin"> & { margin?: number };
 
-async function readUpload(file: File, businessType: BusinessType | undefined): Promise<AnalysisInput> {
+async function readUpload(file: File, businessType: BusinessType | undefined): Promise<DocumentInput> {
   if (file.size === 0) throw new HttpError(400, "Uploaded file is empty.");
   if (file.size > MAX_UPLOAD_BYTES) throw new HttpError(413, "File exceeds the 15 MB limit.");
   if (!ALLOWED_UPLOAD_TYPES.has(file.type)) throw new HttpError(415, "Upload a PDF, CSV or plain-text statement.");
@@ -159,7 +168,8 @@ async function readInput(request: Request): Promise<RequestInput> {
     const file = form.get("file");
     const bt = form.get("businessType");
     if (!(file instanceof File)) throw new HttpError(400, "Missing `file` in form data.");
-    return readUpload(file, isBusinessType(bt) ? bt : undefined);
+    const document = await readUpload(file, isBusinessType(bt) ? bt : undefined);
+    return form.get("mode") === "extract" ? { kind: "extract", document } : document;
   }
 
   let body: unknown;
@@ -171,14 +181,15 @@ async function readInput(request: Request): Promise<RequestInput> {
   if (!body || typeof body !== "object") throw new HttpError(400, "Invalid request body.");
   const b = body as Record<string, unknown>;
 
-  if (b.mode === "text") {
+  if (b.mode === "text" || b.mode === "extract") {
     if (typeof b.rawText !== "string" || !b.rawText.trim()) throw new HttpError(400, "`rawText` is required.");
-    return {
+    const document: DocumentInput = {
       kind: "text",
       text: b.rawText,
       businessType: isBusinessType(b.businessType) ? b.businessType : undefined,
       source: "pasted text",
     };
+    return b.mode === "extract" ? { kind: "extract", document } : document;
   }
 
   if (b.mode === "form") {
@@ -186,7 +197,7 @@ async function readInput(request: Request): Promise<RequestInput> {
     const revenue = sanitizeRevenue(b.revenue);
     const expenses = sanitizeExpenses(b.expenses);
     if (revenue.length === 0) throw new HttpError(400, b.businessType === "PERSONAL_FAMILY" ? "Add at least one income line." : "Add at least one revenue line.");
-    return { kind: "form", businessType: b.businessType, revenue, expenses };
+    return { kind: "form", businessType: b.businessType, revenue, expenses, origin: b.origin === "statement" ? "statement" : "manual" };
   }
 
   if (b.mode === "unlock") {
@@ -202,7 +213,7 @@ async function readInput(request: Request): Promise<RequestInput> {
     if (!isBusinessType(base.businessType)) throw new HttpError(400, "`baseline.businessType` is required.");
     const baseline: ScenarioBaseline = {
       businessType: base.businessType,
-      itemizedRevenue: sanitizeRevenue(base.itemizedRevenue).map(({ label, amount }) => ({ label, amount })),
+      itemizedRevenue: sanitizeRevenue(base.itemizedRevenue).map(({ label, amount, oneTime }) => ({ label, amount, ...(oneTime ? { oneTime } : {}) })),
       itemizedExpenses: sanitizeExpenses(base.itemizedExpenses),
       inflationRateAssumed: typeof base.inflationRateAssumed === "number" ? clamp(base.inflationRateAssumed, 0, 0.5) : DEFAULT_INFLATION_RATE,
     };
@@ -210,7 +221,7 @@ async function readInput(request: Request): Promise<RequestInput> {
     return { kind: "scenario", prompt, baseline };
   }
 
-  throw new HttpError(400, "`mode` must be \"text\", \"form\", \"unlock\" or \"scenario\".");
+  throw new HttpError(400, "`mode` must be \"text\", \"extract\", \"form\", \"unlock\" or \"scenario\".");
 }
 
 function sanitizeRevenue(value: unknown): FormRevenueLine[] {
@@ -221,6 +232,7 @@ function sanitizeRevenue(value: unknown): FormRevenueLine[] {
       label: String(r?.label ?? "").trim().slice(0, 120),
       amount: Number(r?.amount),
       ...(r?.margin == null || r.margin === "" ? {} : { margin: clamp(Number(r.margin), 0, 1) }),
+      ...(r?.oneTime === true ? { oneTime: true } : {}),
     }))
     .filter((r) => r.label && Number.isFinite(r.amount) && r.amount > 0);
 }
@@ -233,6 +245,7 @@ function sanitizeExpenses(value: unknown): ExpenseLine[] {
       label: String(e?.label ?? "").trim().slice(0, 120),
       amount: Number(e?.amount),
       category: String(e?.category ?? "Uncategorized").trim().slice(0, 60) || "Uncategorized",
+      ...(e?.oneTime === true ? { oneTime: true } : {}),
     }))
     .filter((e) => e.label && Number.isFinite(e.amount) && e.amount > 0);
 }
@@ -415,10 +428,14 @@ function buildUserContent(input: AnalysisInput): Anthropic.Beta.BetaContentBlock
       },
     ];
   }
+  const origin =
+    input.origin === "statement"
+      ? "These line items were extracted from the owner's uploaded statement, then reviewed and edited by the owner."
+      : "The owner entered these figures in a guided form.";
   return [
     {
       type: "text",
-      text: `${hint}\nThe owner entered these monthly figures in a guided form. Keep their amounts as given; assign categories, flag issues, and write the audit.\n\n<form_input>\n${JSON.stringify(
+      text: `${hint}\n${origin} Amounts are monthly, except lines with "oneTime": true, which are single non-recurring amounts (don't treat them as monthly costs or income, and don't base recurring savings estimates on them). Keep their amounts as given; assign categories, flag issues, and write the audit.\n\n<form_input>\n${JSON.stringify(
         { revenue: input.revenue, expenses: input.expenses },
         null,
         2,
@@ -460,8 +477,11 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
           ...(e.flag ? { flag: e.flag } : {}),
         }));
 
-  const monthlyRevenue = round2(sum(itemizedRevenue, (r) => r.amount));
-  const monthlyExpenses = round2(sum(itemizedExpenses, (e) => e.amount));
+  // Monthly figures are recurring-only; one-time lines land once in the first projected month.
+  const revenueTotals = splitTotals(itemizedRevenue);
+  const expenseTotals = splitTotals(itemizedExpenses);
+  const monthlyRevenue = revenueTotals.recurring;
+  const monthlyExpenses = expenseTotals.recurring;
 
   const ruleBased = detectMissingCategories({ businessType, itemizedExpenses });
   const missingCategories = Array.from(new Set([...ruleBased.map((w) => w.category), ...extraction.missingCategories]));
@@ -471,7 +491,7 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
     .filter((w) => !modelFlags.some((f) => f.title.toLowerCase().includes(w.category.toLowerCase())))
     .map<AuditFlag>((w) => ({ title: `Missing: ${w.category}`, severity: w.severity, message: w.message, potentialSavings: 0, source: "MISSING_CATEGORY" }));
   const budgetFlags = personal
-    ? evaluatePersonalBudget(monthlyRevenue, itemizedExpenses).filter((b) => !modelFlags.some((f) => f.title.toLowerCase() === b.title.toLowerCase()))
+    ? evaluatePersonalBudget(monthlyRevenue, itemizedExpenses.filter((e) => !e.oneTime)).filter((b) => !modelFlags.some((f) => f.title.toLowerCase() === b.title.toLowerCase()))
     : [];
 
   const auditFlags = [...modelFlags, ...budgetFlags, ...missingFlags].sort(
@@ -484,11 +504,79 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
     itemizedRevenue,
     itemizedExpenses,
     inflationRateAssumed: DEFAULT_INFLATION_RATE,
-    macroProjections: buildMacroProjections({ businessType, monthlyRevenue, monthlyExpenses }),
+    macroProjections: buildMacroProjections({
+      businessType,
+      monthlyRevenue,
+      monthlyExpenses,
+      oneTimeRevenue: revenueTotals.oneTime,
+      oneTimeExpenses: expenseTotals.oneTime,
+    }),
     auditFlags,
     missingCategories,
     winnerInsight: extraction.winnerInsight,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Extract only (statement → editable line items, no audit)
+// ---------------------------------------------------------------------------
+
+const LINE_ITEMS_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["businessType", "itemizedRevenue", "itemizedExpenses"],
+  properties: {
+    businessType: EXTRACTION_SCHEMA.properties.businessType,
+    itemizedRevenue: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["label", "amount", "margin", "oneTime"],
+        properties: {
+          ...EXTRACTION_SCHEMA.properties.itemizedRevenue.items.properties,
+          oneTime: { type: "boolean", description: "True only for a clearly non-recurring amount" },
+        },
+      },
+    },
+    itemizedExpenses: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["label", "amount", "category", "oneTime"],
+        properties: {
+          label: { type: "string" },
+          amount: { type: "number", description: "Average MONTHLY amount in USD, or the full amount when oneTime" },
+          category: { type: "string" },
+          oneTime: { type: "boolean", description: "True only for a clearly non-recurring charge" },
+        },
+      },
+    },
+  },
+} as const;
+
+const EXTRACT_INSTRUCTIONS = `Extract only the line items; the owner will review and edit them before the audit runs.
+Mark a line "oneTime": true only when it is clearly non-recurring (a single late fee, a one-off purchase, a tax refund); give its full amount rather than a monthly average. Everything else is recurring ("oneTime": false) with an average MONTHLY amount.`;
+
+async function handleExtract(document: DocumentInput) {
+  const raw = await callStructured<{ businessType?: unknown; itemizedRevenue?: unknown; itemizedExpenses?: unknown }>({
+    system: buildSystemPrompt(),
+    content: [...buildUserContent(document), { type: "text", text: EXTRACT_INSTRUCTIONS }],
+    schema: LINE_ITEMS_SCHEMA,
+    maxTokens: 16000,
+  });
+  const businessType: BusinessType = document.businessType ?? (isBusinessType(raw.businessType) ? raw.businessType : "OTHER_CUSTOM");
+  const personal = businessType === "PERSONAL_FAMILY";
+  const items: ExtractedLineItems = {
+    businessType,
+    revenue: sanitizeRevenue(raw.itemizedRevenue).map((r) => ({ ...r, amount: round2(r.amount), margin: personal ? 1 : r.margin ?? 0.5 })),
+    expenses: sanitizeExpenses(raw.itemizedExpenses).map((e) => ({ ...e, amount: round2(e.amount) })),
+  };
+  if (items.revenue.length === 0 && items.expenses.length === 0) {
+    throw new HttpError(422, "No transactions could be read from this document. Check that it's a readable statement.");
+  }
+  return json({ items });
 }
 
 function respondWithAnalysis(full: FinancialAnalysis, viewer: Viewer) {
@@ -625,9 +713,12 @@ export async function POST(request: Request) {
     if (input.kind === "unlock") return await handleUnlock(input.sealed, viewer);
     if (input.kind === "scenario") return await handleScenario(input.prompt, input.baseline, viewer);
 
-    if (input.kind === "text" && input.text.length > MAX_TEXT_CHARS) {
+    const textLength = input.kind === "text" ? input.text.length : input.kind === "extract" && input.document.kind === "text" ? input.document.text.length : 0;
+    if (textLength > MAX_TEXT_CHARS) {
       throw new HttpError(413, "This document is too long to analyze in one pass. Split it into smaller date ranges and upload each.");
     }
+    if (input.kind === "extract") return await handleExtract(input.document);
+
     const extraction = await callStructured<Partial<ModelExtraction>>({
       system: buildSystemPrompt(),
       content: buildUserContent(input),

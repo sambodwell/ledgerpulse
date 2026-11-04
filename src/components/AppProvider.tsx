@@ -12,6 +12,7 @@ import {
 } from "@/lib/supabase";
 import type { UserProfile, WorkspaceMode, WorkspaceProfile } from "@/lib/schemas";
 import { AuthDialog } from "@/components/AuthDialog";
+import { DEV_UNLOCK } from "@/lib/devUnlock";
 
 interface UiHints {
   mode: WorkspaceMode;
@@ -53,7 +54,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const refreshProfile = useCallback(async () => {
     try {
-      const p = await fetchProfile();
+      const fetched = await fetchProfile();
+      // Local testing (NEXT_PUBLIC_DEV_UNLOCK=1): present every account as Pro, matching the server override.
+      const p = DEV_UNLOCK && fetched ? { ...fetched, tier: "pro" as const } : fetched;
       setProfile(p);
       return p;
     } catch (e) {

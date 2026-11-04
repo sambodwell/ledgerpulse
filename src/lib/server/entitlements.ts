@@ -7,6 +7,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { bearerToken, createRequestClient, fetchProfile } from "@/lib/supabase";
+import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { isFinancialAnalysis, type AnalysisAccess, type FinancialAnalysis, type SubscriptionTier } from "@/lib/schemas";
 
 export interface Viewer {
@@ -20,6 +21,12 @@ const GUEST: Viewer = { userId: null, tier: "free", reportUnlocks: 0, db: null }
 
 /** Verifies the bearer JWT with Supabase and loads the caller's billing columns. */
 export async function resolveViewer(request: Request): Promise<Viewer> {
+  const viewer = await lookupViewer(request);
+  // Local testing: every signed-in user is treated as Pro, so nothing is redacted or paywalled.
+  return DEV_UNLOCK && viewer.userId ? { ...viewer, tier: "pro" } : viewer;
+}
+
+async function lookupViewer(request: Request): Promise<Viewer> {
   const token = bearerToken(request);
   if (!token) return GUEST;
   const db = createRequestClient(token);
@@ -85,7 +92,7 @@ export function redactForTeaser(full: FinancialAnalysis): FinancialAnalysis {
   const top = full.auditFlags.find((f) => f.severity === "HIGH") ?? full.auditFlags[0];
   return {
     ...full,
-    itemizedExpenses: full.itemizedExpenses.map((e) => ({ label: e.label, amount: e.amount, category: e.category })),
+    itemizedExpenses: full.itemizedExpenses.map((e) => ({ label: e.label, amount: e.amount, category: e.category, ...(e.oneTime ? { oneTime: true } : {}) })),
     macroProjections: [],
     auditFlags: top ? [top] : [],
   };
