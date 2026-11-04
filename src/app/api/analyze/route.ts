@@ -1,5 +1,4 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { PDFParse } from "pdf-parse";
 import {
   BUSINESS_TYPES,
   CATEGORY_TEMPLATES,
@@ -24,6 +23,7 @@ import {
   type ScenarioPlan,
   type WinnerInsight,
 } from "@/lib/schemas";
+import { isSupabaseConfigured } from "@/lib/supabase";
 import { buildAccess, consumeReportUnlock, redactForTeaser, resolveViewer, seal, unseal, type Viewer } from "@/lib/server/entitlements";
 
 /**
@@ -54,7 +54,22 @@ const MIN_EXTRACTED_CHARS = 80; // below this, treat the PDF as scanned and send
 const MAX_SCENARIO_PROMPT = 500;
 const ALLOWED_UPLOAD_TYPES = new Set(["application/pdf", "text/plain", "text/csv", "application/vnd.ms-excel", "application/octet-stream", ""]);
 
-const client = new Anthropic();
+// Large statements can take a minute or more; don't let the platform default (often 10–60s) cut them off.
+export const maxDuration = 300;
+
+// Created on first use, inside the request's try/catch. Constructing it at module
+// scope throws when ANTHROPIC_API_KEY is missing, which crashes the whole route
+// with an HTML 500 before any error handling can run.
+let anthropic: Anthropic | null = null;
+function getClient(): Anthropic {
+  if (!anthropic) {
+    if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
+      throw new HttpError(503, "The analysis service isn't configured on this server (missing ANTHROPIC_API_KEY).");
+    }
+    anthropic = new Anthropic();
+  }
+  return anthropic;
+}
 
 const NO_STORE_HEADERS = {
   "Cache-Control": "no-store, max-age=0",
@@ -109,8 +124,12 @@ async function readUpload(file: File, businessType: BusinessType | undefined): P
       return { kind: "text", text: bytes.toString("utf8"), businessType, source };
     }
 
-    const parser = new PDFParse({ data: new Uint8Array(bytes) });
+    // Loaded lazily: pdfjs can fail to initialise in some serverless runtimes, and a
+    // top-level import would then break every request, including guided-form ones.
+    let parser: { getText(): Promise<{ text: string }>; destroy(): Promise<void> } | null = null;
     try {
+      const { PDFParse } = await import("pdf-parse");
+      parser = new PDFParse({ data: new Uint8Array(bytes) });
       const { text } = await parser.getText();
       if (text.replace(/\s+/g, "").length >= MIN_EXTRACTED_CHARS) {
         return { kind: "text", text, businessType, source };
@@ -118,7 +137,7 @@ async function readUpload(file: File, businessType: BusinessType | undefined): P
     } catch (err) {
       console.warn("[analyze] pdf-parse failed, falling back to native PDF input:", err instanceof Error ? err.name : "unknown");
     } finally {
-      await parser.destroy();
+      await parser?.destroy().catch(() => {});
     }
     // Scanned / image-only PDF: let Claude read the pages itself.
     return { kind: "pdf", base64: bytes.toString("base64"), businessType, source };
@@ -131,7 +150,12 @@ async function readInput(request: Request): Promise<RequestInput> {
   const contentType = request.headers.get("content-type") ?? "";
 
   if (contentType.includes("multipart/form-data")) {
-    const form = await request.formData();
+    let form: FormData;
+    try {
+      form = await request.formData();
+    } catch {
+      throw new HttpError(400, "The upload couldn't be read. Choose the file again and resubmit.");
+    }
     const file = form.get("file");
     const bt = form.get("businessType");
     if (!(file instanceof File)) throw new HttpError(400, "Missing `file` in form data.");
@@ -222,7 +246,7 @@ function clamp(n: number, lo: number, hi: number) {
 // ---------------------------------------------------------------------------
 
 async function callStructured<T>(params: { system: string; content: Anthropic.Beta.BetaContentBlockParam[]; schema: object; maxTokens: number }): Promise<T> {
-  const stream = client.beta.messages.stream({
+  const stream = getClient().beta.messages.stream({
     model: MODEL,
     max_tokens: params.maxTokens,
     betas: ["server-side-fallback-2026-07-01"],
@@ -247,11 +271,40 @@ async function callStructured<T>(params: { system: string; content: Anthropic.Be
     .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
     .map((b) => b.text)
     .join("");
+  let parsed: unknown;
   try {
-    return JSON.parse(text) as T;
+    parsed = JSON.parse(text);
   } catch {
     throw new HttpError(502, "The analysis came back malformed. Please try again.");
   }
+  if (!parsed || typeof parsed !== "object") throw new HttpError(502, "The analysis came back malformed. Please try again.");
+  return parsed as T;
+}
+
+const arr = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const str = (v: unknown, fallback = "") => (typeof v === "string" ? v : fallback);
+
+/** Structured outputs should match the schema, but a fallback model or partial output must never crash assembly. */
+function normalizeExtraction(raw: Partial<ModelExtraction>): ModelExtraction {
+  const severities = SEVERITIES as readonly string[];
+  return {
+    businessType: isBusinessType(raw.businessType) ? raw.businessType : "OTHER_CUSTOM",
+    itemizedRevenue: arr<RevenueLine>(raw.itemizedRevenue)
+      .filter((r) => r && typeof r === "object")
+      .map((r) => ({ label: str(r.label, "Revenue"), amount: num(r.amount), margin: num(r.margin) })),
+    itemizedExpenses: arr<ModelExtraction["itemizedExpenses"][number]>(raw.itemizedExpenses)
+      .filter((e) => e && typeof e === "object")
+      .map((e) => ({ label: str(e.label, "Expense"), amount: num(e.amount), category: str(e.category, "Other") || "Other", flag: typeof e.flag === "string" ? e.flag : null })),
+    auditFlags: arr<ModelExtraction["auditFlags"][number]>(raw.auditFlags)
+      .filter((f) => f && typeof f === "object" && typeof f.title === "string")
+      .map((f) => ({ title: f.title, severity: severities.includes(f.severity) ? f.severity : "LOW", message: str(f.message), potentialSavings: Math.max(0, num(f.potentialSavings)) })),
+    missingCategories: arr<unknown>(raw.missingCategories).filter((c): c is string => typeof c === "string"),
+    winnerInsight: {
+      topService: str(raw.winnerInsight?.topService, "—"),
+      message: str(raw.winnerInsight?.message),
+    },
+  };
 }
 
 /** What Claude returns; the route derives the rest of FinancialAnalysis. */
@@ -532,9 +585,9 @@ If the request isn't a financial scenario, return no adjustments and explain wha
       text: `<baseline>\n${JSON.stringify({ revenue: baseline.itemizedRevenue, expenses: baseline.itemizedExpenses }, null, 2)}\n</baseline>\n\n<scenario>\n${prompt}\n</scenario>`,
     },
   ];
-  const out = await callStructured<ModelScenario>({ system, content, schema: SCENARIO_SCHEMA, maxTokens: 8000 });
+  const out = await callStructured<Partial<ModelScenario>>({ system, content, schema: SCENARIO_SCHEMA, maxTokens: 8000 });
 
-  const adjustments: ScenarioAdjustment[] = out.adjustments.slice(0, 12).flatMap<ScenarioAdjustment>((a) => {
+  const adjustments: ScenarioAdjustment[] = arr<ModelScenario["adjustments"][number]>(out.adjustments).slice(0, 12).flatMap<ScenarioAdjustment>((a) => {
     const startMonth = Math.round(clamp(a.startMonth, 1, PROJECTION_MONTHS));
     const description = String(a.description ?? "").slice(0, 160);
     if ((a.type === "REVENUE_PCT" || a.type === "EXPENSE_PCT") && typeof a.pct === "number" && Number.isFinite(a.pct)) {
@@ -549,7 +602,7 @@ If the request isn't a financial scenario, return no adjustments and explain wha
   const scenario: ScenarioPlan = {
     prompt,
     adjustments,
-    assumptions: out.assumptions.slice(0, 8).map((s) => String(s).slice(0, 300)),
+    assumptions: arr<unknown>(out.assumptions).slice(0, 8).map((s) => String(s).slice(0, 300)),
     explanation: String(out.explanation ?? "").slice(0, 600),
   };
   return json({ scenario });
@@ -561,7 +614,10 @@ If the request isn't a financial scenario, return no adjustments and explain wha
 
 export async function POST(request: Request) {
   try {
+    if (!isSupabaseConfigured) throw new HttpError(503, "Accounts aren't configured on this server, so analyses are disabled.");
     const viewer = await resolveViewer(request);
+    // Financial data is only accepted from signed-in users, so every request is tied to an RLS-scoped identity.
+    if (!viewer.userId) throw new HttpError(401, "Sign in or create an account to analyze your finances.");
     const input = await readInput(request);
 
     if (input.kind === "unlock") return await handleUnlock(input.sealed, viewer);
@@ -570,27 +626,31 @@ export async function POST(request: Request) {
     if (input.kind === "text" && input.text.length > MAX_TEXT_CHARS) {
       throw new HttpError(413, "This document is too long to analyze in one pass. Split it into smaller date ranges and upload each.");
     }
-    const extraction = await callStructured<ModelExtraction>({
+    const extraction = await callStructured<Partial<ModelExtraction>>({
       system: buildSystemPrompt(),
       content: buildUserContent(input),
       schema: EXTRACTION_SCHEMA,
       maxTokens: 32000,
     });
-    return respondWithAnalysis(assemble(extraction, input), viewer);
+    return respondWithAnalysis(assemble(normalizeExtraction(extraction), input), viewer);
   } catch (err) {
     if (err instanceof HttpError) {
       return json({ error: err.message }, err.status);
     }
-    if (err instanceof Anthropic.AuthenticationError) {
-      console.error("[analyze] auth error", err.message);
-      return json({ error: "Analysis service is not configured (check ANTHROPIC_API_KEY)." }, 500);
+    if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
+      console.error("[analyze] credentials rejected", err.status);
+      return json({ error: "The analysis service is misconfigured on this server. Please try again later." }, 503);
     }
     if (err instanceof Anthropic.RateLimitError) {
       return json({ error: "We're handling a lot of analyses right now. Try again in a minute." }, 429);
     }
     if (err instanceof Anthropic.BadRequestError) {
       console.error("[analyze] bad request", err.message);
-      return json({ error: "The document couldn't be processed." }, 400);
+      return json({ error: "The document couldn't be processed. Check that it's a readable statement and try again." }, 400);
+    }
+    if (err instanceof Anthropic.APIConnectionError) {
+      console.error("[analyze] connection error", err.name);
+      return json({ error: "Couldn't reach the analysis service. Check your connection and try again." }, 503);
     }
     if (err instanceof Anthropic.APIError) {
       console.error("[analyze] API error", err.status, err.message);

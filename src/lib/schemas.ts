@@ -194,6 +194,55 @@ export const CATEGORY_TEMPLATES: Record<BusinessType, BusinessTemplate> = {
   },
 };
 
+/**
+ * Example sub-line items per category, shown as the line-item placeholder in the
+ * guided form so users describe the specific expense instead of retyping the category.
+ */
+export const CATEGORY_LINE_HINTS: Record<string, string> = {
+  "Mortgage Interest": "e.g. Wells Fargo loan – Unit A",
+  "Property Taxes": "e.g. County tax installment",
+  Insurance: "e.g. Liability policy premium",
+  "Repairs & Maintenance": "e.g. Plumber call, HVAC service",
+  "Property Management": "e.g. PM fee (8% of rent)",
+  Utilities: "e.g. Electric, water, internet",
+  "HOA Fees": "e.g. Monthly association dues",
+  "Capital Reserves": "e.g. Roof / appliance reserve",
+  "Vacancy Allowance": "e.g. 5% of scheduled rent",
+  Fuel: "e.g. Truck diesel, fleet fuel cards",
+  "Supplies & Materials": "e.g. Copper pipe, fittings, filters",
+  "Vehicle Costs": "e.g. Van lease, tires, oil changes",
+  "Payroll / Subcontractors": "e.g. Lead technician wages",
+  "Tools & Equipment": "e.g. Drain camera rental",
+  "Software & Dispatch": "e.g. Jobber subscription",
+  "Licensing & Permits": "e.g. Contractor license renewal",
+  Marketing: "e.g. Google Ads, yard signs",
+  "Software & SaaS": "e.g. Adobe, Figma, Slack",
+  Contractors: "e.g. Freelance developer",
+  Payroll: "e.g. Staff salaries via Gusto",
+  "Self-Employment Tax Reserve": "e.g. Quarterly estimated tax set-aside",
+  "Health Insurance": "e.g. Marketplace health premium",
+  "Home Office / Rent": "e.g. Coworking membership",
+  "Professional Services": "e.g. CPA, bookkeeper",
+  Equipment: "e.g. Laptop, monitor",
+  "Cost of Goods Sold": "e.g. Wholesale inventory",
+  "Rent & Facilities": "e.g. Warehouse lease",
+  "Taxes & Fees": "e.g. Business license, bank fees",
+  "Household Rent/Mortgage": "e.g. Apartment rent, home loan",
+  Groceries: "e.g. Weekly grocery runs",
+  Subscriptions: "e.g. Netflix, Spotify, gym",
+  Investments: "e.g. 401(k) deduction, Roth IRA transfer",
+  Debt: "e.g. Credit card, student loan payment",
+  Transportation: "e.g. Car payment, gas, transit pass",
+  "Childcare & Education": "e.g. Daycare, tuition",
+  "Dining & Entertainment": "e.g. Restaurants, concerts",
+  Other: "Describe the expense",
+};
+
+/** Extra guidance for categories whose scope is easy to misread. Keyed by category. */
+export const CATEGORY_HELP: Partial<Record<string, string>> = {
+  Investments: "Includes routine payroll deductions or discretionary transfers toward wealth building (e.g., 401(k), IRA, or brokerage allocations).",
+};
+
 // ---------------------------------------------------------------------------
 // Personal budget rules (50/30/20 + housing / debt / subscription guardrails)
 // ---------------------------------------------------------------------------

@@ -96,12 +96,34 @@ export async function signInWithPassword(email: string, password: string) {
   if (error) throw new Error(error.message);
 }
 
+/**
+ * Public origin of this deployment, used for links in auth emails. Order:
+ * NEXT_PUBLIC_SITE_URL (set this in production) → NEXT_PUBLIC_VERCEL_URL
+ * (Vercel preview/production host) → the browser's current origin. Never
+ * hardcodes localhost.
+ */
+export function getSiteUrl(): string {
+  const configured = process.env.NEXT_PUBLIC_SITE_URL?.trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  const vercel = process.env.NEXT_PUBLIC_VERCEL_URL?.trim();
+  if (vercel) return `https://${vercel.replace(/^https?:\/\//, "").replace(/\/+$/, "")}`;
+  if (typeof window !== "undefined") return window.location.origin;
+  return "";
+}
+
+/** Only same-site relative paths are allowed as post-auth destinations (prevents open redirects). */
+export function safeNextPath(next: string | null | undefined, fallback = "/dashboard"): string {
+  if (!next || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) return fallback;
+  return next;
+}
+
 /** Returns true when the project requires email confirmation before first sign-in. */
-export async function signUpWithPassword(email: string, password: string): Promise<{ needsConfirmation: boolean }> {
+export async function signUpWithPassword(email: string, password: string, next = "/dashboard"): Promise<{ needsConfirmation: boolean }> {
+  const site = getSiteUrl();
   const { data, error } = await requireClient().auth.signUp({
     email,
     password,
-    options: { emailRedirectTo: typeof window !== "undefined" ? `${window.location.origin}/dashboard` : undefined },
+    options: { emailRedirectTo: site ? `${site}/auth/callback?next=${encodeURIComponent(safeNextPath(next))}` : undefined },
   });
   if (error) throw new Error(error.message);
   return { needsConfirmation: !data.session };

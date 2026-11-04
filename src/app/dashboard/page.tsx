@@ -1,6 +1,7 @@
 "use client";
 
 import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
 import {
   Area,
   AreaChart,
@@ -42,6 +43,8 @@ import {
 import {
   BUSINESS_ONLY_TYPES,
   BUSINESS_TYPE_LABELS,
+  CATEGORY_HELP,
+  CATEGORY_LINE_HINTS,
   CATEGORY_TEMPLATES,
   MODE_COPY,
   PRICING,
@@ -62,6 +65,7 @@ import {
 } from "@/lib/schemas";
 import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
 import { useApp } from "@/components/AppProvider";
+import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu } from "@/components/ProfileMenu";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
@@ -129,12 +133,16 @@ type InputTab = "form" | "upload";
 
 export default function DashboardPage() {
   const app = useApp();
+  const router = useRouter();
   const wsKey = app.activeWorkspace?.id ?? "guest";
-  const defaultMode: WorkspaceMode = app.activeWorkspace?.mode ?? (app.profile?.planCategory === "PERSONAL_FAMILY" ? "PERSONAL" : "BUSINESS");
+  const { mode, setActiveWorkspace } = useWorkspace();
+  const setMode = (m: WorkspaceMode) => setActiveWorkspace(fromMode(m));
 
-  const [modeByWs, setModeByWs] = useState<Record<string, WorkspaceMode>>({});
-  const mode = modeByWs[wsKey] ?? defaultMode;
-  const setMode = (m: WorkspaceMode) => setModeByWs((cur) => ({ ...cur, [wsKey]: m }));
+  // Gate: financial inputs require an account (the API enforces this too).
+  const mustSignIn = app.ready && !app.user;
+  useEffect(() => {
+    if (mustSignIn) router.replace(`/signup?next=${encodeURIComponent("/dashboard")}`);
+  }, [mustSignIn, router]);
 
   // Results live in memory only, per workspace, for this browser tab.
   const [results, setResults] = useState<Record<string, AnalysisResponse>>({});
@@ -267,6 +275,16 @@ export default function DashboardPage() {
   const ws = app.activeWorkspace;
   const formDefaultType: BusinessType = mode === "PERSONAL" ? "PERSONAL_FAMILY" : ws && ws.mode === "BUSINESS" ? ws.businessType : "REAL_ESTATE";
 
+  if (!app.ready || !app.user) {
+    return (
+      <div className="grid min-h-screen place-items-center bg-slate-950 text-sm text-slate-400" role="status">
+        <span className="inline-flex items-center gap-2">
+          <Loader2 className="h-4 w-4 animate-spin text-indigo-300" /> {app.ready ? "Redirecting to sign up…" : "Checking your session…"}
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div className="relative min-h-screen overflow-x-hidden bg-slate-950 text-slate-100">
       {/* Ambient glow */}
@@ -293,7 +311,7 @@ export default function DashboardPage() {
                   <span className="text-slate-500">· {BUSINESS_TYPE_LABELS[ws.businessType]}</span>
                 </>
               ) : (
-                <span className="text-slate-500">Guest workspace — sign in to save workspaces.</span>
+                <span className="text-slate-500">No saved workspace selected — create one from the profile menu.</span>
               )}
             </p>
           </div>
@@ -501,9 +519,13 @@ function templateRows(bt: BusinessType) {
   const seed = bt === "OTHER_CUSTOM" ? [{ category: "" }, { category: "" }] : bt === "PERSONAL_FAMILY" ? t.expenses.slice(0, 6) : essentials;
   return {
     revenue: t.revenue.slice(0, bt === "OTHER_CUSTOM" ? 1 : 2).map<FormRevenue>((label) => ({ id: newId(), label: bt === "OTHER_CUSTOM" ? "" : label, amount: "", margin: "" })),
-    expenses: seed.map<FormExpense>((e) => ({ id: newId(), label: e.category, amount: "", category: e.category })),
+    // Category is chosen first; the line item is a distinct description (left blank, with an example placeholder).
+    expenses: seed.map<FormExpense>((e) => ({ id: newId(), label: "", amount: "", category: e.category })),
   };
 }
+
+/** What gets sent as the line label: the user's description, or the category when they left it blank. */
+const expenseLabel = (e: FormExpense) => e.label.trim() || e.category.trim();
 
 const STEPS = ["Type", "Income", "Expenses", "Review"] as const;
 
@@ -527,7 +549,12 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
 
   const custom = businessType === "OTHER_CUSTOM";
   const validRevenue = revenue.filter((r) => r.label.trim() && Number(r.amount) > 0);
-  const validExpenses = expenses.filter((e) => e.label.trim() && Number(e.amount) > 0);
+  const validExpenses = expenses.filter((e) => expenseLabel(e) && Number(e.amount) > 0);
+
+  // Household tab: each category chip toggles its expense line on or off.
+  const isCategoryOn = (c: string) => expenses.some((e) => e.category === c);
+  const toggleCategory = (c: string) =>
+    setExpenses((rows) => (rows.some((e) => e.category === c) ? rows.filter((e) => e.category !== c) : [...rows, { id: newId(), label: "", amount: "", category: c }]));
   const canNext = step === 0 || (step === 1 ? validRevenue.length > 0 : true);
   const stepLabels = STEPS.map((s, i) => (i === 0 ? (personal ? "Household" : "Business") : i === 1 ? copy.revenue : s));
 
@@ -540,7 +567,7 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
         amount: Number(r.amount),
         ...(!personal && r.margin !== "" && Number.isFinite(Number(r.margin)) ? { margin: Math.min(100, Math.max(0, Number(r.margin))) / 100 } : {}),
       })),
-      expenses: validExpenses.map((e) => ({ label: e.label.trim(), amount: Number(e.amount), category: e.category.trim() || "Uncategorized" })),
+      expenses: validExpenses.map((e) => ({ label: expenseLabel(e), amount: Number(e.amount), category: e.category.trim() || "Uncategorized" })),
     });
 
   const categoryOptions = CATEGORY_TEMPLATES[businessType].expenses.map((e) => e.category);
@@ -565,16 +592,43 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
       <div className="mt-6 flex-1">
         {step === 0 &&
           (personal ? (
-            <div className="space-y-3 text-sm">
-              <p className="text-slate-400">Personal Finance mode uses household categories and the 50/30/20 budgeting guideline.</p>
+            <fieldset className="space-y-3 text-sm">
+              <legend className="mb-2 text-slate-400">
+                Which spending categories apply to your household? Selected categories become lines you fill in on the Spending step. Personal Finance mode uses the 50/30/20 budgeting guideline.
+              </legend>
               <div className="flex flex-wrap gap-2">
-                {CATEGORY_TEMPLATES.PERSONAL_FAMILY.expenses.map((e) => (
-                  <span key={e.category} className="rounded-md border border-white/10 bg-white/[0.03] px-2 py-1 text-xs text-slate-300">
-                    {e.category}
-                  </span>
-                ))}
+                {CATEGORY_TEMPLATES.PERSONAL_FAMILY.expenses.map((e) => {
+                  const on = isCategoryOn(e.category);
+                  const help = CATEGORY_HELP[e.category];
+                  return (
+                    <button
+                      key={e.category}
+                      type="button"
+                      aria-pressed={on}
+                      title={help}
+                      onClick={() => toggleCategory(e.category)}
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300",
+                        on ? "border-indigo-400/60 bg-indigo-500/15 text-white" : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.07]",
+                      )}
+                    >
+                      {on ? <CheckCircle2 className="h-3.5 w-3.5 text-indigo-300" /> : <Plus className="h-3.5 w-3.5 text-slate-500" />}
+                      {e.category}
+                    </button>
+                  );
+                })}
               </div>
-            </div>
+              {isCategoryOn("Investments") && CATEGORY_HELP.Investments && (
+                <p className="flex items-start gap-1.5 text-xs text-slate-400">
+                  <Info className="mt-0.5 h-3 w-3 shrink-0" /> <span>
+                    <span className="text-slate-300">Investments:</span> {CATEGORY_HELP.Investments}
+                  </span>
+                </p>
+              )}
+              <p className="text-xs text-slate-500">
+                {new Set(expenses.map((e) => e.category).filter(Boolean)).size} selected · you can add custom lines later.
+              </p>
+            </fieldset>
           ) : (
             <fieldset className="space-y-3">
               <legend className="mb-2 text-sm text-slate-400">What kind of business is this?</legend>
@@ -616,42 +670,50 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
               custom
                 ? "Add your own expense lines and name the categories however you like."
                 : personal
-                  ? "We pre-filled common household categories. Remove what doesn't apply."
-                  : "We pre-filled the essentials for your business type. Leave a line at 0 if it truly doesn't apply — we'll flag it."
+                  ? "Pick a category, then optionally describe the specific item (e.g. which card or service). Add several lines per category if needed."
+                  : "We pre-filled the essential categories for your business type. Describe each line item, or leave a line at 0 if it truly doesn't apply — we'll flag it."
             }
-            columns={[personal ? "Spending" : "Expense", "Monthly $", "Category"]}
+            columns={["Category", personal ? "What it's for" : "Line item", "Monthly $"]}
+            variant="cards"
             rows={expenses}
             onAdd={() => setExpenses((r) => [...r, { id: newId(), label: "", amount: "", category: "" }])}
             onRemove={(id) => setExpenses((r) => r.filter((x) => x.id !== id))}
-            render={(row) => (
-              <>
-                <TextInput aria-label="Expense" value={row.label} onChange={(v) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, label: v } : x)))} />
-                <NumInput aria-label="Monthly amount" value={row.amount} onChange={(v) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, amount: v } : x)))} />
-                {custom ? (
-                  <input
-                    aria-label="Category"
-                    list={datalistId}
-                    value={row.category}
-                    placeholder="Your category"
-                    onChange={(ev) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, category: ev.target.value } : x)))}
-                    className={cn(inputCls, "px-2")}
-                  />
-                ) : (
-                  <select
-                    aria-label="Category"
-                    value={row.category}
-                    onChange={(ev) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, category: ev.target.value } : x)))}
-                    className={cn(inputCls, "px-2")}
-                  >
-                    <option value="">Auto-classify</option>
-                    {categoryOptions.map((c) => (
-                      <option key={c}>{c}</option>
-                    ))}
-                    <option>Other</option>
-                  </select>
-                )}
-              </>
-            )}
+            render={(row, removeButton) => {
+              const update = (patch: Partial<FormExpense>) => setExpenses((r) => r.map((x) => (x.id === row.id ? { ...x, ...patch } : x)));
+              const help = personal ? CATEGORY_HELP[row.category] : undefined;
+              return (
+                <>
+                  <div className="flex items-center gap-2">
+                    {custom ? (
+                      <input aria-label="Category" list={datalistId} value={row.category} placeholder="Your category" title={row.category || undefined} onChange={(ev) => update({ category: ev.target.value })} className={cn(inputCls, "min-w-0 flex-1")} />
+                    ) : (
+                      <select aria-label="Category" value={row.category} title={row.category || "Auto-classify"} onChange={(ev) => update({ category: ev.target.value })} className={cn(inputCls, "min-w-0 flex-1 pr-8")}>
+                        <option value="">Auto-classify from description</option>
+                        {categoryOptions.map((c) => (
+                          <option key={c}>{c}</option>
+                        ))}
+                        {!categoryOptions.includes("Other") && <option>Other</option>}
+                      </select>
+                    )}
+                    {removeButton}
+                  </div>
+                  <div className="grid grid-cols-[minmax(0,1fr)_7.5rem] gap-2">
+                    <TextInput
+                      aria-label={personal ? "What it's for" : "Line item"}
+                      value={row.label}
+                      placeholder={CATEGORY_LINE_HINTS[row.category] ?? (row.category ? "Optional description" : "Describe the expense")}
+                      onChange={(v) => update({ label: v })}
+                    />
+                    <NumInput aria-label="Monthly amount" value={row.amount} onChange={(v) => update({ amount: v })} />
+                  </div>
+                  {help && (
+                    <p className="flex items-start gap-1.5 text-xs text-slate-400">
+                      <Info className="mt-0.5 h-3 w-3 shrink-0" /> {help}
+                    </p>
+                  )}
+                </>
+              );
+            }}
           />
         )}
         {custom && (
@@ -696,27 +758,43 @@ function RowEditor<T extends { id: number }>(props: {
   rows: T[];
   onAdd: () => void;
   onRemove: (id: number) => void;
-  render: (row: T) => ReactNode;
+  /** "table": one grid row per line. "cards": stacked rows, so long labels (e.g. category names) get full width. */
+  variant?: "table" | "cards";
+  render: (row: T, removeButton: ReactNode) => ReactNode;
 }) {
-  const grid = props.columns.length === 2 ? "grid-cols-[1fr_7.5rem_2rem]" : "grid-cols-[1fr_6.5rem_7.5rem_2rem]";
+  const grid = props.columns.length === 2 ? "grid-cols-[minmax(0,1fr)_7.5rem_2rem]" : "grid-cols-[minmax(0,1fr)_6.5rem_6.5rem_2rem]";
+  const cards = props.variant === "cards";
+  const remove = (id: number) => (
+    <button type="button" onClick={() => props.onRemove(id)} aria-label="Remove line" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-500 hover:bg-white/5 hover:text-rose-300">
+      <Trash2 className="h-4 w-4" />
+    </button>
+  );
   return (
     <div>
       <p className="mb-3 text-sm text-slate-400">{props.hint}</p>
-      <div className={cn("grid gap-2 px-1 pb-1 text-xs uppercase tracking-wide text-slate-500", grid)}>
-        {props.columns.map((c) => (
-          <span key={c}>{c}</span>
-        ))}
-        <span />
-      </div>
-      <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
-        {props.rows.map((row) => (
-          <div key={row.id} className={cn("grid items-center gap-2", grid)}>
-            {props.render(row)}
-            <button onClick={() => props.onRemove(row.id)} aria-label="Remove line" className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-white/5 hover:text-rose-300">
-              <Trash2 className="h-4 w-4" />
-            </button>
-          </div>
-        ))}
+      {cards ? (
+        <p className="px-1 pb-1 text-xs uppercase tracking-wide text-slate-500">{props.columns.join(" → ")}</p>
+      ) : (
+        <div className={cn("grid gap-2 px-1 pb-1 text-xs uppercase tracking-wide text-slate-500", grid)}>
+          {props.columns.map((c) => (
+            <span key={c}>{c}</span>
+          ))}
+          <span />
+        </div>
+      )}
+      <div className={cn("max-h-80 overflow-y-auto pr-1", cards ? "space-y-3" : "space-y-2")}>
+        {props.rows.map((row) =>
+          cards ? (
+            <div key={row.id} className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
+              {props.render(row, remove(row.id))}
+            </div>
+          ) : (
+            <div key={row.id} className={cn("grid items-center gap-2", grid)}>
+              {props.render(row, null)}
+              {remove(row.id)}
+            </div>
+          ),
+        )}
       </div>
       <button onClick={props.onAdd} className="mt-3 inline-flex items-center gap-1.5 text-sm text-indigo-300 hover:text-indigo-200">
         <Plus className="h-4 w-4" /> Add line
@@ -1549,7 +1627,8 @@ function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
             <li key={`${e.label}-${i}`} className="py-2">
               <div className="flex justify-between gap-3">
                 <span className="text-slate-300">
-                  {e.label} <span className="text-xs text-slate-500">· {e.category}</span>
+                  {e.label}
+                  {e.category && e.category.toLowerCase() !== e.label.toLowerCase() && <span className="text-xs text-slate-500"> · {e.category}</span>}
                 </span>
                 <span className="tabular-nums">{usd.format(e.amount)}</span>
               </div>

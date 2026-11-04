@@ -22,5 +22,9 @@ export const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
 /** Reads an `{ error }` body from a failed fetch, falling back to the status. */
 export async function errorMessage(res: Response): Promise<string> {
   const data: unknown = await res.json().catch(() => null);
-  return data && typeof data === "object" && "error" in data ? String((data as { error: unknown }).error) : `Request failed (${res.status})`;
+  if (data && typeof data === "object" && "error" in data) return String((data as { error: unknown }).error);
+  if (res.status === 401) return "Your session has expired. Sign in again to continue.";
+  if (res.status === 504) return "The analysis took too long. Try a shorter statement or fewer line items.";
+  if (res.status >= 500) return `The server hit an error (${res.status}). Please try again in a moment.`;
+  return `Request failed (${res.status})`;
 }
