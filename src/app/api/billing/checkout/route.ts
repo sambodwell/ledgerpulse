@@ -1,5 +1,6 @@
 import Stripe from "stripe";
 import { resolveViewer } from "@/lib/server/entitlements";
+import { DEV_UNLOCK } from "@/lib/devUnlock";
 import {
   appOrigin,
   billingError,
@@ -21,6 +22,9 @@ export async function POST(request: Request) {
     const body = (await request.json().catch(() => null)) as { kind?: unknown } | null;
     const kind: CheckoutKind | null = body?.kind === "pro" || body?.kind === "report" ? body.kind : null;
     if (!kind) return Response.json({ error: "`kind` must be \"pro\" or \"report\"." }, { status: 400 });
+
+    // Pro unlock override: everyone is already Pro, so skip Stripe and the service-role key entirely.
+    if (DEV_UNLOCK) return Response.json({ url: `${appOrigin(request)}/dashboard?checkout=success&dev=1`, dev: true });
 
     if (kind === "pro" && viewer.tier === "pro") return Response.json({ error: "You're already on Pro." }, { status: 409 });
 

@@ -1,10 +1,16 @@
 /**
- * Local-testing override: NEXT_PUBLIC_DEV_UNLOCK=1 treats every signed-in user as Pro
- * (full audit, executive report, 12-month projection, scenario forecasting) on both
- * the server and the client, so the app can be tested without Stripe.
+ * Pro unlock overrides. When active, every signed-in user is treated as Pro (full audit,
+ * executive report, 12-month projection, scenario forecasting) on both the server and the
+ * client, and the billing routes never call Stripe or demand Stripe/service-role keys.
  *
- * Never active in production builds: `next build` / `next start` and deployments run
- * with NODE_ENV=production, so a stray env var can't give away paid features.
- * The value is inlined at build time, so restart `next dev` after changing it.
+ *   NEXT_PUBLIC_DEV_UNLOCK=1          local `next dev` only — ignored in production builds.
+ *   NEXT_PUBLIC_FORCE_PRO_UNLOCK=1    emergency override that ALSO applies to production builds
+ *                                     (`next build` / `next start` / deployments). Anyone who can
+ *                                     sign in gets Pro for free while it's set — remove it before launch.
+ *
+ * NEXT_PUBLIC_ values are inlined at build time: rebuild / restart after changing them.
  */
-export const DEV_UNLOCK = process.env.NODE_ENV !== "production" && process.env.NEXT_PUBLIC_DEV_UNLOCK === "1";
+const DEV_FLAG = process.env.NODE_ENV !== "production" && process.env.NEXT_PUBLIC_DEV_UNLOCK === "1";
+export const FORCE_PRO_UNLOCK = process.env.NEXT_PUBLIC_FORCE_PRO_UNLOCK === "1";
+
+export const DEV_UNLOCK = DEV_FLAG || FORCE_PRO_UNLOCK;

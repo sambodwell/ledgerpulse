@@ -1,4 +1,5 @@
 import { resolveViewer } from "@/lib/server/entitlements";
+import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { appOrigin, billingError, billingNotConfigured, getStripe } from "@/lib/server/billing";
 
 /** POST /api/billing/portal → { url } (Stripe Customer Portal for managing the subscription) */
@@ -8,7 +9,10 @@ export async function POST(request: Request) {
     if (!viewer.userId || !viewer.db) return Response.json({ error: "Your session has expired. Sign in again to manage billing." }, { status: 401 });
 
     const stripe = getStripe();
-    if (!stripe) return billingNotConfigured();
+    if (!stripe) {
+      if (DEV_UNLOCK) return Response.json({ error: "Pro is unlocked by a test override — there's no billing account to manage." }, { status: 409 });
+      return billingNotConfigured();
+    }
 
     const { data } = await viewer.db
       .from("profiles")

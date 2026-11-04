@@ -1,4 +1,5 @@
 import { resolveViewer } from "@/lib/server/entitlements";
+import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { billingError, billingNotConfigured, fulfillCheckoutSession, getAdminSupabase, getStripe } from "@/lib/server/billing";
 
 /**
@@ -19,7 +20,7 @@ export async function POST(request: Request) {
 
     const stripe = getStripe();
     const admin = getAdminSupabase();
-    if (!stripe || !admin) return billingNotConfigured();
+    if (!stripe || !admin) return DEV_UNLOCK ? Response.json({ status: "duplicate", kind: "pro" }) : billingNotConfigured();
 
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     const owner = session.client_reference_id ?? session.metadata?.userId;
