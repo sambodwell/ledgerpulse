@@ -612,6 +612,29 @@ export const PRICING = {
   proMonthlyUsd: 39,
 } as const;
 
+/** Marketing copy for pricing cards / paywalls. Keep in sync with server caps (AI_QUERY_CAP). */
+export const PLANS = {
+  report: {
+    name: "Single Audit",
+    price: `$${PRICING.reportUnlockUsd} one-time`,
+    badge: "Recommended for Households & Individuals",
+    features: ["One-Time Full Executive Report", "Cryptographically Sealed Audit PDF", "12-Month Solvency Baseline", "3 AI Scenario Queries"],
+  },
+  pro: {
+    name: "Pro",
+    price: `$${PRICING.proMonthlyUsd}/mo`,
+    badge: "Recommended for Businesses & Serious Operators",
+    features: [
+      "Unlimited Guided Audits",
+      "Dual-Workspace Sync (Personal + Business)",
+      "Interactive Macro-Scenario Modeler (sliders & custom graphs)",
+      "50 AI Assistant Queries/mo",
+      "CSV/Excel Export",
+      "Priority Processing",
+    ],
+  },
+} as const;
+
 /**
  * What the API tells the client about access. In "teaser" mode the analysis
  * payload has been redacted server-side: only the top HIGH flag, no projections,

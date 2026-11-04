@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { Loader2, MessageCircle, Send, Sparkles, X } from "lucide-react";
 import { useApp } from "@/components/AppProvider";
 import { cn, errorMessage, glass, inputCls } from "@/components/ui";
+import { authHeaders } from "@/lib/supabase";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -45,7 +46,7 @@ export function ChatAssistant() {
     try {
       const res = await fetch("/api/assistant", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
         body: JSON.stringify({
           messages: next.filter((m) => m !== GREETING),
           context: { page: window.location.pathname, mode: uiHints.mode, hasAnalysis: uiHints.hasAnalysis, tier: profile?.tier ?? "free" },

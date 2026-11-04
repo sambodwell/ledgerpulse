@@ -67,6 +67,7 @@ import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
 import { useApp } from "@/components/AppProvider";
 import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu } from "@/components/ProfileMenu";
+import { PlanCard } from "@/components/PlanCard";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
 
@@ -657,7 +658,7 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
             render={(row) => (
               <>
                 <TextInput aria-label={copy.revenueLines} value={row.label} placeholder={custom ? "e.g. Catering orders" : undefined} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, label: v } : x)))} />
-                <NumInput aria-label="Monthly amount" value={row.amount} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, amount: v } : x)))} />
+                <MoneyInput aria-label="Monthly amount" value={row.amount} onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, amount: v } : x)))} />
                 {!personal && <NumInput aria-label="Margin percent" value={row.margin} placeholder="auto" onChange={(v) => setRevenue((r) => r.map((x) => (x.id === row.id ? { ...x, margin: v } : x)))} />}
               </>
             )}
@@ -704,7 +705,7 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
                       placeholder={CATEGORY_LINE_HINTS[row.category] ?? (row.category ? "Optional description" : "Describe the expense")}
                       onChange={(v) => update({ label: v })}
                     />
-                    <NumInput aria-label="Monthly amount" value={row.amount} onChange={(v) => update({ amount: v })} />
+                    <MoneyInput aria-label="Monthly amount" value={row.amount} onChange={(v) => update({ amount: v })} />
                   </div>
                   {help && (
                     <p className="flex items-start gap-1.5 text-xs text-slate-400">
@@ -809,6 +810,24 @@ function TextInput({ value, onChange, ...rest }: { value: string; onChange: (v: 
 
 function NumInput({ value, onChange, placeholder = "0", ...rest }: { value: string; onChange: (v: string) => void; placeholder?: string; "aria-label": string }) {
   return <input {...rest} type="number" inputMode="decimal" min={0} step="any" placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} className={cn(inputCls, "tabular-nums")} />;
+}
+
+/** Keeps digits and at most one decimal point with up to 2 decimals ("1,00.0.5" → "100.05"). */
+const cleanMoney = (raw: string) => {
+  const [whole, ...rest] = raw.replace(/[^\d.]/g, "").split(".");
+  return rest.length ? `${whole}.${rest.join("").slice(0, 2)}` : whole;
+};
+
+/** Text input (not type=number) so the value string stays exactly what was typed, with a static $ prefix. */
+function MoneyInput({ value, onChange, placeholder = "0.00", ...rest }: { value: string; onChange: (v: string) => void; placeholder?: string; "aria-label": string }) {
+  return (
+    <div className="relative">
+      <span aria-hidden className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm text-slate-500">
+        $
+      </span>
+      <input {...rest} type="text" inputMode="decimal" autoComplete="off" placeholder={placeholder} value={value} onChange={(e) => onChange(cleanMoney(e.target.value))} className={cn(inputCls, "pl-7 tabular-nums")} />
+    </div>
+  );
 }
 
 function ReviewRow({ label, value }: { label: string; value: string }) {
@@ -984,7 +1003,7 @@ function PaywallButtons({ paywall, proOnly = false }: { paywall: Paywall; proOnl
 function TeaserBanner({ paywall }: { paywall: Paywall }) {
   const { access } = paywall;
   return (
-    <div className={cn(glass, "flex flex-col gap-4 border-indigo-400/20 bg-gradient-to-r from-indigo-500/10 to-transparent p-5 lg:flex-row lg:items-center lg:justify-between")}>
+    <div className={cn(glass, "flex flex-col gap-4 border-indigo-400/20 bg-gradient-to-r from-indigo-500/10 to-transparent p-5 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between")}>
       <div>
         <p className="flex items-center gap-2 font-medium">
           <Sparkles className="h-4 w-4 text-indigo-300" /> You&apos;re viewing the free preview
@@ -996,6 +1015,12 @@ function TeaserBanner({ paywall }: { paywall: Paywall }) {
         {paywall.message && <p className="mt-2 text-sm text-amber-200">{paywall.message}</p>}
       </div>
       <PaywallButtons paywall={paywall} />
+      {!paywall.isPro && (
+        <div className="grid w-full gap-3 sm:grid-cols-2 lg:basis-full">
+          <PlanCard plan="report" />
+          <PlanCard plan="pro" />
+        </div>
+      )}
     </div>
   );
 }

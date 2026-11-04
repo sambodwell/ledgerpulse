@@ -23,8 +23,24 @@ export function getStripe(): Stripe | null {
   return stripe;
 }
 
+/** Returns the configured Stripe price id, or null if it's missing or not a `price_…` id (e.g. a `prod_…` id pasted by mistake). */
 export function priceFor(kind: CheckoutKind): string | null {
-  return (kind === "pro" ? process.env.STRIPE_PRICE_PRO_MONTHLY : process.env.STRIPE_PRICE_REPORT_UNLOCK) ?? null;
+  const id = (kind === "pro" ? process.env.STRIPE_PRICE_PRO_MONTHLY : process.env.STRIPE_PRICE_REPORT_UNLOCK)?.trim();
+  return id && /^price_[A-Za-z0-9]+$/.test(id) ? id : null;
+}
+
+/** Maps a thrown error from a billing route to a clean JSON response (never an unhandled 500). */
+export function billingError(route: string, err: unknown): Response {
+  if (err instanceof Stripe.errors.StripeError) {
+    console.error(`[billing/${route}] Stripe ${err.type}`, err.code ?? "", err.param ?? "", err.message);
+    if (err instanceof Stripe.errors.StripeAuthenticationError) return billingNotConfigured();
+    if (err instanceof Stripe.errors.StripeInvalidRequestError) {
+      return Response.json({ error: "Billing is misconfigured on the server. Please contact support." }, { status: 502 });
+    }
+    return Response.json({ error: "Stripe is unavailable right now. Please try again in a moment." }, { status: 502 });
+  }
+  console.error(`[billing/${route}] unexpected error`, err instanceof Error ? err.message : err);
+  return Response.json({ error: "Billing is temporarily unavailable. Please try again." }, { status: 502 });
 }
 
 export function getAdminSupabase(): SupabaseClient | null {

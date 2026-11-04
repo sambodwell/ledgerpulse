@@ -24,7 +24,7 @@ import {
   type WinnerInsight,
 } from "@/lib/schemas";
 import { isSupabaseConfigured } from "@/lib/supabase";
-import { buildAccess, consumeReportUnlock, redactForTeaser, resolveViewer, seal, unseal, type Viewer } from "@/lib/server/entitlements";
+import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, resolveViewer, seal, unseal, type Viewer } from "@/lib/server/entitlements";
 
 /**
  * POST /api/analyze
@@ -565,6 +565,8 @@ const SCENARIO_SCHEMA = {
 
 async function handleScenario(prompt: string, baseline: ScenarioBaseline, viewer: Viewer) {
   if (viewer.tier !== "pro") throw new HttpError(402, "Scenario forecasting is a Pro feature.");
+  const quota = await consumeAiQuery(viewer);
+  if (!quota.ok) throw new HttpError(quota.status, quota.error);
 
   const months = projectionFactors({ businessType: baseline.businessType }).map((f, i) => `${i + 1}=${f.month}`).join(", ");
   const system = `You convert a "what if" question about a ${baseline.businessType} budget into structured adjustments for a deterministic 12-month projection. You do not compute the projection.

@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { PRICING } from "@/lib/schemas";
+import { consumeAiQuery, resolveViewer } from "@/lib/server/entitlements";
 
 /**
  * POST /api/assistant — floating site-guide chat.
@@ -54,6 +55,10 @@ function sanitize(body: unknown): { messages: Anthropic.Beta.BetaMessageParam[];
 export async function POST(request: Request) {
   const parsed = sanitize(await request.json().catch(() => null));
   if (!parsed) return Response.json({ error: "Send at least one user message." }, { status: 400 });
+
+  // Meter before calling the model so the monthly cap protects API spend.
+  const quota = await consumeAiQuery(await resolveViewer(request));
+  if (!quota.ok) return Response.json({ error: quota.error }, { status: quota.status });
 
   try {
     const message = await client.beta.messages.create({

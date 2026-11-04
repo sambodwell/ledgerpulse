@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, Briefcase, Check, CheckCircle2, CreditCard, Home, Loader2, Pencil, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
+import { ArrowLeft, Briefcase, Check, CheckCircle2, CreditCard, Home, Loader2, Pencil, ShieldCheck, Trash2, X } from "lucide-react";
 import {
   BUSINESS_TYPES,
   BUSINESS_TYPE_LABELS,
@@ -16,6 +16,7 @@ import {
 import { authHeaders, createWorkspace, deleteWorkspace, updatePlanCategory, updateWorkspace } from "@/lib/supabase";
 import { useApp } from "@/components/AppProvider";
 import { ProfileMenu, TierBadge } from "@/components/ProfileMenu";
+import { PlanCard } from "@/components/PlanCard";
 import { cn, errorMessage, glass, inputCls, primaryBtn, secondaryBtn } from "@/components/ui";
 
 const PLAN_COPY: Record<PlanCategory, { Icon: typeof Home; blurb: string }> = {
@@ -203,27 +204,16 @@ function SubscriptionCard() {
 
       {!isPro && (
         <div className="mt-5 grid gap-3 sm:grid-cols-2">
-          <div className="rounded-xl border border-amber-300/25 bg-gradient-to-br from-amber-400/10 to-transparent p-4">
-            <p className="flex items-center gap-2 font-medium">
-              <Sparkles className="h-4 w-4 text-amber-200" /> Pro — ${PRICING.proMonthlyUsd}/mo
-            </p>
-            <ul className="mt-2 space-y-1 text-sm text-slate-300">
-              <li>Every audit flag + savings total</li>
-              <li>12-month macro-adjusted projections</li>
-              <li>Unlimited scenario forecasting</li>
-              <li>Executive PDF reports</li>
-            </ul>
-            <button onClick={() => go("pro")} disabled={!!busy} className={cn(primaryBtn, "mt-4 w-full")}>
-              {busy === "pro" && <Loader2 className="h-4 w-4 animate-spin" />} Upgrade to Pro Subscription (${PRICING.proMonthlyUsd}/mo)
-            </button>
-          </div>
-          <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
-            <p className="font-medium">One-time report — ${PRICING.reportUnlockUsd}</p>
-            <p className="mt-2 text-sm text-slate-300">Unlock the full audit, projection and PDF report for a single analysis. No subscription.</p>
-            <button onClick={() => go("report")} disabled={!!busy} className={cn(secondaryBtn, "mt-4 w-full")}>
+          <PlanCard plan="report">
+            <button onClick={() => go("report")} disabled={!!busy} className={cn(secondaryBtn, "w-full")}>
               {busy === "report" && <Loader2 className="h-4 w-4 animate-spin" />} Unlock Full Audit &amp; Report (${PRICING.reportUnlockUsd})
             </button>
-          </div>
+          </PlanCard>
+          <PlanCard plan="pro">
+            <button onClick={() => go("pro")} disabled={!!busy} className={cn(primaryBtn, "w-full")}>
+              {busy === "pro" && <Loader2 className="h-4 w-4 animate-spin" />} Upgrade to Pro Subscription (${PRICING.proMonthlyUsd}/mo)
+            </button>
+          </PlanCard>
         </div>
       )}
 

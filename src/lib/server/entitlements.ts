@@ -47,6 +47,36 @@ export async function consumeReportUnlock(viewer: Viewer): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
+// AI query metering (assistant chat + scenario forecasting share one monthly pool)
+// ---------------------------------------------------------------------------
+
+export const AI_QUERY_CAP = { pro: 50, free: 3 } as const;
+
+export type AiQuotaResult = { ok: true; used: number; cap: number } | { ok: false; status: 401 | 429 | 503; error: string };
+
+/** Atomically counts one AI query against the caller's monthly cap. Fails closed if metering is unavailable. */
+export async function consumeAiQuery(viewer: Viewer): Promise<AiQuotaResult> {
+  if (!viewer.db || !viewer.userId) return { ok: false, status: 401, error: "Sign in to use the AI assistant." };
+  const cap = AI_QUERY_CAP[viewer.tier];
+  const { data, error } = await viewer.db.rpc("consume_ai_query", { cap });
+  if (error || typeof data !== "number") {
+    console.error("[entitlements] consume_ai_query failed", error?.message ?? data);
+    return { ok: false, status: 503, error: "AI usage tracking is unavailable right now. Try again shortly." };
+  }
+  if (data < 0) {
+    return {
+      ok: false,
+      status: 429,
+      error:
+        viewer.tier === "pro"
+          ? `Monthly AI scenario limit reached (${cap}/${cap}). It resets on the 1st.`
+          : `Monthly AI query limit reached (${cap}/${cap}). Upgrade to Pro for ${AI_QUERY_CAP.pro} queries a month.`,
+    };
+  }
+  return { ok: true, used: data, cap };
+}
+
+// ---------------------------------------------------------------------------
 // Teaser redaction
 // ---------------------------------------------------------------------------
 

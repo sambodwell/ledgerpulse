@@ -1,13 +1,14 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Eye, EyeOff, Loader2, Lock } from "lucide-react";
-import { isSupabaseConfigured, signInWithPassword, signUpWithPassword } from "@/lib/supabase";
+import { isSupabaseConfigured, resendSignupEmail, signInWithPassword, signUpWithPassword } from "@/lib/supabase";
 import { cn, inputCls, primaryBtn } from "@/components/ui";
 
 export type AuthMode = "signin" | "signup";
 
 const MIN_PASSWORD = 8;
+const RESEND_COOLDOWN_S = 60;
 
 /**
  * Email + password form used by the auth dialog and the /signup page.
@@ -33,6 +34,31 @@ export function AuthForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(initialNotice ?? null);
+  // Set once sign-up succeeds but needs email confirmation; enables "Resend".
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
+  const [cooldown, setCooldown] = useState(0);
+  const [resending, setResending] = useState(false);
+
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [cooldown]);
+
+  const resend = async () => {
+    if (!pendingEmail || cooldown > 0) return;
+    setResending(true);
+    setError(null);
+    try {
+      await resendSignupEmail(pendingEmail, next);
+      setNotice(`We sent a new confirmation link to ${pendingEmail}.`);
+      setCooldown(RESEND_COOLDOWN_S);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't resend the confirmation email.");
+    } finally {
+      setResending(false);
+    }
+  };
 
   const signup = mode === "signup";
   const mismatch = signup && confirm.length > 0 && confirm !== password;
@@ -63,6 +89,8 @@ export function AuthForm({
         const { needsConfirmation } = await signUpWithPassword(email, password, next);
         if (needsConfirmation) {
           setNotice("Check your inbox and click the confirmation link to finish creating your account.");
+          setPendingEmail(email);
+          setCooldown(RESEND_COOLDOWN_S);
           setPassword("");
           setConfirm("");
         } else onSignedIn();
@@ -116,6 +144,15 @@ export function AuthForm({
           {signup ? "Create account" : "Sign in"}
         </button>
       </form>
+
+      {signup && pendingEmail && (
+        <p className="mt-3 text-center text-sm text-slate-400">
+          Didn&apos;t get it?{" "}
+          <button type="button" onClick={resend} disabled={resending || cooldown > 0} className="text-indigo-300 hover:text-indigo-200 disabled:text-slate-500">
+            {resending ? "Sending…" : cooldown > 0 ? `Resend confirmation email (${cooldown}s)` : "Resend confirmation email"}
+          </button>
+        </p>
+      )}
 
       <p className="mt-4 text-center text-sm text-slate-400">
         {signup ? "Already have an account? " : "New here? "}

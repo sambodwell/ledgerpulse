@@ -129,6 +129,17 @@ export async function signUpWithPassword(email: string, password: string, next =
   return { needsConfirmation: !data.session };
 }
 
+/** Re-sends the sign-up confirmation email (Supabase rate-limits this server-side too). */
+export async function resendSignupEmail(email: string, next = "/dashboard") {
+  const site = getSiteUrl();
+  const { error } = await requireClient().auth.resend({
+    type: "signup",
+    email,
+    options: { emailRedirectTo: site ? `${site}/auth/callback?next=${encodeURIComponent(safeNextPath(next))}` : undefined },
+  });
+  if (error) throw new Error(`Couldn't resend the confirmation email: ${error.message}`);
+}
+
 export async function signOut() {
   const c = getSupabase();
   if (c) await c.auth.signOut();
