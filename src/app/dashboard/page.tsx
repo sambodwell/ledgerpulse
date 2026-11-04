@@ -2,19 +2,7 @@
 
 import { Component, useCallback, useEffect, useId, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ReferenceLine,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { Area, AreaChart, CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -29,14 +17,14 @@ import {
   Info,
   Loader2,
   Lock,
-  MessageSquareText,
+  Pencil,
   Plus,
   Repeat,
   Repeat1,
-  Send,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  SplitSquareHorizontal,
   Trash2,
   Trophy,
   Upload,
@@ -48,29 +36,29 @@ import {
   CATEGORY_HELP,
   CATEGORY_LINE_HINTS,
   CATEGORY_TEMPLATES,
+  DEFAULT_FORECAST,
   MODE_COPY,
   PRICING,
-  applyScenario,
   isAnalysisResponse,
   isExtractedLineItems,
   isBusinessType,
   modeOf,
+  projectBaseline,
+  resolveForecastStart,
   splitTotals,
   sum,
+  validShare,
   type AnalysisAccess,
   type AnalysisResponse,
   type BusinessType,
   type ExpenseLine,
+  type ForecastSettings,
   type RevenueLine,
   type FinancialAnalysis,
-  type SavedScenario,
-  type ScenarioBaseline,
-  type ScenarioPlan,
-  type ScenarioResult,
   type Severity,
   type WorkspaceMode,
 } from "@/lib/schemas";
-import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
+import { authHeaders } from "@/lib/supabase";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
@@ -78,10 +66,13 @@ import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu } from "@/components/ProfileMenu";
 import { PlanCard } from "@/components/PlanCard";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
+import { COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml } from "@/components/dashboard/chartKit";
+import { ForecastControls } from "@/components/dashboard/ForecastControls";
+import { ScenarioPanel, scenarioExamples } from "@/components/dashboard/ScenarioPanel";
+import { FiscalYearTracker } from "@/components/dashboard/FiscalYearTracker";
+import { FeedbackWidget } from "@/components/dashboard/FeedbackWidget";
+import { MoneyInput } from "@/components/dashboard/MoneyInput";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
-
-// Chart colors: validated categorical slots 1–3 for a dark surface.
-const COLOR = { revenue: "#3987e5", expenses: "#d95926", cash: "#199e70", baseline: "#94a3b8" } as const;
 
 const PRIVACY_BADGE = "🔒 256-Bit Encrypted | Zero File Retention — Your financial data is parsed in memory and never stored.";
 const PENDING_UNLOCK_KEY = "lp:pendingUnlock";
@@ -166,6 +157,8 @@ export default function DashboardPage() {
   const [pendingUnlock, setPendingUnlock] = useState<{ sealed: string; wsKey: string } | null>(null);
   const [confirmingCheckout, setConfirmingCheckout] = useState(false);
   const [checkoutNotice, setCheckoutNotice] = useState<string | null>(null);
+  /** Projection start month + horizon, shared by the baseline chart, scenarios, KPIs and the executive report. */
+  const [forecast, setForecast] = useState<ForecastSettings>(DEFAULT_FORECAST);
   const resultsRef = useRef<HTMLDivElement>(null);
 
   const { setUiHints, refreshProfile } = app;
@@ -325,8 +318,20 @@ export default function DashboardPage() {
       }
     : null;
 
-  const analysis = current?.analysis ?? null;
   const teaser = current?.access.level === "teaser";
+  const rawAnalysis = current?.analysis ?? null;
+  // Full reports re-project client-side so line-item edits and the chosen horizon/start month apply immediately.
+  // Teasers stay redacted (no projection) exactly as the server sent them.
+  const analysis = useMemo(() => (rawAnalysis && !teaser ? withProjection(rawAnalysis, forecast) : rawAnalysis), [rawAnalysis, teaser, forecast]);
+  const updateLineItems = useCallback(
+    (revenue: RevenueLine[], expenses: ExpenseLine[]) =>
+      setResults((r) => {
+        const cur = r[wsKey];
+        if (!cur) return r;
+        return { ...r, [wsKey]: { ...cur, analysis: { ...cur.analysis, itemizedRevenue: revenue, itemizedExpenses: expenses, monthlyRevenue: splitTotals(revenue).recurring } } };
+      }),
+    [wsKey],
+  );
   const copy = MODE_COPY[mode];
   const ws = app.activeWorkspace;
   const formDefaultType: BusinessType = mode === "PERSONAL" ? "PERSONAL_FAMILY" : ws && ws.mode === "BUSINESS" ? ws.businessType : "REAL_ESTATE";
@@ -356,8 +361,8 @@ export default function DashboardPage() {
             <h1 className="mt-1 text-3xl font-semibold tracking-tight">{mode === "PERSONAL" ? "Household budget & savings forecast" : "Cash flow & runway forecast"}</h1>
             <p className="mt-2 max-w-2xl text-slate-400">
               {mode === "PERSONAL"
-                ? "Enter your household income and spending or upload a bank statement. We'll audit your budget and project the next 12 months."
-                : "Enter your numbers or upload a bank statement / P&L. We'll audit it and project the next 12 months with seasonality and inflation."}
+                ? "Enter your household income and spending or upload a bank statement. We'll audit your budget and project the next 12–60 months."
+                : "Enter your numbers or upload a bank statement / P&L. We'll audit it and project the next 12–60 months with seasonality and inflation."}
             </p>
             <p className="mt-3 inline-flex items-center gap-2 text-sm text-slate-300">
               {ws ? (
@@ -484,7 +489,7 @@ export default function DashboardPage() {
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               ) : (
-                <button onClick={() => printExecutiveReport(analysis)} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
+                <button onClick={() => printExecutiveReport(analysis, forecast.months)} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
                   <Download className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               )}
@@ -493,39 +498,58 @@ export default function DashboardPage() {
             {teaser && <TeaserBanner paywall={paywall} />}
 
             <PanelBoundary title="Summary">
-              <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} />
+              <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} months={forecast.months} />
             </PanelBoundary>
             <div className="grid gap-6 xl:grid-cols-3">
               <div className="space-y-6 xl:col-span-2">
                 <PanelBoundary title="Projection chart">
                   {teaser ? (
-                    <LockedSection title="12-Month Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
+                    <LockedSection title="Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
                   ) : (
-                    <ProjectionCharts analysis={analysis} />
+                    <ProjectionCharts analysis={analysis} settings={forecast} onSettingsChange={setForecast} />
                   )}
                 </PanelBoundary>
                 <PanelBoundary title="Scenario forecasting">
                   {isPro && !teaser ? (
-                    <ScenarioPanel analysis={analysis} workspaceId={ws?.id ?? null} />
+                    <ScenarioPanel analysis={analysis} workspaceId={ws?.id ?? null} settings={forecast} onSettingsChange={setForecast} />
                   ) : (
                     <LockedSection title="Interactive Scenario Forecasting" paywall={paywall} proOnly placeholder={<FakeScenarioChat mode={mode} />} />
                   )}
                 </PanelBoundary>
                 <PanelBoundary title="Line items">
-                  <LineItems analysis={analysis} />
+                  <LineItems analysis={analysis} onApply={updateLineItems} />
                 </PanelBoundary>
               </div>
               <div className="space-y-6">
                 <PanelBoundary title="Audit Mode">
-                  <AuditPanel analysis={analysis} paywall={paywall} />
+                  <AuditPanel analysis={analysis} paywall={paywall} workspaceId={ws?.id ?? null} />
                 </PanelBoundary>
                 <PanelBoundary title="Winner insight">
                   <WinnerCard analysis={analysis} label={copy.revenue} />
                 </PanelBoundary>
               </div>
             </div>
+            <FeedbackWidget
+              key={`report-${wsKey}`}
+              context="report"
+              workspaceId={ws?.id ?? null}
+              prompt={teaser ? "How useful is this free preview?" : "How useful is this report?"}
+              className={cn(glass, "px-5 py-3")}
+            />
           </div>
         )}
+
+        <section className="mt-10" aria-label="Fiscal Year Tracker">
+          <PanelBoundary title="Fiscal Year Tracker">
+            <FiscalYearTracker
+              key={`fy-${wsKey}`}
+              userId={app.user.id}
+              workspaceId={ws?.id ?? null}
+              businessType={formDefaultType}
+              analysis={teaser ? null : rawAnalysis}
+            />
+          </PanelBoundary>
+        </section>
       </main>
     </div>
   );
@@ -569,6 +593,8 @@ interface FormRevenue {
   margin: string; // percent, 0–100
   /** Every line starts recurring; the owner can flip single amounts (a bonus, a refund) to one-time. */
   oneTime: boolean;
+  /** Recurring lines only: percent (1–99) of the first projected month this line covers; "" = full month. */
+  partial: string;
 }
 interface FormExpense {
   id: number;
@@ -577,13 +603,15 @@ interface FormExpense {
   category: string;
   /** Every line starts recurring; the owner can flip single charges (a late fee, one purchase) to one-time. */
   oneTime: boolean;
+  /** Recurring lines only: percent (1–99) of the first projected month this line covers; "" = full month. */
+  partial: string;
 }
 
 type FormPayload = {
   mode: "form";
   businessType: BusinessType;
-  revenue: { label: string; amount: number; margin?: number; oneTime?: true }[];
-  expenses: { label: string; amount: number; category: string; oneTime?: true }[];
+  revenue: { label: string; amount: number; margin?: number; oneTime?: true; firstMonthShare?: number }[];
+  expenses: { label: string; amount: number; category: string; oneTime?: true; firstMonthShare?: number }[];
   /** "statement" = parsed from an upload and reviewed by the owner. */
   origin?: "manual" | "statement";
 };
@@ -591,8 +619,11 @@ type FormPayload = {
 let nextId = 1;
 const newId = () => nextId++;
 
-const blankRevenue = (label = ""): FormRevenue => ({ id: newId(), label, amount: "", margin: "", oneTime: false });
-const blankExpense = (category = ""): FormExpense => ({ id: newId(), label: "", amount: "", category, oneTime: false });
+const blankRevenue = (label = ""): FormRevenue => ({ id: newId(), label, amount: "", margin: "", oneTime: false, partial: "" });
+const blankExpense = (category = ""): FormExpense => ({ id: newId(), label: "", amount: "", category, oneTime: false, partial: "" });
+
+/** Form "partial %" → share of the first month (0–1, exclusive), or undefined for one-time / full-month lines. */
+const rowShare = (r: { oneTime: boolean; partial: string }) => (r.oneTime || r.partial === "" ? undefined : validShare(Number(r.partial) / 100));
 
 const validRevenueRows = (rows: FormRevenue[]) => rows.filter((r) => r.label.trim() && Number(r.amount) > 0);
 const validExpenseRows = (rows: FormExpense[]) => rows.filter((e) => expenseLabel(e) && Number(e.amount) > 0);
@@ -604,13 +635,13 @@ function toPayloadLines(revenue: FormRevenue[], expenses: FormExpense[], persona
       label: r.label.trim(),
       amount: Number(r.amount),
       ...(!personal && r.margin !== "" && Number.isFinite(Number(r.margin)) ? { margin: Math.min(100, Math.max(0, Number(r.margin))) / 100 } : {}),
-      ...(r.oneTime ? { oneTime: true as const } : {}),
+      ...(r.oneTime ? { oneTime: true as const } : rowShare(r) ? { firstMonthShare: rowShare(r) } : {}),
     })),
     expenses: validExpenseRows(expenses).map((e) => ({
       label: expenseLabel(e),
       amount: Number(e.amount),
       category: e.category.trim() || "Uncategorized",
-      ...(e.oneTime ? { oneTime: true as const } : {}),
+      ...(e.oneTime ? { oneTime: true as const } : rowShare(e) ? { firstMonthShare: rowShare(e) } : {}),
     })),
   };
 }
@@ -639,26 +670,29 @@ const STEPS = ["Type", "Income", "Expenses", "Review"] as const;
 
 /** Drafts saved before the recurring toggle existed have no `oneTime`; those rows load as recurring. */
 const optionalBool = (v: unknown) => v === undefined || typeof v === "boolean";
+const optionalStr = (v: unknown) => v === undefined || typeof v === "string";
 const isFormRevenue = (r: unknown): r is FormRevenue =>
   !!r &&
   typeof r === "object" &&
   typeof (r as FormRevenue).id === "number" &&
   ["label", "amount", "margin"].every((k) => typeof (r as unknown as Record<string, unknown>)[k] === "string") &&
-  optionalBool((r as FormRevenue).oneTime);
+  optionalBool((r as FormRevenue).oneTime) &&
+  optionalStr((r as FormRevenue).partial);
 const isFormExpense = (e: unknown): e is FormExpense =>
   !!e &&
   typeof e === "object" &&
   typeof (e as FormExpense).id === "number" &&
   ["label", "amount", "category"].every((k) => typeof (e as unknown as Record<string, unknown>)[k] === "string") &&
-  optionalBool((e as FormExpense).oneTime);
+  optionalBool((e as FormExpense).oneTime) &&
+  optionalStr((e as FormExpense).partial);
 
 /** Reads a saved draft for this form, validating its shape and keeping row ids unique. Client-only (the form never SSRs). */
 function restoreDraft(key: string, mode: WorkspaceMode) {
   const d = loadDraft<unknown, unknown>(key);
   if (!d || !isBusinessType(d.businessType) || modeOf(d.businessType) !== mode) return null;
   if (!d.revenue.every(isFormRevenue) || !d.expenses.every(isFormExpense)) return null;
-  const revenue = (d.revenue as FormRevenue[]).map((r) => ({ ...r, oneTime: r.oneTime === true }));
-  const expenses = (d.expenses as FormExpense[]).map((e) => ({ ...e, oneTime: e.oneTime === true }));
+  const revenue = (d.revenue as FormRevenue[]).map((r) => ({ ...r, oneTime: r.oneTime === true, partial: r.partial ?? "" }));
+  const expenses = (d.expenses as FormExpense[]).map((e) => ({ ...e, oneTime: e.oneTime === true, partial: e.partial ?? "" }));
   nextId = Math.max(nextId, ...revenue.map((r) => r.id + 1), ...expenses.map((e) => e.id + 1));
   return { step: Math.min(Math.max(0, Math.trunc(d.step)), STEPS.length - 1), businessType: d.businessType, revenue, expenses };
 }
@@ -907,7 +941,7 @@ function RevenueRowsEditor({
                   <NumInput aria-label="Margin percent" value={row.margin} placeholder="Margin % (auto)" onChange={(v) => update({ margin: v })} />
                 </div>
               )}
-              <RecurrenceToggle oneTime={row.oneTime} onChange={(oneTime) => update({ oneTime })} />
+              <RecurrenceControl oneTime={row.oneTime} partial={row.partial} onChange={update} />
             </div>
           </>
         );
@@ -975,7 +1009,7 @@ function ExpenseRowsEditor({
                 <div className="w-[7.5rem]">
                   <MoneyInput aria-label={row.oneTime ? "One-time amount" : "Monthly amount"} value={row.amount} onChange={(v) => update({ amount: v })} />
                 </div>
-                <RecurrenceToggle oneTime={row.oneTime} onChange={(oneTime) => update({ oneTime })} />
+                <RecurrenceControl oneTime={row.oneTime} partial={row.partial} onChange={update} />
               </div>
               {help && (
                 <p className="flex items-start gap-1.5 text-xs text-slate-400">
@@ -997,34 +1031,75 @@ function ExpenseRowsEditor({
   );
 }
 
-/** Recurring (default) ↔ one-time switch for a single line item. */
-function RecurrenceToggle({ oneTime, onChange }: { oneTime: boolean; onChange: (oneTime: boolean) => void }) {
+type Recurrence = "recurring" | "partial" | "oneTime";
+const RECURRENCE_HELP: Record<Recurrence, string> = {
+  recurring: "Recurring: repeats every month.",
+  partial: "Partial first month: repeats monthly, but only this % of the first projected month is counted (e.g. rent or a contract starting mid-month).",
+  oneTime: "One-time: counted once, in the first projected month (e.g. a single-week contract or a late fee).",
+};
+
+/** Recurring (default) / partial first month / one-time selector for a single line item. */
+function RecurrenceControl({ oneTime, partial, onChange }: { oneTime: boolean; partial: string; onChange: (patch: { oneTime?: boolean; partial?: string }) => void }) {
+  const value: Recurrence = oneTime ? "oneTime" : partial !== "" ? "partial" : "recurring";
+  const Icon = value === "oneTime" ? Repeat1 : value === "partial" ? SplitSquareHorizontal : Repeat;
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={oneTime}
-      aria-label="One-time amount"
-      title={oneTime ? "One-time: counted once, in the first projected month. Click to make it recurring." : "Recurring: repeats every month. Click to mark it one-time."}
-      onClick={() => onChange(!oneTime)}
-      className={cn(
-        "inline-flex h-[38px] shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300",
-        oneTime ? "border-amber-300/40 bg-amber-400/10 text-amber-100 hover:bg-amber-400/15" : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.07]",
+    <div className="flex shrink-0 items-center gap-1.5">
+      <div className="relative">
+        <Icon aria-hidden className={cn("pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2", value === "recurring" ? "text-slate-400" : value === "partial" ? "text-sky-200" : "text-amber-100")} />
+        <select
+          aria-label="Recurrence"
+          title={RECURRENCE_HELP[value]}
+          value={value}
+          onChange={(e) => {
+            const v = e.target.value as Recurrence;
+            onChange(v === "oneTime" ? { oneTime: true, partial: "" } : v === "partial" ? { oneTime: false, partial: partial || "50" } : { oneTime: false, partial: "" });
+          }}
+          className={cn(
+            "h-[38px] appearance-none rounded-lg border pl-7 pr-3 text-xs font-medium transition focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300",
+            value === "oneTime" && "border-amber-300/40 bg-amber-400/10 text-amber-100",
+            value === "partial" && "border-sky-300/40 bg-sky-400/10 text-sky-100",
+            value === "recurring" && "border-white/10 bg-white/[0.03] text-slate-300",
+          )}
+        >
+          <option value="recurring">Recurring</option>
+          <option value="partial">Partial 1st month</option>
+          <option value="oneTime">One-time</option>
+        </select>
+      </div>
+      {value === "partial" && (
+        <div className="relative w-[4.75rem]">
+          <input
+            aria-label="Percent of the first month"
+            title="Share of the first projected month this line covers, e.g. 50 for mid-month"
+            type="text"
+            inputMode="numeric"
+            value={partial}
+            onChange={(e) => {
+              const digits = e.target.value.replace(/\D/g, "").slice(0, 2);
+              onChange({ partial: digits === "" || digits === "0" ? "1" : digits });
+            }}
+            className={cn(inputCls, "pr-6 tabular-nums")}
+          />
+          <span aria-hidden className="pointer-events-none absolute inset-y-0 right-2.5 flex items-center text-xs text-slate-500">
+            %
+          </span>
+        </div>
       )}
-    >
-      {oneTime ? <Repeat1 className="h-3.5 w-3.5" /> : <Repeat className="h-3.5 w-3.5 text-slate-400" />}
-      {oneTime ? "One-time" : "Recurring"}
-    </button>
+    </div>
   );
 }
 
-/** Totals before submitting: recurring per month, with one-time amounts listed separately. */
+/** Totals before submitting: recurring per month, with one-time amounts and first-month proration listed separately. */
 function ReviewSummary({ mode, businessType, revenue, expenses }: { mode: WorkspaceMode; businessType: BusinessType; revenue: FormRevenue[]; expenses: FormExpense[] }) {
   const copy = MODE_COPY[mode];
   const rev = rowTotals(revenue);
   const exp = rowTotals(expenses);
   const oneTimeRev = revenue.filter((r) => r.oneTime).length;
   const oneTimeExp = expenses.filter((e) => e.oneTime).length;
+  // Month-1 change from partial lines: −amount × (1 − share) for revenue, +amount × (1 − share) back for expenses.
+  const proration = (rows: { amount: string; oneTime: boolean; partial: string }[]) => sum(rows, (r) => (rowShare(r) ? (Number(r.amount) || 0) * (1 - rowShare(r)!) : 0));
+  const partialCount = [...revenue, ...expenses].filter((r) => rowShare(r)).length;
+  const firstMonthAdj = proration(expenses) - proration(revenue);
   return (
     <dl className="space-y-3 text-sm">
       <ReviewRow label={mode === "PERSONAL" ? "Mode" : "Business type"} value={BUSINESS_TYPE_LABELS[businessType]} />
@@ -1035,6 +1110,12 @@ function ReviewSummary({ mode, businessType, revenue, expenses }: { mode: Worksp
         <ReviewRow
           label={`One-time (${oneTimeRev + oneTimeExp} line${oneTimeRev + oneTimeExp === 1 ? "" : "s"}, first month only)`}
           value={`${rev.oneTime - exp.oneTime >= 0 ? "+" : ""}${usd.format(rev.oneTime - exp.oneTime)}`}
+        />
+      )}
+      {partialCount > 0 && (
+        <ReviewRow
+          label={`Partial-month proration (${partialCount} line${partialCount === 1 ? "" : "s"}, first month only)`}
+          value={`${firstMonthAdj >= 0 ? "+" : ""}${usd.format(firstMonthAdj)}`}
         />
       )}
     </dl>
@@ -1100,48 +1181,6 @@ function TextInput({ value, onChange, ...rest }: { value: string; onChange: (v: 
 
 function NumInput({ value, onChange, placeholder = "0", ...rest }: { value: string; onChange: (v: string) => void; placeholder?: string; "aria-label": string }) {
   return <input {...rest} type="number" inputMode="decimal" min={0} step="any" placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} className={cn(inputCls, "tabular-nums")} />;
-}
-
-/**
- * Normalizes typed/pasted money to a plain decimal string: digits, at most one decimal point,
- * up to 2 decimals, no redundant leading zeros ("$1,00.0.5" → "100.05", "007" → "7", "." → "0.").
- */
-const cleanMoney =(raw: string) => {
-  const [rawWhole, ...rest] = raw.replace(/[^\d.]/g, "").split(".");
-  const whole = rawWhole.replace(/^0+(?=\d)/, "");
-  if (!rest.length) return whole;
-  return `${whole || "0"}.${rest.join("").slice(0, 2)}`;
-};
-
-/** On blur: "12" → "12.00", "12.5" → "12.50", "12." → "12.00". Empty stays empty so the placeholder shows. */
-const padMoney = (v: string) => (v === "" || !Number.isFinite(Number(v)) ? v : Number(v).toFixed(2));
-
-/**
- * Text input (not type=number) so the bound value is exactly the normalized string, with a static $ prefix
- * and a faded 0.00 placeholder that typing replaces.
- */
-function MoneyInput({ value, onChange, placeholder = "0.00", ...rest }: { value: string; onChange: (v: string) => void; placeholder?: string; "aria-label": string }) {
-  return (
-    <div className="group relative">
-      <span aria-hidden className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm text-slate-500 transition group-focus-within:text-indigo-300">
-        $
-      </span>
-      <input
-        {...rest}
-        type="text"
-        inputMode="decimal"
-        autoComplete="off"
-        placeholder={placeholder}
-        value={value}
-        onChange={(e) => onChange(cleanMoney(e.target.value))}
-        onBlur={() => {
-          const padded = padMoney(value);
-          if (padded !== value) onChange(padded);
-        }}
-        className={cn(inputCls, "pl-7 tabular-nums placeholder:text-slate-600/80")}
-      />
-    </div>
-  );
 }
 
 function ReviewRow({ label, value }: { label: string; value: string }) {
@@ -1474,7 +1513,7 @@ function TeaserBanner({ paywall }: { paywall: Paywall }) {
         </p>
         <p className="mt-1 text-sm text-slate-400">
           {access.lockedFlagCount > 0 ? `${access.lockedFlagCount} more audit flag${access.lockedFlagCount === 1 ? "" : "s"}, ` : ""}
-          the potential-savings total, the 12-month projection and the executive report are locked.
+          the potential-savings total, the multi-month projection and the executive report are locked.
         </p>
         {paywall.message && <p className="mt-2 text-sm text-amber-200">{paywall.message}</p>}
       </div>
@@ -1504,7 +1543,7 @@ function LockedSection({ title, paywall, placeholder, proOnly = false }: { title
           <Lock className="mx-auto h-6 w-6 text-indigo-300" />
           <p className="mt-2 font-medium">{proOnly ? "Scenario forecasting is a Pro feature" : "Unlock your full forecast"}</p>
           <p className="mt-1 text-sm text-slate-400">
-            {proOnly ? "Ask \"what if\" in plain English and see your adjusted 12-month runway." : "See every month of your seasonality- and inflation-adjusted cash flow."}
+            {proOnly ? "Ask \"what if\" in plain English and see your adjusted runway over 12–60 months." : "See every month of your seasonality- and inflation-adjusted cash flow."}
           </p>
           <div className="mt-4">
             <PaywallButtons paywall={paywall} proOnly={proOnly} />
@@ -1555,6 +1594,14 @@ function projectionRows(a: FinancialAnalysis) {
   return rows;
 }
 
+function toBaseline(a: FinancialAnalysis) {
+  return { businessType: a.businessType, itemizedRevenue: a.itemizedRevenue, itemizedExpenses: a.itemizedExpenses, inflationRateAssumed: a.inflationRateAssumed };
+}
+
+function withProjection(a: FinancialAnalysis, s: ForecastSettings): FinancialAnalysis {
+  return { ...a, macroProjections: projectBaseline(toBaseline(a), { start: resolveForecastStart(s), months: s.months }) };
+}
+
 function useDerived(a: FinancialAnalysis) {
   return useMemo(() => {
     // Monthly figures are recurring-only; one-time lines are shown separately and land in month 1 of the projection.
@@ -1569,7 +1616,7 @@ function useDerived(a: FinancialAnalysis) {
   }, [a]);
 }
 
-function KpiRow({ analysis, mode, locked }: { analysis: FinancialAnalysis; mode: WorkspaceMode; locked: boolean }) {
+function KpiRow({ analysis, mode, locked, months }: { analysis: FinancialAnalysis; mode: WorkspaceMode; locked: boolean; months: number }) {
   const d = useDerived(analysis);
   const copy = MODE_COPY[mode];
   const tiles: { label: string; value: string; sub?: string; bad?: boolean; locked?: boolean }[] = [
@@ -1577,9 +1624,9 @@ function KpiRow({ analysis, mode, locked }: { analysis: FinancialAnalysis; mode:
     { label: `Monthly ${copy.expenses.toLowerCase()}`, value: usd.format(d.monthlyExpenses), sub: d.oneTimeExpenses > 0 ? `+ ${usd.format(d.oneTimeExpenses)} one-time` : undefined },
     { label: copy.net, value: usd.format(d.net), bad: d.net < 0 },
     locked
-      ? { label: "12-mo projected net", value: "Locked", sub: "Unlock to see your forecast", locked: true }
+      ? { label: `${months}-mo projected net`, value: "Locked", sub: "Unlock to see your forecast", locked: true }
       : {
-          label: "12-mo projected net",
+          label: `${months}-mo projected net`,
           value: usd.format(d.annualNet),
           sub: d.firstNegative ? `Cash turns negative in ${d.firstNegative}` : `After ${pct(analysis.inflationRateAssumed)} inflation`,
           bad: d.annualNet < 0,
@@ -1606,34 +1653,18 @@ function KpiRow({ analysis, mode, locked }: { analysis: FinancialAnalysis; mode:
   );
 }
 
-function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: ReadonlyArray<{ name?: string | number; value?: unknown; color?: string }>; label?: string | number }) {
-  if (!active || !payload?.length) return null;
-  return (
-    <div className="rounded-lg border border-white/10 bg-slate-900/95 px-3 py-2 text-xs shadow-xl backdrop-blur">
-      <p className="mb-1 font-medium text-slate-200">{label}</p>
-      {payload.map((p) => (
-        <p key={String(p.name)} className="flex items-center gap-2 text-slate-300">
-          <span className="inline-block h-2 w-2 rounded-full" style={{ background: p.color }} />
-          <span className="text-slate-400">{p.name}</span>
-          <span className="ml-auto pl-3 tabular-nums text-slate-100">{usd.format(Number(p.value))}</span>
-        </p>
-      ))}
-    </div>
-  );
-}
-
-const axisProps = { stroke: "#64748b", tick: { fill: "#94a3b8", fontSize: 12 }, tickLine: false, axisLine: false } as const;
-
-function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
+function ProjectionCharts({ analysis, settings, onSettingsChange }: { analysis: FinancialAnalysis; settings: ForecastSettings; onSettingsChange: (s: ForecastSettings) => void }) {
   const { rows } = useDerived(analysis);
   const [showTable, setShowTable] = useState(false);
   const copy = MODE_COPY[modeOf(analysis.businessType)];
+  const months = settings.months;
+  const long = months > 12;
 
   return (
     <div className={cn(glass, "p-6")}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold">12-Month Macro-Adjusted Projection</h2>
+          <h2 className="text-lg font-semibold">{months}-Month Macro-Adjusted Projection</h2>
           <p className="text-sm text-slate-400">
             Seasonality for {BUSINESS_TYPE_LABELS[analysis.businessType].toLowerCase()} · {pct(analysis.inflationRateAssumed)} annual inflation on costs
           </p>
@@ -1642,9 +1673,10 @@ function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
           {showTable ? "Show chart" : "Show table"}
         </button>
       </div>
+      <ForecastControls settings={settings} onChange={onSettingsChange} className="mt-4" />
 
       {showTable ? (
-        <div className="mt-4 overflow-x-auto">
+        <div className="mt-4 max-h-[32rem] overflow-auto">
           <table className="w-full text-sm tabular-nums">
             <thead className="text-left text-xs uppercase text-slate-500">
               <tr>
@@ -1674,7 +1706,7 @@ function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
                 <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0]} />
+                <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
                 <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
                 <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
                 <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
@@ -1695,7 +1727,7 @@ function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
                   </linearGradient>
                 </defs>
                 <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0]} />
+                <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
                 <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
                 <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" />
                 <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
@@ -1710,274 +1742,6 @@ function ProjectionCharts({ analysis }: { analysis: FinancialAnalysis }) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario forecasting (Pro)
-// ---------------------------------------------------------------------------
-
-function scenarioExamples(mode: WorkspaceMode) {
-  return mode === "PERSONAL"
-    ? ["What if groceries go up 10% and I put an extra $300/month into investments?", "What if rent rises 5% in month 6?", "What if I pay off my car loan in 4 months?"]
-    : ["What if fuel costs increase by 15% and I gain 2 new clients next quarter?", "What if I hire a $4,000/month technician starting in month 3?", "What if revenue drops 20% for the next 3 months?"];
-}
-
-interface ScenarioEntry {
-  id: number;
-  prompt: string;
-  plan?: ScenarioPlan;
-  result?: ScenarioResult;
-  error?: string;
-  saved?: boolean;
-}
-
-function ScenarioPanel({ analysis, workspaceId }: { analysis: FinancialAnalysis; workspaceId: string | null }) {
-  const mode = modeOf(analysis.businessType);
-  const [entries, setEntries] = useState<ScenarioEntry[]>([]);
-  const [selected, setSelected] = useState<number | null>(null);
-  const [draft, setDraft] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState<SavedScenario[]>([]);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const listRef = useRef<HTMLDivElement>(null);
-
-  const baseline: ScenarioBaseline = useMemo(
-    () => ({
-      businessType: analysis.businessType,
-      itemizedRevenue: analysis.itemizedRevenue.map(({ label, amount, oneTime }) => ({ label, amount, oneTime })),
-      itemizedExpenses: analysis.itemizedExpenses.map(({ label, amount, category, oneTime }) => ({ label, amount, category, oneTime })),
-      inflationRateAssumed: analysis.inflationRateAssumed,
-    }),
-    [analysis],
-  );
-
-  useEffect(() => {
-    if (!workspaceId) return;
-    let cancelled = false;
-    listScenarios(workspaceId)
-      .then((s) => !cancelled && setSaved(s))
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [workspaceId]);
-
-  useEffect(() => {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
-  }, [entries]);
-
-  const ask = async (text: string) => {
-    const prompt = text.trim();
-    if (!prompt || busy) return;
-    const id = Date.now();
-    setEntries((e) => [...e, { id, prompt }]);
-    setDraft("");
-    setBusy(true);
-    try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
-        body: JSON.stringify({ mode: "scenario", prompt, baseline }),
-      });
-      if (!res.ok) throw new Error(await errorMessage(res));
-      const { scenario } = (await res.json()) as { scenario: ScenarioPlan };
-      const result = applyScenario(baseline, scenario.adjustments);
-      setEntries((e) => e.map((x) => (x.id === id ? { ...x, plan: scenario, result } : x)));
-      setSelected(id);
-    } catch (err) {
-      setEntries((e) => e.map((x) => (x.id === id ? { ...x, error: err instanceof Error ? err.message : "Scenario failed." } : x)));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const loadSaved = (s: SavedScenario) => {
-    const id = Date.now();
-    const plan: ScenarioPlan = { prompt: s.prompt, adjustments: s.adjustments, assumptions: [], explanation: s.summary.explanation };
-    setEntries((e) => [...e, { id, prompt: s.prompt, plan, result: applyScenario(baseline, s.adjustments), saved: true }]);
-    setSelected(id);
-  };
-
-  const save = async (entry: ScenarioEntry) => {
-    if (!workspaceId || !entry.plan || !entry.result) return;
-    setSaveError(null);
-    try {
-      await saveScenario({
-        workspaceId,
-        prompt: entry.prompt,
-        adjustments: entry.plan.adjustments,
-        summary: { baselineAnnualNet: entry.result.baselineAnnualNet, adjustedAnnualNet: entry.result.adjustedAnnualNet, delta: entry.result.delta, explanation: entry.plan.explanation },
-      });
-      setEntries((e) => e.map((x) => (x.id === entry.id ? { ...x, saved: true } : x)));
-      setSaved(await listScenarios(workspaceId));
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Couldn't save.");
-    }
-  };
-
-  const active = entries.find((e) => e.id === selected && e.result);
-  const firstNegative = active?.result?.points.find((p) => p.adjustedCumulative < 0)?.month ?? null;
-
-  return (
-    <div className={cn(glass, "p-6")}>
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="flex items-center gap-2 text-lg font-semibold">
-            <MessageSquareText className="h-5 w-5 text-indigo-300" /> Scenario Forecasting
-          </h2>
-          <p className="text-sm text-slate-400">Describe a change in plain English. We model it on top of your baseline projection.</p>
-        </div>
-      </div>
-
-      <div className="mt-5 grid gap-6 lg:grid-cols-5">
-        {/* Chat */}
-        <div className="flex flex-col lg:col-span-2">
-          <div ref={listRef} className="max-h-80 min-h-40 flex-1 space-y-3 overflow-y-auto pr-1 text-sm" aria-live="polite">
-            {entries.length === 0 && (
-              <div className="space-y-2">
-                <p className="text-slate-500">Try one of these:</p>
-                {scenarioExamples(mode).map((ex) => (
-                  <button key={ex} onClick={() => ask(ex)} className="block w-full rounded-xl border border-white/10 px-3 py-2 text-left text-slate-300 hover:bg-white/5">
-                    {ex}
-                  </button>
-                ))}
-              </div>
-            )}
-            {entries.map((e) => (
-              <div key={e.id} className="space-y-2">
-                <p className="ml-auto max-w-[90%] rounded-2xl rounded-br-sm bg-indigo-500/80 px-3 py-2 text-white">{e.prompt}</p>
-                {e.error ? (
-                  <p className="max-w-[90%] rounded-2xl rounded-bl-sm bg-rose-500/10 px-3 py-2 text-rose-200">{e.error}</p>
-                ) : e.plan && e.result ? (
-                  <button
-                    onClick={() => setSelected(e.id)}
-                    className={cn("block max-w-[90%] rounded-2xl rounded-bl-sm px-3 py-2 text-left", selected === e.id ? "bg-white/[0.1] ring-1 ring-indigo-400/40" : "bg-white/[0.06] hover:bg-white/[0.08]")}
-                  >
-                    <span className="text-slate-200">{e.plan.explanation || "Scenario modeled."}</span>
-                    <span className={cn("mt-1 block text-xs font-medium tabular-nums", e.result.delta >= 0 ? "text-emerald-300" : "text-rose-300")}>
-                      {e.result.delta >= 0 ? "+" : ""}
-                      {usd.format(e.result.delta)} over 12 months
-                    </span>
-                  </button>
-                ) : (
-                  <p className="inline-flex items-center gap-2 rounded-2xl bg-white/[0.06] px-3 py-2 text-slate-400">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Modeling…
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void ask(draft);
-            }}
-            className="mt-3 flex gap-2"
-          >
-            <input value={draft} onChange={(e) => setDraft(e.target.value)} maxLength={500} placeholder="What if…" aria-label="Scenario" className={inputCls} />
-            <button type="submit" disabled={busy || !draft.trim()} aria-label="Run scenario" className="grid h-9 w-10 shrink-0 place-items-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-400 disabled:opacity-40">
-              <Send className="h-4 w-4" />
-            </button>
-          </form>
-
-          {saved.length > 0 && (
-            <div className="mt-4 border-t border-white/10 pt-3">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Saved in this workspace</p>
-              <ul className="mt-2 space-y-1 text-sm">
-                {saved.slice(0, 6).map((s) => (
-                  <li key={s.id}>
-                    <button onClick={() => loadSaved(s)} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-slate-300 hover:bg-white/5">
-                      <Bookmark className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-                      <span className="flex-1 truncate">{s.prompt}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-
-        {/* Chart */}
-        <div className="lg:col-span-3">
-          {active?.result && active.plan ? (
-            <>
-              <div className="grid grid-cols-3 gap-3 text-sm">
-                <Stat label="Baseline 12-mo net" value={usd.format(active.result.baselineAnnualNet)} />
-                <Stat label="Adjusted 12-mo net" value={usd.format(active.result.adjustedAnnualNet)} tone={active.result.adjustedAnnualNet < 0 ? "bad" : undefined} />
-                <Stat label="Change" value={`${active.result.delta >= 0 ? "+" : ""}${usd.format(active.result.delta)}`} tone={active.result.delta >= 0 ? "good" : "bad"} />
-              </div>
-              <div className="mt-4 h-64">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={active.result.points} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
-                    <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                    <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0]} />
-                    <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
-                    <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" />
-                    <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
-                    <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
-                    <Line name="Baseline runway" type="monotone" dataKey="baselineCumulative" stroke={COLOR.baseline} strokeDasharray="5 4" strokeWidth={2} dot={false} />
-                    <Line name="Adjusted runway" type="monotone" dataKey="adjustedCumulative" stroke={COLOR.cash} strokeWidth={2.5} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-              {firstNegative && (
-                <p className="mt-2 flex items-center gap-1.5 text-xs text-rose-300">
-                  <AlertTriangle className="h-3 w-3" /> Under this scenario, cumulative cash turns negative in {firstNegative}.
-                </p>
-              )}
-              <div className="mt-4 space-y-2 text-sm">
-                <ul className="space-y-1">
-                  {active.plan.adjustments.map((a, i) => (
-                    <li key={i} className="flex items-start gap-2 text-slate-300">
-                      <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-300" />
-                      {a.description} <span className="text-slate-500">(from month {a.startMonth})</span>
-                    </li>
-                  ))}
-                </ul>
-                {active.result.unmatched.length > 0 && (
-                  <p className="text-xs text-amber-200">No matching line items for: {active.result.unmatched.join("; ")}. Those changes had no effect.</p>
-                )}
-                {active.plan.assumptions.length > 0 && (
-                  <details className="text-xs text-slate-400">
-                    <summary className="cursor-pointer text-slate-300">Assumptions</summary>
-                    <ul className="mt-1 list-disc space-y-0.5 pl-5">
-                      {active.plan.assumptions.map((s, i) => (
-                        <li key={i}>{s}</li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
-              </div>
-              <div className="mt-4 flex items-center gap-3">
-                {workspaceId ? (
-                  <button onClick={() => save(active)} disabled={active.saved} className={cn(secondaryBtn, "py-1.5 text-xs")}>
-                    <Bookmark className="h-3.5 w-3.5" /> {active.saved ? "Saved" : "Save scenario"}
-                  </button>
-                ) : (
-                  <p className="text-xs text-slate-500">Create a workspace to save scenarios.</p>
-                )}
-                {saveError && <p className="text-xs text-rose-300">{saveError}</p>}
-              </div>
-              <p className="mt-2 text-[11px] text-slate-500">Saving stores only the question, the adjustment parameters and the headline totals — never your statements.</p>
-            </>
-          ) : (
-            <div className="grid h-full min-h-64 place-items-center rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-slate-500">
-              Your baseline vs adjusted runway will appear here.
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, tone }: { label: string; value: string; tone?: "good" | "bad" }) {
-  return (
-    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
-      <p className="text-[11px] uppercase tracking-wide text-slate-500">{label}</p>
-      <p className={cn("mt-1 font-semibold tabular-nums", tone === "good" && "text-emerald-300", tone === "bad" && "text-rose-300")}>{value}</p>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------
 
@@ -1987,7 +1751,7 @@ const SEVERITY_STYLE: Record<Severity, { badge: string; Icon: typeof ShieldAlert
   LOW: { badge: "border-sky-400/40 bg-sky-500/15 text-sky-200", Icon: Info },
 };
 
-function AuditPanel({ analysis, paywall }: { analysis: FinancialAnalysis; paywall: Paywall }) {
+function AuditPanel({ analysis, paywall, workspaceId }: { analysis: FinancialAnalysis; paywall: Paywall; workspaceId: string | null }) {
   const [showAll, setShowAll] = useState(false);
   const teaser = paywall.access.level === "teaser";
   const flags = analysis.auditFlags;
@@ -2076,6 +1840,8 @@ function AuditPanel({ analysis, paywall }: { analysis: FinancialAnalysis; paywal
           </div>
         </div>
       )}
+
+      <FeedbackWidget context="audit" workspaceId={workspaceId} prompt="Rate this audit" className="mt-5 border-t border-white/10 pt-4" />
     </div>
   );
 }
@@ -2102,49 +1868,181 @@ function OneTimeBadge() {
   );
 }
 
-function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
-  const personal = analysis.businessType === "PERSONAL_FAMILY";
-  const copy = MODE_COPY[modeOf(analysis.businessType)];
+function PartialBadge({ share }: { share: number }) {
   return (
-    <div className={cn(glass, "grid gap-6 p-6 md:grid-cols-2")}>
-      <div>
-        <h3 className="text-sm font-medium text-slate-300">{copy.revenue}</h3>
-        <ul className="mt-3 divide-y divide-white/5 text-sm">
-          {analysis.itemizedRevenue.map((r) => (
-            <li key={r.label} className="flex justify-between gap-3 py-2">
-              <span className="text-slate-300">
-                {r.label}
-                {r.oneTime && <OneTimeBadge />}
-              </span>
-              <span className="tabular-nums">
-                {usd.format(r.amount)} {!personal && <span className="text-xs text-slate-500">· {pct(r.margin)} margin</span>}
-              </span>
-            </li>
-          ))}
-        </ul>
-      </div>
-      <div>
-        <h3 className="text-sm font-medium text-slate-300">{copy.expenses}</h3>
-        <ul className="mt-3 divide-y divide-white/5 text-sm">
-          {analysis.itemizedExpenses.map((e, i) => (
-            <li key={`${e.label}-${i}`} className="py-2">
-              <div className="flex justify-between gap-3">
-                <span className="text-slate-300">
-                  {e.label}
-                  {e.category && e.category.toLowerCase() !== e.label.toLowerCase() && <span className="text-xs text-slate-500"> · {e.category}</span>}
-                  {e.oneTime && <OneTimeBadge />}
-                </span>
-                <span className="tabular-nums">{usd.format(e.amount)}</span>
-              </div>
-              {e.flag && (
-                <p className="mt-1 flex items-center gap-1 text-xs text-amber-200">
-                  <AlertTriangle className="h-3 w-3" /> {e.flag}
-                </p>
-              )}
-            </li>
-          ))}
-        </ul>
-      </div>
+    <span
+      className="ml-2 inline-flex items-center gap-1 rounded-md border border-sky-300/30 bg-sky-400/10 px-1.5 py-0.5 align-middle text-[11px] text-sky-100"
+      title="Recurring, but only part of the first projected month is counted (e.g. starts mid-month)"
+    >
+      <SplitSquareHorizontal className="h-3 w-3" /> Partial · {Math.round(share * 100)}% of 1st month
+    </span>
+  );
+}
+
+/** Analysis lines → editable form rows (amounts with cents, margins as percents, partial share as a percent). */
+function toFormRows(revenue: RevenueLine[], expenses: ExpenseLine[], personal: boolean) {
+  const share = (l: { oneTime?: boolean; firstMonthShare?: number }) => {
+    const v = l.oneTime ? undefined : validShare(l.firstMonthShare);
+    return v ? String(Math.round(v * 100)) : "";
+  };
+  return {
+    revenue: revenue.map((r) => ({
+      ...blankRevenue(r.label),
+      amount: r.amount.toFixed(2),
+      margin: personal || !Number.isFinite(r.margin) ? "" : String(Math.round(r.margin * 100)),
+      oneTime: r.oneTime === true,
+      partial: share(r),
+    })),
+    expenses: expenses.map((e) => ({ ...blankExpense(e.category), label: e.label, amount: e.amount.toFixed(2), oneTime: e.oneTime === true, partial: share(e) })),
+  };
+}
+
+/**
+ * Report line items with an "Edit Items" mode: rename, re-price, re-categorize, add/remove lines and switch
+ * recurring / partial-first-month / one-time, without re-uploading. KPIs, projections and scenarios recompute
+ * locally from the edited lines; audit flags and insights keep the original analysis.
+ */
+function LineItems({ analysis, onApply }: { analysis: FinancialAnalysis; onApply: (revenue: RevenueLine[], expenses: ExpenseLine[]) => void }) {
+  const personal = analysis.businessType === "PERSONAL_FAMILY";
+  const mode = modeOf(analysis.businessType);
+  const copy = MODE_COPY[mode];
+  const [editing, setEditing] = useState<{ revenue: FormRevenue[]; expenses: FormExpense[] } | null>(null);
+  const [edited, setEdited] = useState(false);
+
+  const startEdit = () => setEditing(toFormRows(analysis.itemizedRevenue, analysis.itemizedExpenses, personal));
+  const apply = () => {
+    if (!editing) return;
+    const lines = toPayloadLines(editing.revenue, editing.expenses, personal);
+    const revenue: RevenueLine[] = lines.revenue.map((r) => {
+      const prior = analysis.itemizedRevenue.find((x) => x.label === r.label);
+      return { ...r, margin: personal ? 1 : r.margin ?? prior?.margin ?? 0.5 };
+    });
+    const expenses: ExpenseLine[] = lines.expenses.map((e) => {
+      const prior = analysis.itemizedExpenses.find((x) => x.label === e.label && x.category === e.category);
+      return { ...e, category: e.category === "Uncategorized" ? "Other" : e.category, ...(prior?.flag ? { flag: prior.flag } : {}) };
+    });
+    onApply(revenue, expenses);
+    setEditing(null);
+    setEdited(true);
+  };
+
+  const revTotals = splitTotals(analysis.itemizedRevenue);
+  const expTotals = splitTotals(analysis.itemizedExpenses);
+  const canApply = !!editing && validRevenueRows(editing.revenue).length > 0;
+
+  return (
+    <div className={cn(glass, "p-6")}>
+      {editing ? (
+        <div className="space-y-6">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="flex items-center gap-2 text-lg font-semibold">
+              <Pencil className="h-4 w-4 text-indigo-300" /> Edit line items
+            </h2>
+            <p className="text-xs text-slate-500">Changes update the KPIs, projection and scenarios instantly — no re-upload.</p>
+          </div>
+          <div className="grid gap-6 md:grid-cols-2">
+            <section aria-label={copy.revenue}>
+              <h3 className="mb-2 text-sm font-medium text-slate-200">{copy.revenue}</h3>
+              <RevenueRowsEditor
+                rows={editing.revenue}
+                setRows={(fn) => setEditing((s) => s && { ...s, revenue: fn(s.revenue) })}
+                mode={mode}
+                custom={analysis.businessType === "OTHER_CUSTOM"}
+                hint="Monthly amounts. Partial = a recurring line that only covers part of the first month."
+              />
+            </section>
+            <section aria-label={copy.expenses}>
+              <h3 className="mb-2 text-sm font-medium text-slate-200">{copy.expenses}</h3>
+              <ExpenseRowsEditor
+                rows={editing.expenses}
+                setRows={(fn) => setEditing((s) => s && { ...s, expenses: fn(s.expenses) })}
+                mode={mode}
+                businessType={analysis.businessType}
+                hint="e.g. mark rent that starts mid-month as Partial at 50%, or a single-week contract as One-time."
+              />
+            </section>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+            <ReviewSummary mode={mode} businessType={analysis.businessType} revenue={validRevenueRows(editing.revenue)} expenses={validExpenseRows(editing.expenses)} />
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {!canApply && <p className="mr-auto text-sm text-amber-200">Keep at least one {personal ? "income" : "revenue"} line with an amount.</p>}
+            <button type="button" onClick={() => setEditing(null)} className={secondaryBtn}>
+              Cancel
+            </button>
+            <button type="button" onClick={apply} disabled={!canApply} className={primaryBtn}>
+              <CheckCircle2 className="h-4 w-4" /> Apply changes
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="grid gap-6 md:grid-cols-2">
+            <div>
+              <h3 className="text-sm font-medium text-slate-300">{copy.revenue}</h3>
+              <ul className="mt-3 divide-y divide-white/5 text-sm">
+                {analysis.itemizedRevenue.map((r, i) => {
+                  const share = r.oneTime ? undefined : validShare(r.firstMonthShare);
+                  return (
+                    <li key={`${r.label}-${i}`} className="flex justify-between gap-3 py-2">
+                      <span className="text-slate-300">
+                        {r.label}
+                        {r.oneTime && <OneTimeBadge />}
+                        {share && <PartialBadge share={share} />}
+                      </span>
+                      <span className="shrink-0 tabular-nums">
+                        {usd.format(r.amount)} {!personal && <span className="text-xs text-slate-500">· {pct(r.margin)} margin</span>}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+              <p className="mt-2 text-xs tabular-nums text-slate-500">
+                {usd.format(revTotals.recurring)}/mo recurring{revTotals.oneTime > 0 ? ` · ${usd.format(revTotals.oneTime)} one-time` : ""}
+              </p>
+            </div>
+            <div>
+              <h3 className="text-sm font-medium text-slate-300">{copy.expenses}</h3>
+              <ul className="mt-3 divide-y divide-white/5 text-sm">
+                {analysis.itemizedExpenses.map((e, i) => {
+                  const share = e.oneTime ? undefined : validShare(e.firstMonthShare);
+                  return (
+                    <li key={`${e.label}-${i}`} className="py-2">
+                      <div className="flex justify-between gap-3">
+                        <span className="text-slate-300">
+                          {e.label}
+                          {e.category && e.category.toLowerCase() !== e.label.toLowerCase() && <span className="text-xs text-slate-500"> · {e.category}</span>}
+                          {e.oneTime && <OneTimeBadge />}
+                          {share && <PartialBadge share={share} />}
+                        </span>
+                        <span className="shrink-0 tabular-nums">{usd.format(e.amount)}</span>
+                      </div>
+                      {e.flag && (
+                        <p className="mt-1 flex items-center gap-1 text-xs text-amber-200">
+                          <AlertTriangle className="h-3 w-3" /> {e.flag}
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+              <p className="mt-2 text-xs tabular-nums text-slate-500">
+                {usd.format(expTotals.recurring)}/mo recurring{expTotals.oneTime > 0 ? ` · ${usd.format(expTotals.oneTime)} one-time` : ""}
+              </p>
+            </div>
+          </div>
+          <div className="mt-5 flex flex-wrap items-center gap-3 border-t border-white/10 pt-4">
+            <button type="button" onClick={startEdit} className={cn(secondaryBtn, "py-1.5 text-xs")}>
+              <Pencil className="h-3.5 w-3.5" /> Edit Items
+            </button>
+            <p className="text-xs text-slate-500">
+              {edited
+                ? "Edited — totals, projection and scenarios reflect your changes. Audit flags and insights are from the original analysis; re-run Analyze to refresh them."
+                : "Adjust names, amounts, or recurring / partial / one-time status without re-uploading."}
+            </p>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -2153,11 +2051,7 @@ function LineItems({ analysis }: { analysis: FinancialAnalysis }) {
 // Executive report → browser print dialog ("Save as PDF"). Rendered client-side only.
 // ---------------------------------------------------------------------------
 
-function esc(s: string) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-}
-
-function reportHtml(a: FinancialAnalysis) {
+function reportHtml(a: FinancialAnalysis, months: number) {
   const copy = MODE_COPY[modeOf(a.businessType)];
   const monthlyExpenses = splitTotals(a.itemizedExpenses).recurring;
   const net = a.monthlyRevenue - monthlyExpenses;
@@ -2191,31 +2085,18 @@ td:first-child,th:first-child{text-align:left}.neg{color:#b42318}li{margin-botto
 <div class="kpi">Monthly ${esc(copy.revenue.toLowerCase())}<b>${usd.format(a.monthlyRevenue)}</b></div>
 <div class="kpi">Monthly ${esc(copy.expenses.toLowerCase())}<b>${usd.format(monthlyExpenses)}</b></div>
 <div class="kpi">${esc(copy.net)}<b class="${net < 0 ? "neg" : ""}">${usd.format(net)}</b></div>
-<div class="kpi">12-mo projected net<b class="${cumulative < 0 ? "neg" : ""}">${usd.format(cumulative)}</b></div>
+<div class="kpi">${months}-mo projected net<b class="${cumulative < 0 ? "neg" : ""}">${usd.format(cumulative)}</b></div>
 </div>
 <h2>${a.businessType === "PERSONAL_FAMILY" ? "Biggest budget lever" : "Top performer"}: ${esc(a.winnerInsight.topService)}</h2><p>${esc(a.winnerInsight.message)}</p>
 <h2>Priority actions</h2>${flags ? `<ol>${flags}</ol>` : "<p>No issues found.</p>"}
 ${a.missingCategories.length ? `<h2>Missing categories</h2><p>${a.missingCategories.map(esc).join(", ")}</p>` : ""}
-<h2>12-month projection</h2>
+<h2>${months}-month projection</h2>
 <table><thead><tr><th>Month</th><th>${esc(copy.revenue)}</th><th>${esc(copy.expenses)}</th><th>Net</th><th>Cumulative</th></tr></thead><tbody>${projRows}</tbody></table>
-<p class="muted" style="margin-top:24px;font-size:12px">Projections apply seasonality and inflation to current recurring monthly averages; one-time items are counted once, in the first month. ${esc(LEGAL_DISCLAIMER)}</p>
+<p class="muted" style="margin-top:24px;font-size:12px">Projections apply seasonality and inflation to current recurring monthly averages; one-time items are counted once, in the first month, and partial-month lines are pro-rated in the first month. ${esc(LEGAL_DISCLAIMER)}</p>
 </body></html>`;
 }
 
-/** Opens the browser's print dialog on a hidden iframe so the user can save a PDF. */
-function printExecutiveReport(a: FinancialAnalysis) {
-  const frame = document.createElement("iframe");
-  frame.setAttribute("aria-hidden", "true");
-  frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
-  frame.srcdoc = reportHtml(a);
-  frame.onload = () => {
-    const w = frame.contentWindow;
-    if (!w) return frame.remove();
-    w.addEventListener("afterprint", () => setTimeout(() => frame.remove(), 0));
-    w.focus();
-    w.print();
-    // Fallback cleanup for browsers that don't fire afterprint.
-    setTimeout(() => frame.isConnected && frame.remove(), 60_000);
-  };
-  document.body.appendChild(frame);
+/** Opens the browser's print dialog with the executive report so the user can save a PDF. */
+function printExecutiveReport(a: FinancialAnalysis, months: number) {
+  printHtml(reportHtml(a, months));
 }

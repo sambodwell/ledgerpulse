@@ -92,7 +92,13 @@ export function redactForTeaser(full: FinancialAnalysis): FinancialAnalysis {
   const top = full.auditFlags.find((f) => f.severity === "HIGH") ?? full.auditFlags[0];
   return {
     ...full,
-    itemizedExpenses: full.itemizedExpenses.map((e) => ({ label: e.label, amount: e.amount, category: e.category, ...(e.oneTime ? { oneTime: true } : {}) })),
+    itemizedExpenses: full.itemizedExpenses.map((e) => ({
+      label: e.label,
+      amount: e.amount,
+      category: e.category,
+      ...(e.oneTime ? { oneTime: true } : {}),
+      ...(e.firstMonthShare ? { firstMonthShare: e.firstMonthShare } : {}),
+    })),
     macroProjections: [],
     auditFlags: top ? [top] : [],
   };

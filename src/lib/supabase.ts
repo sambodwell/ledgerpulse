@@ -308,3 +308,44 @@ export async function deleteScenario(id: string) {
   const { error } = await requireClient().from("scenarios").delete().eq("id", id);
   if (error) throw new Error(error.message);
 }
+
+// ---------------------------------------------------------------------------
+// Fiscal Year Tracker (one row per workspace; monthly totals only)
+// ---------------------------------------------------------------------------
+
+export async function loadFiscalTracker(workspaceId: string): Promise<unknown | null> {
+  const { data, error } = await requireClient().from("fiscal_trackers").select("state").eq("workspace_id", workspaceId).maybeSingle<{ state: unknown }>();
+  if (error) throw new Error(error.message);
+  return data?.state ?? null;
+}
+
+export async function saveFiscalTracker(workspaceId: string, state: unknown): Promise<void> {
+  const c = requireClient();
+  const { data: u } = await c.auth.getUser();
+  if (!u.user) throw new Error("Sign in to save your tracker.");
+  const { error } = await c.from("fiscal_trackers").upsert({ workspace_id: workspaceId, user_id: u.user.id, state }, { onConflict: "workspace_id" });
+  if (error) throw new Error(error.message);
+}
+
+// ---------------------------------------------------------------------------
+// User feedback (star rating + short comment)
+// ---------------------------------------------------------------------------
+
+export type FeedbackContext = "audit" | "report" | "tracker";
+
+export async function submitFeedback(input: { rating: number; comment: string; context: FeedbackContext; workspaceId: string | null }): Promise<void> {
+  const c = requireClient();
+  const { data: u } = await c.auth.getUser();
+  if (!u.user) throw new Error("Sign in to send feedback.");
+  const rating = Math.round(input.rating);
+  if (rating < 1 || rating > 5) throw new Error("Pick a rating from 1 to 5 stars.");
+  const comment = input.comment.trim().slice(0, 1000);
+  const { error } = await c.from("user_feedback").insert({
+    user_id: u.user.id,
+    workspace_id: input.workspaceId,
+    context: input.context,
+    rating,
+    comment: comment || null,
+  });
+  if (error) throw new Error(error.message);
+}

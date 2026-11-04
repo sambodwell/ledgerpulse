@@ -3,15 +3,19 @@ import {
   BUSINESS_TYPES,
   CATEGORY_TEMPLATES,
   DEFAULT_INFLATION_RATE,
-  PROJECTION_MONTHS,
+  MAX_PROJECTION_MONTHS,
   SEVERITIES,
-  buildMacroProjections,
+  clampHorizon,
+  defaultProjectionStart,
   detectMissingCategories,
   evaluatePersonalBudget,
   isBusinessType,
+  parseMonthKey,
+  projectBaseline,
   projectionFactors,
   round2,
   splitTotals,
+  validShare,
   type AnalysisResponse,
   type ExtractedLineItems,
   type AuditFlag,
@@ -38,7 +42,7 @@ import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, reso
  *                            and edit the parsed lines, then submit them back as mode "form"
  *   - application/json:    { mode: "form", businessType, revenue: RevenueLine[], expenses: ExpenseLine[], origin? }
  *   - application/json:    { mode: "unlock", sealed }                 (signed-in; Pro or 1 report unlock)
- *   - application/json:    { mode: "scenario", prompt, baseline }     (Pro)
+ *   - application/json:    { mode: "scenario", prompt, baseline, horizon?, start? }  (Pro; start = "YYYY-MM" first projected month)
  *
  * Responds with AnalysisResponse ({ analysis, access }) for analysis/unlock, or
  * { scenario: ScenarioPlan } for scenario mode. Free callers get a teaser that
@@ -55,7 +59,7 @@ const MODEL = process.env.LEDGERPULSE_MODEL ?? "claude-sonnet-5-5";
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
 const MAX_TEXT_CHARS = 600_000; // ~150k tokens; beyond this we ask the user to split the statement
 const MIN_EXTRACTED_CHARS = 80; // below this, treat the PDF as scanned and send it to Claude directly
-const MAX_SCENARIO_PROMPT = 500;
+const MAX_SCENARIO_PROMPT = 1000;
 const ALLOWED_UPLOAD_TYPES = new Set(["application/pdf", "text/plain", "text/csv", "application/vnd.ms-excel", "application/octet-stream", ""]);
 
 // Large statements can take a minute or more; don't let the platform default (often 10–60s) cut them off.
@@ -111,7 +115,7 @@ type RequestInput =
   | AnalysisInput
   | { kind: "extract"; document: DocumentInput }
   | { kind: "unlock"; sealed: string }
-  | { kind: "scenario"; prompt: string; baseline: ScenarioBaseline };
+  | { kind: "scenario"; prompt: string; baseline: ScenarioBaseline; horizon: number; start: Date };
 
 /** Owner-entered revenue; margin is optional and estimated by the model when absent. */
 type FormRevenueLine = Omit<RevenueLine, "margin"> & { margin?: number };
@@ -213,12 +217,19 @@ async function readInput(request: Request): Promise<RequestInput> {
     if (!isBusinessType(base.businessType)) throw new HttpError(400, "`baseline.businessType` is required.");
     const baseline: ScenarioBaseline = {
       businessType: base.businessType,
-      itemizedRevenue: sanitizeRevenue(base.itemizedRevenue).map(({ label, amount, oneTime }) => ({ label, amount, ...(oneTime ? { oneTime } : {}) })),
+      itemizedRevenue: sanitizeRevenue(base.itemizedRevenue).map(({ label, amount, oneTime, firstMonthShare }) => ({
+        label,
+        amount,
+        ...(oneTime ? { oneTime } : {}),
+        ...(firstMonthShare ? { firstMonthShare } : {}),
+      })),
       itemizedExpenses: sanitizeExpenses(base.itemizedExpenses),
       inflationRateAssumed: typeof base.inflationRateAssumed === "number" ? clamp(base.inflationRateAssumed, 0, 0.5) : DEFAULT_INFLATION_RATE,
     };
     if (baseline.itemizedRevenue.length === 0) throw new HttpError(400, "Run an analysis before forecasting scenarios.");
-    return { kind: "scenario", prompt, baseline };
+    const horizon = clampHorizon(typeof b.horizon === "number" ? b.horizon : 12);
+    const start = parseMonthKey(typeof b.start === "string" ? b.start : null) ?? defaultProjectionStart();
+    return { kind: "scenario", prompt, baseline, horizon, start };
   }
 
   throw new HttpError(400, "`mode` must be \"text\", \"extract\", \"form\", \"unlock\" or \"scenario\".");
@@ -232,7 +243,7 @@ function sanitizeRevenue(value: unknown): FormRevenueLine[] {
       label: String(r?.label ?? "").trim().slice(0, 120),
       amount: Number(r?.amount),
       ...(r?.margin == null || r.margin === "" ? {} : { margin: clamp(Number(r.margin), 0, 1) }),
-      ...(r?.oneTime === true ? { oneTime: true } : {}),
+      ...(r?.oneTime === true ? { oneTime: true } : validShare(r?.firstMonthShare) ? { firstMonthShare: validShare(r.firstMonthShare) } : {}),
     }))
     .filter((r) => r.label && Number.isFinite(r.amount) && r.amount > 0);
 }
@@ -245,7 +256,7 @@ function sanitizeExpenses(value: unknown): ExpenseLine[] {
       label: String(e?.label ?? "").trim().slice(0, 120),
       amount: Number(e?.amount),
       category: String(e?.category ?? "Uncategorized").trim().slice(0, 60) || "Uncategorized",
-      ...(e?.oneTime === true ? { oneTime: true } : {}),
+      ...(e?.oneTime === true ? { oneTime: true } : validShare(e?.firstMonthShare) ? { firstMonthShare: validShare(e.firstMonthShare) } : {}),
     }))
     .filter((e) => e.label && Number.isFinite(e.amount) && e.amount > 0);
 }
@@ -435,7 +446,7 @@ function buildUserContent(input: AnalysisInput): Anthropic.Beta.BetaContentBlock
   return [
     {
       type: "text",
-      text: `${hint}\n${origin} Amounts are monthly, except lines with "oneTime": true, which are single non-recurring amounts (don't treat them as monthly costs or income, and don't base recurring savings estimates on them). Keep their amounts as given; assign categories, flag issues, and write the audit.\n\n<form_input>\n${JSON.stringify(
+      text: `${hint}\n${origin} Amounts are monthly, except lines with "oneTime": true, which are single non-recurring amounts (don't treat them as monthly costs or income, and don't base recurring savings estimates on them). A "firstMonthShare" (0–1) marks a recurring line that only applies for part of the first month (e.g. rent starting mid-month); its amount is still the full monthly figure. Keep their amounts as given; assign categories, flag issues, and write the audit.\n\n<form_input>\n${JSON.stringify(
         { revenue: input.revenue, expenses: input.expenses },
         null,
         2,
@@ -478,10 +489,7 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
         }));
 
   // Monthly figures are recurring-only; one-time lines land once in the first projected month.
-  const revenueTotals = splitTotals(itemizedRevenue);
-  const expenseTotals = splitTotals(itemizedExpenses);
-  const monthlyRevenue = revenueTotals.recurring;
-  const monthlyExpenses = expenseTotals.recurring;
+  const monthlyRevenue = splitTotals(itemizedRevenue).recurring;
 
   const ruleBased = detectMissingCategories({ businessType, itemizedExpenses });
   const missingCategories = Array.from(new Set([...ruleBased.map((w) => w.category), ...extraction.missingCategories]));
@@ -504,13 +512,7 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
     itemizedRevenue,
     itemizedExpenses,
     inflationRateAssumed: DEFAULT_INFLATION_RATE,
-    macroProjections: buildMacroProjections({
-      businessType,
-      monthlyRevenue,
-      monthlyExpenses,
-      oneTimeRevenue: revenueTotals.oneTime,
-      oneTimeExpenses: expenseTotals.oneTime,
-    }),
+    macroProjections: projectBaseline({ businessType, itemizedRevenue, itemizedExpenses, inflationRateAssumed: DEFAULT_INFLATION_RATE }),
     auditFlags,
     missingCategories,
     winnerInsight: extraction.winnerInsight,
@@ -641,7 +643,7 @@ const SCENARIO_SCHEMA = {
           label: { anyOf: [{ type: "string" }, { type: "null" }], description: "For *_ADD: short name of the new line" },
           pct: { anyOf: [{ type: "number" }, { type: "null" }], description: "For *_PCT: fractional change, e.g. 0.15 for +15%, -0.1 for -10%" },
           amount: { anyOf: [{ type: "number" }, { type: "null" }], description: "For *_ADD: MONTHLY USD amount added (negative to remove)" },
-          startMonth: { type: "integer", description: `Projection month the change starts, 1..${PROJECTION_MONTHS}` },
+          startMonth: { type: "integer", description: `Projection month the change starts, 1..${MAX_PROJECTION_MONTHS} (may be beyond the current horizon)` },
           description: { type: "string", description: "One short phrase describing this change" },
         },
       },
@@ -651,15 +653,16 @@ const SCENARIO_SCHEMA = {
   },
 } as const;
 
-async function handleScenario(prompt: string, baseline: ScenarioBaseline, viewer: Viewer) {
+async function handleScenario(prompt: string, baseline: ScenarioBaseline, horizon: number, start: Date, viewer: Viewer) {
   if (viewer.tier !== "pro") throw new HttpError(402, "Scenario forecasting is a Pro feature.");
   const quota = await consumeAiQuery(viewer);
   if (!quota.ok) throw new HttpError(quota.status, quota.error);
 
-  const months = projectionFactors({ businessType: baseline.businessType }).map((f, i) => `${i + 1}=${f.month}`).join(", ");
-  const system = `You convert a "what if" question about a ${baseline.businessType} budget into structured adjustments for a deterministic 12-month projection. You do not compute the projection.
+  // List every month up to the maximum so prompts like "starting month 30" or "in March 2028" map even past the current horizon.
+  const months = projectionFactors({ businessType: baseline.businessType, start, months: MAX_PROJECTION_MONTHS }).map((f, i) => `${i + 1}=${f.month}`).join(", ");
+  const system = `You convert a "what if" question about a ${baseline.businessType} budget into structured adjustments for a deterministic ${horizon}-month projection. You do not compute the projection.
 
-Projection months: ${months}. "Next quarter" means the first month of the next calendar quarter; "now" or no timing means month 1.
+Projection months: ${months}. The user is currently viewing months 1..${horizon}. "Next quarter" means the first month of the next calendar quarter; "now" or no timing means month 1. When the user names a month number ("starting month 30", "in year 3") use it directly (year N starts at month 12×(N−1)+1); when they name a calendar month, map it with the list above.
 
 Rules:
 - Scale existing lines with REVENUE_PCT / EXPENSE_PCT. Set "match" to an existing category or label copied exactly from the baseline, or null to scale every line of that side.
@@ -678,7 +681,7 @@ If the request isn't a financial scenario, return no adjustments and explain wha
   const out = await callStructured<Partial<ModelScenario>>({ system, content, schema: SCENARIO_SCHEMA, maxTokens: 8000 });
 
   const adjustments: ScenarioAdjustment[] = arr<ModelScenario["adjustments"][number]>(out.adjustments).slice(0, 12).flatMap<ScenarioAdjustment>((a) => {
-    const startMonth = Math.round(clamp(a.startMonth, 1, PROJECTION_MONTHS));
+    const startMonth = Math.round(clamp(a.startMonth, 1, MAX_PROJECTION_MONTHS));
     const description = String(a.description ?? "").slice(0, 160);
     if ((a.type === "REVENUE_PCT" || a.type === "EXPENSE_PCT") && typeof a.pct === "number" && Number.isFinite(a.pct)) {
       return [{ type: a.type, match: a.match ? a.match.slice(0, 80) : null, pct: clamp(a.pct, -1, 10), startMonth, description }];
@@ -711,7 +714,7 @@ export async function POST(request: Request) {
     const input = await readInput(request);
 
     if (input.kind === "unlock") return await handleUnlock(input.sealed, viewer);
-    if (input.kind === "scenario") return await handleScenario(input.prompt, input.baseline, viewer);
+    if (input.kind === "scenario") return await handleScenario(input.prompt, input.baseline, input.horizon, input.start, viewer);
 
     const textLength = input.kind === "text" ? input.text.length : input.kind === "extract" && input.document.kind === "text" ? input.document.text.length : 0;
     if (textLength > MAX_TEXT_CHARS) {
