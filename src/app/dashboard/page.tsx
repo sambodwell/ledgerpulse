@@ -50,6 +50,7 @@ import {
   PRICING,
   applyScenario,
   isAnalysisResponse,
+  isBusinessType,
   modeOf,
   sum,
   type AnalysisAccess,
@@ -64,6 +65,7 @@ import {
   type WorkspaceMode,
 } from "@/lib/schemas";
 import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
+import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { useApp } from "@/components/AppProvider";
 import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu } from "@/components/ProfileMenu";
@@ -155,27 +157,12 @@ export default function DashboardPage() {
   const [paywallBusy, setPaywallBusy] = useState<Paywall["busy"]>(null);
   const [paywallMsg, setPaywallMsg] = useState<string | null>(null);
   const [pendingUnlock, setPendingUnlock] = useState<{ sealed: string; wsKey: string } | null>(null);
+  const [confirmingCheckout, setConfirmingCheckout] = useState(false);
+  const [checkoutNotice, setCheckoutNotice] = useState<string | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
   const { setUiHints, refreshProfile } = app;
   useEffect(() => setUiHints({ mode, hasAnalysis: !!current }), [mode, current, setUiHints]);
-
-  // Returning from Stripe Checkout: offer to unlock the analysis that was run before leaving.
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const stored = safeSession((s) => s.getItem(PENDING_UNLOCK_KEY));
-    if (params.get("checkout") === "success" && stored) {
-      let parsed: { sealed: string; wsKey: string } | null = null;
-      try {
-        parsed = JSON.parse(stored);
-      } catch {
-        /* ignore malformed */
-      }
-      // Refresh first so the new tier / unlock credit is reflected before we offer the unlock.
-      void refreshProfile().then(() => parsed?.sealed && setPendingUnlock(parsed));
-    }
-    if (params.has("checkout")) window.history.replaceState(null, "", window.location.pathname);
-  }, [refreshProfile]);
 
   const post = useCallback(async (init: RequestInit) => {
     const auth = await authHeaders();
@@ -183,7 +170,7 @@ export default function DashboardPage() {
   }, []);
 
   const runAnalysis = useCallback(
-    async (init: RequestInit) => {
+    async (init: RequestInit): Promise<boolean> => {
       setLoading(true);
       setError(null);
       setPaywallMsg(null);
@@ -194,8 +181,10 @@ export default function DashboardPage() {
         if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
         setResults((r) => ({ ...r, [wsKey]: data }));
         requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+        return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Something went wrong.");
+        return false;
       } finally {
         setLoading(false);
       }
@@ -203,20 +192,28 @@ export default function DashboardPage() {
     [post, wsKey],
   );
 
+  /** Exchanges a sealed teaser for the full analysis. `retries` covers a webhook that lands a moment after the redirect. */
   const unlockSealed = useCallback(
-    async (sealed: string, targetWs: string) => {
+    async (sealed: string, targetWs: string, retries = 0) => {
       setPaywallBusy("unlock");
       setPaywallMsg(null);
       try {
-        const res = await post({ headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "unlock", sealed }) });
-        if (res.status === 402) throw new Error("Your payment is still processing. Give it a few seconds and try again.");
-        if (!res.ok) throw new Error(await errorMessage(res));
-        const data: unknown = await res.json();
-        if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response.");
-        setResults((r) => ({ ...r, [targetWs]: data }));
-        safeSession((s) => s.removeItem(PENDING_UNLOCK_KEY));
-        setPendingUnlock(null);
-        void refreshProfile();
+        for (let attempt = 0; ; attempt++) {
+          const res = await post({ headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "unlock", sealed }) });
+          if (res.status === 402 && attempt < retries) {
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+          if (res.status === 402) throw new Error("Your payment is still processing. Give it a few seconds and try again.");
+          if (!res.ok) throw new Error(await errorMessage(res));
+          const data: unknown = await res.json();
+          if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response.");
+          setResults((r) => ({ ...r, [targetWs]: data }));
+          safeSession((s) => s.removeItem(PENDING_UNLOCK_KEY));
+          setPendingUnlock(null);
+          void refreshProfile();
+          return;
+        }
       } catch (e) {
         setPaywallMsg(e instanceof Error ? e.message : "Couldn't unlock.");
       } finally {
@@ -225,6 +222,57 @@ export default function DashboardPage() {
     },
     [post, refreshProfile],
   );
+
+  // Returning from Stripe Checkout (or the dev bypass): confirm the purchase server-side, refresh the
+  // profile so the new tier / credit is reflected, then unlock the analysis that was run before leaving.
+  const checkoutHandled = useRef(false);
+  useEffect(() => {
+    if (checkoutHandled.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const status = params.get("checkout");
+    if (!status) return;
+    checkoutHandled.current = true;
+    const sessionId = params.get("session_id");
+    window.history.replaceState(null, "", window.location.pathname);
+    if (status !== "success") return;
+
+    let parsed: { sealed: string; wsKey: string } | null = null;
+    try {
+      const stored = safeSession((s) => s.getItem(PENDING_UNLOCK_KEY));
+      const v: unknown = stored ? JSON.parse(stored) : null;
+      if (v && typeof v === "object" && typeof (v as { sealed?: unknown }).sealed === "string" && typeof (v as { wsKey?: unknown }).wsKey === "string") {
+        parsed = v as { sealed: string; wsKey: string };
+      }
+    } catch {
+      /* ignore malformed */
+    }
+
+    void (async () => {
+      setConfirmingCheckout(true);
+      if (sessionId) {
+        try {
+          const res = await fetch("/api/billing/confirm", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+            body: JSON.stringify({ sessionId }),
+          });
+          // Not fatal: the webhook may still fulfill it; the unlock below retries on 402.
+          if (!res.ok) console.warn("[checkout] confirm failed", res.status, await errorMessage(res));
+        } catch (e) {
+          console.warn("[checkout] confirm request failed", e);
+        }
+      }
+      await refreshProfile();
+      setConfirmingCheckout(false);
+      if (parsed) {
+        setPendingUnlock(parsed);
+        await unlockSealed(parsed.sealed, parsed.wsKey, 5);
+        setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+      } else {
+        setCheckoutNotice("Payment received — your plan is active. Run an analysis to see your full report.");
+      }
+    })();
+  }, [refreshProfile, unlockSealed]);
 
   const checkout = useCallback(
     async (kind: "report" | "pro") => {
@@ -327,12 +375,28 @@ export default function DashboardPage() {
           <span>{PRIVACY_BADGE}</span>
         </div>
 
+        {confirmingCheckout && (
+          <div className="mb-6 flex items-center gap-3 rounded-xl border border-indigo-400/30 bg-indigo-500/10 px-4 py-3 text-sm" role="status">
+            <Loader2 className="h-4 w-4 animate-spin text-indigo-300" /> Confirming your payment…
+          </div>
+        )}
+        {checkoutNotice && (
+          <div className="mb-6 flex items-center gap-3 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-4 py-3 text-sm" role="status">
+            <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+            <span className="flex-1">{checkoutNotice}</span>
+            <button onClick={() => setCheckoutNotice(null)} aria-label="Dismiss" className="text-slate-400 hover:text-white">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
         {pendingUnlock && (
           <div className="mb-6 flex flex-wrap items-center gap-3 rounded-xl border border-indigo-400/30 bg-indigo-500/10 px-4 py-3 text-sm" role="status">
             <CheckCircle2 className="h-4 w-4 text-indigo-300" />
-            <span className="flex-1">Thanks for your purchase! Unlock the full audit for the analysis you ran before checkout.</span>
-            <button onClick={() => unlockSealed(pendingUnlock.sealed, pendingUnlock.wsKey)} disabled={paywallBusy === "unlock"} className={primaryBtn}>
-              {paywallBusy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} Unlock now
+            <span className="flex-1">
+              {paywallBusy === "unlock" ? "Thanks for your purchase! Unlocking your full audit…" : "Thanks for your purchase! Unlock the full audit for the analysis you ran before checkout."}
+            </span>
+            <button onClick={() => unlockSealed(pendingUnlock.sealed, pendingUnlock.wsKey, 2)} disabled={paywallBusy === "unlock"} className={primaryBtn}>
+              {paywallBusy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} {paywallBusy === "unlock" ? "Unlocking" : "Unlock now"}
             </button>
             <button
               onClick={() => {
@@ -373,6 +437,7 @@ export default function DashboardPage() {
             <PanelBoundary title="Guided form">
               <GuidedForm
                 key={`${wsKey}-${mode}`}
+                draftKey={draftKey(app.user.id, wsKey, mode)}
                 mode={mode}
                 defaultType={formDefaultType}
                 disabled={loading}
@@ -530,13 +595,64 @@ const expenseLabel = (e: FormExpense) => e.label.trim() || e.category.trim();
 
 const STEPS = ["Type", "Income", "Expenses", "Review"] as const;
 
-function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: WorkspaceMode; defaultType: BusinessType; disabled: boolean; onSubmit: (p: FormPayload) => void }) {
+const isFormRevenue = (r: unknown): r is FormRevenue =>
+  !!r && typeof r === "object" && typeof (r as FormRevenue).id === "number" && ["label", "amount", "margin"].every((k) => typeof (r as unknown as Record<string, unknown>)[k] === "string");
+const isFormExpense = (e: unknown): e is FormExpense =>
+  !!e && typeof e === "object" && typeof (e as FormExpense).id === "number" && ["label", "amount", "category"].every((k) => typeof (e as unknown as Record<string, unknown>)[k] === "string");
+
+/** Reads a saved draft for this form, validating its shape and keeping row ids unique. Client-only (the form never SSRs). */
+function restoreDraft(key: string, mode: WorkspaceMode) {
+  const d = loadDraft<unknown, unknown>(key);
+  if (!d || !isBusinessType(d.businessType) || modeOf(d.businessType) !== mode) return null;
+  if (!d.revenue.every(isFormRevenue) || !d.expenses.every(isFormExpense)) return null;
+  const revenue = d.revenue as FormRevenue[];
+  const expenses = d.expenses as FormExpense[];
+  nextId = Math.max(nextId, ...revenue.map((r) => r.id + 1), ...expenses.map((e) => e.id + 1));
+  return { step: Math.min(Math.max(0, Math.trunc(d.step)), STEPS.length - 1), businessType: d.businessType, revenue, expenses };
+}
+
+function GuidedForm({
+  draftKey: storageKey,
+  mode,
+  defaultType,
+  disabled,
+  onSubmit,
+}: {
+  draftKey: string;
+  mode: WorkspaceMode;
+  defaultType: BusinessType;
+  disabled: boolean;
+  onSubmit: (p: FormPayload) => Promise<boolean>;
+}) {
   const personal = mode === "PERSONAL";
   const copy = MODE_COPY[mode];
-  const [step, setStep] = useState(0);
-  const [businessType, setBusinessType] = useState<BusinessType>(defaultType);
-  const [revenue, setRevenue] = useState<FormRevenue[]>(() => templateRows(defaultType).revenue);
-  const [expenses, setExpenses] = useState<FormExpense[]>(() => templateRows(defaultType).expenses);
+  // Hydrate once from the saved draft (if any) so a refresh lands on the same step with the same inputs.
+  const [initial] = useState(() => restoreDraft(storageKey, mode));
+  const [restored, setRestored] = useState(!!initial);
+  const [step, setStep] = useState(initial?.step ?? 0);
+  const [businessType, setBusinessType] = useState<BusinessType>(initial?.businessType ?? defaultType);
+  const [revenue, setRevenue] = useState<FormRevenue[]>(() => initial?.revenue ?? templateRows(defaultType).revenue);
+  const [expenses, setExpenses] = useState<FormExpense[]>(() => initial?.expenses ?? templateRows(defaultType).expenses);
+
+  // Auto-save every change once the user has interacted with the form (an untouched template isn't stored).
+  const touched = useRef(!!initial);
+  const markTouched = () => {
+    touched.current = true;
+  };
+  useEffect(() => {
+    if (touched.current) saveDraft(storageKey, { step, businessType, revenue, expenses });
+  }, [storageKey, step, businessType, revenue, expenses]);
+
+  const startOver = () => {
+    clearDraft(storageKey);
+    const rows = templateRows(defaultType);
+    touched.current = false;
+    setStep(0);
+    setBusinessType(defaultType);
+    setRevenue(rows.revenue);
+    setExpenses(rows.expenses);
+    setRestored(false);
+  };
 
   const chooseType = (bt: BusinessType) => {
     setBusinessType(bt);
@@ -559,8 +675,8 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
   const canNext = step === 0 || (step === 1 ? validRevenue.length > 0 : true);
   const stepLabels = STEPS.map((s, i) => (i === 0 ? (personal ? "Household" : "Business") : i === 1 ? copy.revenue : s));
 
-  const submit = () =>
-    onSubmit({
+  const submit = async () => {
+    const ok = await onSubmit({
       mode: "form",
       businessType,
       revenue: validRevenue.map((r) => ({
@@ -570,16 +686,31 @@ function GuidedForm({ mode, defaultType, disabled, onSubmit }: { mode: Workspace
       })),
       expenses: validExpenses.map((e) => ({ label: expenseLabel(e), amount: Number(e.amount), category: e.category.trim() || "Uncategorized" })),
     });
+    // The report was generated: the draft has served its purpose. Further edits start a new draft.
+    if (ok) {
+      clearDraft(storageKey);
+      touched.current = false;
+      setRestored(false);
+    }
+  };
 
   const categoryOptions = CATEGORY_TEMPLATES[businessType].expenses.map((e) => e.category);
   const datalistId = `cats-${businessType}`;
 
   return (
-    <div className={cn(glass, "flex h-full flex-col p-6")}>
+    <div className={cn(glass, "flex h-full flex-col p-6")} onClickCapture={markTouched} onChangeCapture={markTouched}>
       <div className="flex items-center gap-2">
         <ClipboardList className="h-5 w-5 text-indigo-300" />
         <h2 className="text-lg font-semibold">Guided Input Form</h2>
       </div>
+      {restored && (
+        <p className="mt-2 flex flex-wrap items-center gap-x-2 text-xs text-slate-400" role="status">
+          <Bookmark className="h-3 w-3 text-indigo-300" /> Restored your unsaved progress from this device.
+          <button type="button" onClick={startOver} className="text-indigo-300 underline-offset-2 hover:underline">
+            Start over
+          </button>
+        </p>
+      )}
 
       <ol className="mt-5 flex gap-2" aria-label="Progress">
         {stepLabels.map((s, i) => (
@@ -812,20 +943,44 @@ function NumInput({ value, onChange, placeholder = "0", ...rest }: { value: stri
   return <input {...rest} type="number" inputMode="decimal" min={0} step="any" placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} className={cn(inputCls, "tabular-nums")} />;
 }
 
-/** Keeps digits and at most one decimal point with up to 2 decimals ("1,00.0.5" → "100.05"). */
-const cleanMoney = (raw: string) => {
-  const [whole, ...rest] = raw.replace(/[^\d.]/g, "").split(".");
-  return rest.length ? `${whole}.${rest.join("").slice(0, 2)}` : whole;
+/**
+ * Normalizes typed/pasted money to a plain decimal string: digits, at most one decimal point,
+ * up to 2 decimals, no redundant leading zeros ("$1,00.0.5" → "100.05", "007" → "7", "." → "0.").
+ */
+const cleanMoney =(raw: string) => {
+  const [rawWhole, ...rest] = raw.replace(/[^\d.]/g, "").split(".");
+  const whole = rawWhole.replace(/^0+(?=\d)/, "");
+  if (!rest.length) return whole;
+  return `${whole || "0"}.${rest.join("").slice(0, 2)}`;
 };
 
-/** Text input (not type=number) so the value string stays exactly what was typed, with a static $ prefix. */
+/** On blur: "12" → "12.00", "12.5" → "12.50", "12." → "12.00". Empty stays empty so the placeholder shows. */
+const padMoney = (v: string) => (v === "" || !Number.isFinite(Number(v)) ? v : Number(v).toFixed(2));
+
+/**
+ * Text input (not type=number) so the bound value is exactly the normalized string, with a static $ prefix
+ * and a faded 0.00 placeholder that typing replaces.
+ */
 function MoneyInput({ value, onChange, placeholder = "0.00", ...rest }: { value: string; onChange: (v: string) => void; placeholder?: string; "aria-label": string }) {
   return (
-    <div className="relative">
-      <span aria-hidden className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm text-slate-500">
+    <div className="group relative">
+      <span aria-hidden className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm text-slate-500 transition group-focus-within:text-indigo-300">
         $
       </span>
-      <input {...rest} type="text" inputMode="decimal" autoComplete="off" placeholder={placeholder} value={value} onChange={(e) => onChange(cleanMoney(e.target.value))} className={cn(inputCls, "pl-7 tabular-nums")} />
+      <input
+        {...rest}
+        type="text"
+        inputMode="decimal"
+        autoComplete="off"
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => onChange(cleanMoney(e.target.value))}
+        onBlur={() => {
+          const padded = padMoney(value);
+          if (padded !== value) onChange(padded);
+        }}
+        className={cn(inputCls, "pl-7 tabular-nums placeholder:text-slate-600/80")}
+      />
     </div>
   );
 }

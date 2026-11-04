@@ -8,6 +8,7 @@
  */
 
 import { createClient, type Session, type SupabaseClient, type User } from "@supabase/supabase-js";
+import { clearAllDrafts } from "@/lib/formDraft";
 import {
   isBusinessType,
   isScenarioAdjustment,
@@ -141,6 +142,8 @@ export async function resendSignupEmail(email: string, next = "/dashboard") {
 }
 
 export async function signOut() {
+  // Don't leave financial form drafts behind on a shared device.
+  clearAllDrafts();
   const c = getSupabase();
   if (c) await c.auth.signOut();
 }

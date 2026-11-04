@@ -1,6 +1,16 @@
 import Stripe from "stripe";
 import { resolveViewer } from "@/lib/server/entitlements";
-import { appOrigin, billingError, billingNotConfigured, getStripe, priceFor, type CheckoutKind } from "@/lib/server/billing";
+import {
+  appOrigin,
+  billingError,
+  billingNotConfigured,
+  devBillingBypass,
+  getAdminSupabase,
+  getStripe,
+  grantEntitlement,
+  priceFor,
+  type CheckoutKind,
+} from "@/lib/server/billing";
 
 /** POST /api/billing/checkout  { kind: "pro" | "report" } → { url } (Stripe Checkout) */
 export async function POST(request: Request) {
@@ -12,6 +22,19 @@ export async function POST(request: Request) {
     const kind: CheckoutKind | null = body?.kind === "pro" || body?.kind === "report" ? body.kind : null;
     if (!kind) return Response.json({ error: "`kind` must be \"pro\" or \"report\"." }, { status: 400 });
 
+    if (kind === "pro" && viewer.tier === "pro") return Response.json({ error: "You're already on Pro." }, { status: 409 });
+
+    // Local testing without Stripe: grant the purchase directly and send the user through the normal return flow.
+    if (devBillingBypass(kind)) {
+      const admin = getAdminSupabase();
+      if (!admin) {
+        return Response.json({ error: "Dev unlock needs SUPABASE_SERVICE_ROLE_KEY in .env.local to record the simulated purchase." }, { status: 503 });
+      }
+      await grantEntitlement(admin, viewer.userId, kind);
+      console.warn(`[billing/checkout] DEV BYPASS: granted "${kind}" to ${viewer.userId} without Stripe`);
+      return Response.json({ url: `${appOrigin(request)}/dashboard?checkout=success&dev=1`, dev: true });
+    }
+
     const stripe = getStripe();
     if (!stripe) return billingNotConfigured();
     const price = priceFor(kind);
@@ -20,8 +43,6 @@ export async function POST(request: Request) {
       console.error(`[billing/checkout] ${env} is missing or not a price_… id`);
       return Response.json({ error: "This plan isn't available for purchase right now." }, { status: 503 });
     }
-    if (kind === "pro" && viewer.tier === "pro") return Response.json({ error: "You're already on Pro." }, { status: 409 });
-
     const { data: profile } = await viewer.db
       .from("profiles")
       .select("email,stripe_customer_id")
@@ -35,8 +56,9 @@ export async function POST(request: Request) {
       client_reference_id: viewer.userId,
       metadata: { userId: viewer.userId, kind },
       ...(kind === "pro" ? { subscription_data: { metadata: { userId: viewer.userId } } } : {}),
-      // The dashboard picks up a pending (sealed) analysis from sessionStorage and offers to unlock it.
-      success_url: `${origin}/dashboard?checkout=success`,
+      // The dashboard confirms the session (so fulfillment doesn't wait on the webhook), then
+      // unlocks the pending sealed analysis it kept in sessionStorage.
+      success_url: `${origin}/dashboard?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${origin}/settings?checkout=cancelled`,
     };
     const asNewCustomer: Stripe.Checkout.SessionCreateParams = {

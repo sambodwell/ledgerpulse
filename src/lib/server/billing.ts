@@ -60,3 +60,73 @@ export function billingNotConfigured() {
     { status: 503 },
   );
 }
+
+// ---------------------------------------------------------------------------
+// Fulfillment (shared by the webhook, the post-checkout confirm call and the dev bypass)
+// ---------------------------------------------------------------------------
+
+/** Applies a purchase to the user's profile. Pro is idempotent; report unlocks are guarded by `fulfillCheckoutSession`. */
+export async function grantEntitlement(
+  admin: SupabaseClient,
+  userId: string,
+  kind: CheckoutKind,
+  ids: { customerId?: string | null; subscriptionId?: string | null } = {},
+): Promise<void> {
+  if (kind === "report") {
+    if (ids.customerId) await admin.from("profiles").update({ stripe_customer_id: ids.customerId }).eq("id", userId);
+    const { error } = await admin.rpc("grant_report_unlock", { target: userId, amount: 1 });
+    if (error) throw new Error(error.message);
+    return;
+  }
+  const { error } = await admin
+    .from("profiles")
+    .update({
+      subscription_tier: "pro",
+      subscription_status: "active",
+      ...(ids.customerId !== undefined ? { stripe_customer_id: ids.customerId } : {}),
+      ...(ids.subscriptionId !== undefined ? { stripe_subscription_id: ids.subscriptionId } : {}),
+    })
+    .eq("id", userId);
+  if (error) throw new Error(error.message);
+}
+
+export type FulfillResult = "fulfilled" | "duplicate" | "unpaid" | "invalid";
+
+/**
+ * Fulfills a completed Checkout Session exactly once, keyed by the session id, so the
+ * webhook and the dashboard's confirm call can both run without double-granting credits.
+ */
+export async function fulfillCheckoutSession(admin: SupabaseClient, s: Stripe.Checkout.Session): Promise<FulfillResult> {
+  const userId = s.client_reference_id ?? s.metadata?.userId;
+  const kind = s.metadata?.kind;
+  if (!userId || (kind !== "pro" && kind !== "report")) return "invalid";
+  if (s.status !== "complete" || (s.payment_status !== "paid" && s.payment_status !== "no_payment_required")) return "unpaid";
+
+  const key = `fulfill:${s.id}`;
+  const { error: dupError } = await admin.from("stripe_events").insert({ id: key, type: "checkout.fulfilled" });
+  if (dupError) {
+    if (dupError.code === "23505") return "duplicate";
+    throw new Error(`idempotency insert failed: ${dupError.message}`);
+  }
+  try {
+    const customerId = typeof s.customer === "string" ? s.customer : s.customer?.id ?? null;
+    const subscriptionId = typeof s.subscription === "string" ? s.subscription : s.subscription?.id ?? null;
+    await grantEntitlement(admin, userId, kind, kind === "pro" ? { customerId, subscriptionId } : { customerId });
+  } catch (err) {
+    // Release the key so a retry (webhook redelivery or another confirm) can fulfill it.
+    await admin.from("stripe_events").delete().eq("id", key);
+    throw err;
+  }
+  return "fulfilled";
+}
+
+/**
+ * Local-testing override: never active in production builds. Enabled when
+ * LEDGERPULSE_DEV_UNLOCK=1, or automatically when Stripe keys / price ids are absent.
+ * Checkout then grants the entitlement directly instead of redirecting to Stripe.
+ */
+export function devBillingBypass(kind: CheckoutKind): boolean {
+  if (process.env.NODE_ENV === "production") return false;
+  if (process.env.LEDGERPULSE_DEV_UNLOCK === "1") return true;
+  return !getStripe() || !priceFor(kind);
+}

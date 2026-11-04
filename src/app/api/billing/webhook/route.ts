@@ -1,9 +1,10 @@
 import type Stripe from "stripe";
-import { getAdminSupabase, getStripe } from "@/lib/server/billing";
+import { fulfillCheckoutSession, getAdminSupabase, getStripe } from "@/lib/server/billing";
 
 /**
  * POST /api/billing/webhook — Stripe → Supabase entitlement sync.
- * Subscribe to: checkout.session.completed, customer.subscription.updated,
+ * Subscribe to: checkout.session.completed, checkout.session.async_payment_succeeded,
+ * customer.subscription.updated,
  * customer.subscription.deleted.
  */
 export async function POST(request: Request) {
@@ -32,25 +33,11 @@ export async function POST(request: Request) {
 
   try {
     switch (event.type) {
-      case "checkout.session.completed": {
-        const s = event.data.object;
-        const userId = s.client_reference_id ?? s.metadata?.userId;
-        if (!userId) break;
-        const customerId = typeof s.customer === "string" ? s.customer : s.customer?.id ?? null;
-
-        if (s.metadata?.kind === "report") {
-          if (s.payment_status !== "paid") break;
-          if (customerId) await admin.from("profiles").update({ stripe_customer_id: customerId }).eq("id", userId);
-          const { error } = await admin.rpc("grant_report_unlock", { target: userId, amount: 1 });
-          if (error) throw new Error(error.message);
-        } else {
-          const subscriptionId = typeof s.subscription === "string" ? s.subscription : s.subscription?.id ?? null;
-          const { error } = await admin
-            .from("profiles")
-            .update({ subscription_tier: "pro", subscription_status: "active", stripe_customer_id: customerId, stripe_subscription_id: subscriptionId })
-            .eq("id", userId);
-          if (error) throw new Error(error.message);
-        }
+      case "checkout.session.completed":
+      case "checkout.session.async_payment_succeeded": {
+        // Shared with /api/billing/confirm and keyed by session id, so a purchase is granted exactly once.
+        const result = await fulfillCheckoutSession(admin, event.data.object);
+        if (result === "invalid") console.warn("[billing/webhook] checkout session without userId/kind", event.data.object.id);
         break;
       }
       case "customer.subscription.updated":
