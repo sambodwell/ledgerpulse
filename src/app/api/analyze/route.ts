@@ -13,8 +13,10 @@ import {
   parseMonthKey,
   projectBaseline,
   projectionFactors,
+  resolvePercentExpenses,
   round2,
   splitTotals,
+  validPercentOf,
   validShare,
   type AnalysisResponse,
   type ExtractedLineItems,
@@ -199,7 +201,7 @@ async function readInput(request: Request): Promise<RequestInput> {
   if (b.mode === "form") {
     if (!isBusinessType(b.businessType)) throw new HttpError(400, "`businessType` is required for form input.");
     const revenue = sanitizeRevenue(b.revenue);
-    const expenses = sanitizeExpenses(b.expenses);
+    const expenses = sanitizeExpenses(b.expenses, revenue);
     if (revenue.length === 0) throw new HttpError(400, b.businessType === "PERSONAL_FAMILY" ? "Add at least one income line." : "Add at least one revenue line.");
     return { kind: "form", businessType: b.businessType, revenue, expenses, origin: b.origin === "statement" ? "statement" : "manual" };
   }
@@ -215,15 +217,16 @@ async function readInput(request: Request): Promise<RequestInput> {
     if (prompt.length > MAX_SCENARIO_PROMPT) throw new HttpError(400, `Keep scenarios under ${MAX_SCENARIO_PROMPT} characters.`);
     const base = (b.baseline ?? {}) as Record<string, unknown>;
     if (!isBusinessType(base.businessType)) throw new HttpError(400, "`baseline.businessType` is required.");
+    const itemizedRevenue = sanitizeRevenue(base.itemizedRevenue).map(({ label, amount, oneTime, firstMonthShare }) => ({
+      label,
+      amount,
+      ...(oneTime ? { oneTime } : {}),
+      ...(firstMonthShare ? { firstMonthShare } : {}),
+    }));
     const baseline: ScenarioBaseline = {
       businessType: base.businessType,
-      itemizedRevenue: sanitizeRevenue(base.itemizedRevenue).map(({ label, amount, oneTime, firstMonthShare }) => ({
-        label,
-        amount,
-        ...(oneTime ? { oneTime } : {}),
-        ...(firstMonthShare ? { firstMonthShare } : {}),
-      })),
-      itemizedExpenses: sanitizeExpenses(base.itemizedExpenses),
+      itemizedRevenue,
+      itemizedExpenses: sanitizeExpenses(base.itemizedExpenses, itemizedRevenue),
       inflationRateAssumed: typeof base.inflationRateAssumed === "number" ? clamp(base.inflationRateAssumed, 0, 0.5) : DEFAULT_INFLATION_RATE,
     };
     if (baseline.itemizedRevenue.length === 0) throw new HttpError(400, "Run an analysis before forecasting scenarios.");
@@ -248,17 +251,22 @@ function sanitizeRevenue(value: unknown): FormRevenueLine[] {
     .filter((r) => r.label && Number.isFinite(r.amount) && r.amount > 0);
 }
 
-function sanitizeExpenses(value: unknown): ExpenseLine[] {
+/**
+ * Expense lines from the client. Percent-of-revenue lines (`percentOf`) are re-priced from `revenue` here, so the
+ * server never trusts a client-computed dollar amount for them.
+ */
+function sanitizeExpenses(value: unknown, revenue: { label: string; amount: number; oneTime?: boolean }[] = []): ExpenseLine[] {
   if (!Array.isArray(value)) return [];
-  return value
-    .slice(0, 400)
-    .map((e) => ({
+  const lines = value.slice(0, 400).map((e): ExpenseLine => {
+    const percentOf = e?.oneTime === true ? undefined : validPercentOf(e?.percentOf);
+    return {
       label: String(e?.label ?? "").trim().slice(0, 120),
       amount: Number(e?.amount),
       category: String(e?.category ?? "Uncategorized").trim().slice(0, 60) || "Uncategorized",
-      ...(e?.oneTime === true ? { oneTime: true } : validShare(e?.firstMonthShare) ? { firstMonthShare: validShare(e.firstMonthShare) } : {}),
-    }))
-    .filter((e) => e.label && Number.isFinite(e.amount) && e.amount > 0);
+      ...(e?.oneTime === true ? { oneTime: true } : percentOf ? { percentOf } : validShare(e?.firstMonthShare) ? { firstMonthShare: validShare(e.firstMonthShare) } : {}),
+    };
+  });
+  return resolvePercentExpenses(revenue, lines).filter((e) => e.label && Number.isFinite(e.amount) && e.amount > 0);
 }
 
 function clamp(n: number, lo: number, hi: number) {
@@ -446,7 +454,7 @@ function buildUserContent(input: AnalysisInput): Anthropic.Beta.BetaContentBlock
   return [
     {
       type: "text",
-      text: `${hint}\n${origin} Amounts are monthly, except lines with "oneTime": true, which are single non-recurring amounts (don't treat them as monthly costs or income, and don't base recurring savings estimates on them). A "firstMonthShare" (0–1) marks a recurring line that only applies for part of the first month (e.g. rent starting mid-month); its amount is still the full monthly figure. Keep their amounts as given; assign categories, flag issues, and write the audit.\n\n<form_input>\n${JSON.stringify(
+      text: `${hint}\n${origin} Amounts are monthly, except lines with "oneTime": true, which are single non-recurring amounts (don't treat them as monthly costs or income, and don't base recurring savings estimates on them). A "firstMonthShare" (0–1) marks a recurring line that only applies for part of the first month (e.g. rent starting mid-month); its amount is still the full monthly figure. A "percentOf" ({ pct, revenueLabel }) marks an expense priced as a share of revenue (e.g. a property-management fee at 8.8% of rent; revenueLabel null = all recurring revenue); its amount is already computed from that share. Keep their amounts as given; assign categories, flag issues, and write the audit.\n\n<form_input>\n${JSON.stringify(
         { revenue: input.revenue, expenses: input.expenses },
         null,
         2,

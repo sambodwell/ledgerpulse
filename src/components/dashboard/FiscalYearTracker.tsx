@@ -8,14 +8,19 @@ import {
   currentFiscalYearStart,
   defaultTrackerState,
   fiscalYearLabel,
+  goalPace,
   normalizeTrackerState,
   summarizeFiscalYear,
   type FiscalTrackerState,
+  type GoalPace,
   type MonthActual,
   type PaceResult,
 } from "@/lib/fiscal";
 import { authHeaders, loadFiscalTracker, saveFiscalTracker } from "@/lib/supabase";
+import { useApp } from "@/components/AppProvider";
+import { InfoTip } from "@/components/InfoTip";
 import { ChartTooltip, COLOR, axisProps, signedUsd } from "@/components/dashboard/chartKit";
+import { GoalTracker } from "@/components/dashboard/GoalTracker";
 import { MoneyNumberInput } from "@/components/dashboard/MoneyInput";
 import { cn, errorMessage, glass, inputCls, secondaryBtn, usd, usdCompact } from "@/components/ui";
 
@@ -24,6 +29,25 @@ const FORECAST_FILL = "rgba(25,158,112,0.35)";
 type SaveStatus = "idle" | "loading" | "saving" | "saved" | "error";
 
 const localKey = (userId: string) => `lp:fiscalTracker:${userId}:guest`;
+
+/** The device-only tracker used before a workspace exists (moved into the workspace when one is saved). */
+export function readLocalTracker(userId: string): unknown {
+  return readLocal(userId);
+}
+
+export function clearLocalTracker(userId: string) {
+  try {
+    window.localStorage.removeItem(localKey(userId));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Goal pace + label, reported up so the executive PDF can include it. */
+export interface GoalReport {
+  pace: GoalPace;
+  fyLabel: string;
+}
 
 function readLocal(userId: string): unknown {
   try {
@@ -51,11 +75,13 @@ export function FiscalYearTracker({
   workspaceId,
   businessType,
   analysis,
+  onGoalReport,
 }: {
   userId: string;
   workspaceId: string | null;
   businessType: BusinessType;
   analysis: FinancialAnalysis | null;
+  onGoalReport?: (r: GoalReport | null) => void;
 }) {
   const [state, setState] = useState<FiscalTrackerState>(() => defaultTrackerState(businessType));
   const [status, setStatus] = useState<SaveStatus>("loading");
@@ -112,6 +138,18 @@ export function FiscalYearTracker({
 
   const summary = useMemo(() => summarizeFiscalYear(state), [state]);
   const currentKey = monthKey(new Date());
+  const goal = state.goalMetric === "NET" ? state.targets.net : state.targets.revenue;
+  const pace = useMemo(() => goalPace(summary, state.goalMetric, goal), [summary, state.goalMetric, goal]);
+  const fyLabel = fiscalYearLabel(state);
+
+  // Report goal pace up for the executive PDF, and share non-financial tracker state with the chat assistant.
+  useEffect(() => {
+    onGoalReport?.(pace && status !== "loading" ? { pace, fyLabel } : null);
+  }, [pace, fyLabel, status, onGoalReport]);
+  const { setUiHints } = useApp();
+  useEffect(() => {
+    setUiHints({ trackerForecastMode: state.forecastMode, goalMetric: goal != null ? state.goalMetric : null });
+  }, [state.forecastMode, state.goalMetric, goal, setUiHints]);
 
   const setActual = (key: string, field: keyof MonthActual, v: number | null) =>
     update((s) => {
@@ -227,7 +265,13 @@ export function FiscalYearTracker({
             </fieldset>
 
             <fieldset className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-4 text-sm">
-              <legend className="px-1 text-xs uppercase tracking-wide text-slate-500">Original baseline (per month)</legend>
+              <legend className="flex items-center gap-1.5 px-1 text-xs uppercase tracking-wide text-slate-500">
+                Original baseline (per month)
+                <InfoTip label="Original baseline" align="left">
+                  Your planned monthly revenue and expenses for the year. It fills every month you haven&apos;t logged yet when the forecast method is &ldquo;Maintain Original
+                  Baseline&rdquo;, and until your first month is logged under &ldquo;Use Trailing Average&rdquo;.
+                </InfoTip>
+              </legend>
               <div className="grid grid-cols-2 gap-2">
                 <label className="block">
                   <span className="text-xs text-slate-400">Revenue</span>
@@ -243,11 +287,26 @@ export function FiscalYearTracker({
                   Use current analysis ({usd.format(analysisBaseline.revenue)} / {usd.format(analysisBaseline.expenses)})
                 </button>
               )}
-              <p className="text-[11px] text-slate-500">Seasonality for your business type is applied month by month.</p>
+              <label className="flex items-center gap-2 text-[11px] text-slate-400">
+                <input type="checkbox" checked={state.seasonality} onChange={(e) => update((s) => ({ ...s, seasonality: e.target.checked }))} className="accent-indigo-400" />
+                Apply seasonality for your business type
+                <span className="text-slate-500">({state.seasonality ? "on" : "off — every month uses the same baseline"})</span>
+              </label>
             </fieldset>
 
             <fieldset className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-4 text-sm">
-              <legend className="px-1 text-xs uppercase tracking-wide text-slate-500">Re-forecast remaining months</legend>
+              <legend className="flex items-center gap-1.5 px-1 text-xs uppercase tracking-wide text-slate-500">
+                Re-forecast remaining months
+                <InfoTip label="Trailing average vs. baseline">
+                  <span className="block">
+                    <strong className="font-medium text-slate-100">Use Trailing Average</strong> forecasts each unlogged month as the average of your most recent logged
+                    months — best when recent results reflect your real run-rate.
+                  </span>
+                  <span className="mt-1 block">
+                    <strong className="font-medium text-slate-100">Maintain Original Baseline</strong> keeps the plan you set — best when recent months were unusual.
+                  </span>
+                </InfoTip>
+              </legend>
               <div role="radiogroup" aria-label="Forecast method" className="grid grid-cols-2 gap-1 rounded-lg border border-white/10 p-0.5 text-xs">
                 {(
                   [
@@ -285,7 +344,9 @@ export function FiscalYearTracker({
                   ? summary.trailing
                     ? `Forecast = ${usd.format(summary.trailing.revenue)} revenue / ${usd.format(summary.trailing.expenses)} expenses per month (avg of ${summary.trailingKeys.length} month${summary.trailingKeys.length === 1 ? "" : "s"}).`
                     : "No actuals yet: using the original baseline until you log a month."
-                  : "Future months follow the original baseline × seasonality."}
+                  : state.seasonality
+                    ? "Future months follow the original baseline × seasonality."
+                    : "Future months follow the original baseline as entered."}
               </p>
             </fieldset>
           </div>
@@ -296,15 +357,15 @@ export function FiscalYearTracker({
             </p>
           )}
 
-          {/* Goal vs pace */}
-          <div className="mt-6 grid gap-4 lg:grid-cols-2">
-            <PaceCard
-              title="Annual revenue target"
-              value={state.targets.revenue}
-              onChange={(v) => update((s) => ({ ...s, targets: { ...s.targets, revenue: v } }))}
-              pace={summary.revenuePace}
-              kind="revenue"
-              ytd={summary.ytd.revenue}
+          {/* Year-end goal vs pace */}
+          <div className="mt-6 space-y-4">
+            <GoalTracker
+              metric={state.goalMetric}
+              goal={goal}
+              pace={pace}
+              fyLabel={fyLabel}
+              onMetricChange={(goalMetric) => update((s) => ({ ...s, goalMetric }))}
+              onGoalChange={(v) => update((s) => ({ ...s, targets: { ...s.targets, [s.goalMetric === "NET" ? "net" : "revenue"]: v } }))}
             />
             <PaceCard
               title="Annual expense cap"
@@ -323,15 +384,19 @@ export function FiscalYearTracker({
                 Monthly actuals <span className="text-xs font-normal text-slate-500">· {summary.loggedCount} of 12 logged</span>
               </h3>
               {importError && <p className="mt-2 text-xs text-rose-300">{importError}</p>}
-              <div className="mt-2 max-h-[28rem] overflow-auto pr-1">
+              {/*
+                Sticky header: the inputs below are positioned (relative wrappers for the $ prefix), so without its own
+                stacking layer and an opaque fill the header would be painted under the scrolling rows.
+              */}
+              <div className="relative mt-2 max-h-[28rem] overflow-auto rounded-lg border border-white/5 pr-1">
                 <table className="w-full min-w-[34rem] text-sm tabular-nums">
-                  <thead className="sticky top-0 bg-slate-950/90 text-left text-[11px] uppercase text-slate-500 backdrop-blur">
+                  <thead className="sticky top-0 z-20 bg-slate-900 text-left text-[11px] uppercase text-slate-400 shadow-[0_1px_0_rgba(255,255,255,0.08)]">
                     <tr>
-                      <th className="py-2 font-medium">Month</th>
-                      <th className="py-2 font-medium">Revenue</th>
-                      <th className="py-2 font-medium">Expenses</th>
-                      <th className="py-2 text-right font-medium">Net</th>
-                      <th className="py-2" />
+                      <th className="bg-slate-900 py-2 pl-2 font-medium">Month</th>
+                      <th className="bg-slate-900 py-2 font-medium">Revenue</th>
+                      <th className="bg-slate-900 py-2 font-medium">Expenses</th>
+                      <th className="bg-slate-900 py-2 text-right font-medium">Net</th>
+                      <th className="bg-slate-900 py-2" />
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
@@ -340,7 +405,7 @@ export function FiscalYearTracker({
                       const net = m.revenue - m.expenses;
                       return (
                         <tr key={m.key} className={cn(m.key === currentKey && "bg-indigo-500/[0.06]")}>
-                          <td className="py-1.5 pr-2 text-slate-300">
+                          <td className="py-1.5 pl-2 pr-2 text-slate-300">
                             {m.label}
                             <span
                               className={cn(
@@ -397,7 +462,7 @@ export function FiscalYearTracker({
                   </tbody>
                   <tfoot className="border-t border-white/10 text-sm font-medium">
                     <tr>
-                      <td className="py-2 text-slate-300">Projected FY</td>
+                      <td className="py-2 pl-2 text-slate-300">Projected FY</td>
                       <td className="py-2 pl-3">{usd.format(summary.projectedTotal.revenue)}</td>
                       <td className="py-2 pl-3">{usd.format(summary.projectedTotal.expenses)}</td>
                       <td className={cn("py-2 text-right", summary.projectedTotal.revenue - summary.projectedTotal.expenses < 0 && "text-rose-300")}>

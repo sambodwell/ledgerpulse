@@ -42,11 +42,24 @@ export interface RevenueLine {
   firstMonthShare?: number;
 }
 
+/**
+ * Expense priced as a percentage of revenue (e.g. property management at 8.8% of rent).
+ * `revenueLabel` names one recurring revenue line (matched case-insensitively); null = all recurring revenue.
+ * The line's `amount` is kept in sync (pct × linked revenue) and the projection recomputes it every month,
+ * so it scales whenever the linked revenue changes.
+ */
+export interface PercentOfRevenue {
+  pct: number; // 0..1
+  revenueLabel: string | null;
+}
+
 export interface ExpenseLine {
   label: string;
   amount: number; // monthly (or the single amount when oneTime)
   category: string;
   flag?: string;
+  /** Recurring lines only: amount is a share of revenue rather than a fixed dollar figure. */
+  percentOf?: PercentOfRevenue;
   /** A single, non-repeating charge (e.g. a late fee or one purchase). Absent/false = recurring every month. */
   oneTime?: boolean;
   /** Recurring lines only: share (0–1, exclusive) of the first projected month this line applies — e.g. 0.5 for rent that starts mid-month. */
@@ -56,6 +69,46 @@ export interface ExpenseLine {
 /** A valid partial-first-month share, or undefined for a full month. */
 export function validShare(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) && v > 0 && v < 1 ? Math.round(v * 1000) / 1000 : undefined;
+}
+
+/** A valid percent-of-revenue link (0 < pct ≤ 1), or undefined. */
+export function validPercentOf(v: unknown): PercentOfRevenue | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  const pct = Number(o.pct);
+  if (!Number.isFinite(pct) || pct <= 0 || pct > 1) return undefined;
+  const label = typeof o.revenueLabel === "string" && o.revenueLabel.trim() ? o.revenueLabel.trim().slice(0, 120) : null;
+  return { pct: Math.round(pct * 100000) / 100000, revenueLabel: label };
+}
+
+const sameLabel = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+
+/** Monthly recurring revenue a percent-of-revenue link points at, or null when the named line doesn't exist. */
+export function linkedRevenueBase(revenue: { label: string; amount: number; oneTime?: boolean }[], link: PercentOfRevenue): number | null {
+  const recurring = revenue.filter((r) => !r.oneTime);
+  if (link.revenueLabel == null) return sum(recurring, (r) => r.amount);
+  const hits = recurring.filter((r) => sameLabel(r.label, link.revenueLabel!));
+  return hits.length ? sum(hits, (r) => r.amount) : null;
+}
+
+/**
+ * Re-derives the dollar amount of every percent-of-revenue expense from the current revenue lines.
+ * A link to a revenue line that no longer exists is dropped and the last computed amount kept as a fixed figure.
+ */
+export function resolvePercentExpenses<E extends { amount: number; oneTime?: boolean; percentOf?: PercentOfRevenue }>(
+  revenue: { label: string; amount: number; oneTime?: boolean }[],
+  expenses: E[],
+): E[] {
+  return expenses.map((e) => {
+    if (!e.percentOf) return e;
+    const base = e.oneTime ? null : linkedRevenueBase(revenue, e.percentOf);
+    if (base == null) {
+      const rest = { ...e };
+      delete rest.percentOf;
+      return rest;
+    }
+    return { ...e, amount: round2(base * e.percentOf.pct) };
+  });
 }
 
 /** Recurring monthly total and one-time total of a set of line items. */
@@ -117,7 +170,7 @@ export function isBusinessType(value: unknown): value is BusinessType {
 // Macro constants
 // ---------------------------------------------------------------------------
 
-/** Default annual inflation assumption applied to projections. */
+/** Annual inflation rate used when the owner turns inflation on (projections are flat by default). */
 export const DEFAULT_INFLATION_RATE = 0.037;
 export const PROJECTION_MONTHS = 12;
 /** Longest supported forecast horizon (months). */
@@ -460,9 +513,18 @@ export interface ForecastSettings {
   /** 0 = January … 11 = December, used when startMode is FISCAL. */
   fiscalStartMonth: number;
   months: number;
+  /** Apply the business type's monthly seasonality curve. Off by default: flat inputs project flat. */
+  seasonality: boolean;
+  /** Compound the assumed annual inflation rate. Off by default. */
+  inflation: boolean;
 }
 
-export const DEFAULT_FORECAST: ForecastSettings = { startMode: "NEXT", customMonth: "", fiscalStartMonth: 0, months: PROJECTION_MONTHS };
+export const DEFAULT_FORECAST: ForecastSettings = { startMode: "NEXT", customMonth: "", fiscalStartMonth: 0, months: PROJECTION_MONTHS, seasonality: false, inflation: false };
+
+/** Projection options for forecast settings (start month, horizon, macro toggles). */
+export function projectionOptions(s: ForecastSettings, now = new Date()): ProjectionOptions {
+  return { start: resolveForecastStart(s, now), months: s.months, seasonality: s.seasonality, inflation: s.inflation };
+}
 
 export const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"] as const;
 
@@ -485,9 +547,11 @@ export function resolveForecastStart(s: ForecastSettings, now = new Date()): Dat
 }
 
 /**
- * Per-month seasonality × inflation multipliers shared by baseline and scenario projections.
- * `start` is the first projected month; month i (1-based) compounds inflation as (1 + rate)^(i/12).
- * `flat` returns 1 for every factor (used to itemize the effect of seasonality and inflation).
+ * Per-month multipliers shared by baseline and scenario projections. Both macro effects are OFF unless
+ * requested, so flat inputs (e.g. $4,100/mo) project as exactly $4,100 every month.
+ *   seasonality: the business type's January→December curve (each row averages 1.0)
+ *   inflation:   month i (1-based) compounds as (1 + rate)^(i/12); revenue passes through part of it
+ * `flat` forces every factor to 1 regardless of the toggles (used to itemize the macro effect).
  */
 export function projectionFactors(params: {
   businessType: BusinessType;
@@ -495,8 +559,12 @@ export function projectionFactors(params: {
   start?: Date;
   months?: number;
   flat?: boolean;
+  seasonality?: boolean;
+  inflation?: boolean;
 }): { month: string; revenue: number; expenses: number }[] {
   const { businessType, inflationRate = DEFAULT_INFLATION_RATE, start = defaultProjectionStart(), flat = false } = params;
+  const useSeason = !flat && params.seasonality === true;
+  const useInflation = !flat && params.inflation === true;
   const months = clampHorizon(params.months ?? PROJECTION_MONTHS);
   const season = SEASONALITY[businessType];
   const passThrough = INFLATION_PASS_THROUGH[businessType];
@@ -506,8 +574,8 @@ export function projectionFactors(params: {
     const monthIdx = d.getUTCMonth();
     out.push({
       month: MONTH_FMT.format(d),
-      revenue: flat ? 1 : season.revenue[monthIdx] * Math.pow(1 + inflationRate * passThrough, i / 12),
-      expenses: flat ? 1 : season.expenses[monthIdx] * Math.pow(1 + inflationRate, i / 12),
+      revenue: (useSeason ? season.revenue[monthIdx] : 1) * (useInflation ? Math.pow(1 + inflationRate * passThrough, i / 12) : 1),
+      expenses: (useSeason ? season.expenses[monthIdx] : 1) * (useInflation ? Math.pow(1 + inflationRate, i / 12) : 1),
     });
   }
   return out;
@@ -518,13 +586,18 @@ export interface ProjectionOptions {
   start?: Date;
   /** Horizon in months, 1..MAX_PROJECTION_MONTHS (defaults to 12). */
   months?: number;
-  /** Ignore seasonality and inflation (every factor = 1). */
+  /** Ignore seasonality and inflation even when toggled on (every factor = 1). */
   flat?: boolean;
+  /** Apply seasonality (default off). */
+  seasonality?: boolean;
+  /** Apply inflation (default off). */
+  inflation?: boolean;
 }
 
 /**
- * Baseline projection from line items. Recurring amounts get seasonality × inflation every month
- * (pro-rated in month 1 when a line has `firstMonthShare`); one-time amounts land once, as-is, in month 1.
+ * Baseline projection from line items. Recurring amounts repeat every month (× seasonality / inflation only when those
+ * are switched on; pro-rated in month 1 when a line has `firstMonthShare`); one-time amounts land once, as-is, in
+ * month 1. Percent-of-revenue expenses are recomputed from their linked revenue each month.
  */
 export function projectBaseline(base: ScenarioBaseline, opts: ProjectionOptions = {}): MacroProjection[] {
   return applyScenario(base, [], opts).points.map((p) => ({ month: p.month, projectedRevenue: p.baselineRevenue, projectedExpenses: p.baselineExpenses }));
@@ -581,7 +654,7 @@ type ProjectedLine = { label: string; amount: number; oneTime?: boolean; firstMo
 export interface ScenarioBaseline {
   businessType: BusinessType;
   itemizedRevenue: ProjectedLine[];
-  itemizedExpenses: (ProjectedLine & { category: string })[];
+  itemizedExpenses: (ProjectedLine & { category: string; percentOf?: PercentOfRevenue })[];
   inflationRateAssumed: number;
 }
 
@@ -602,7 +675,15 @@ export function clampMonth(m: number) {
 
 /** Applies scenario adjustments on top of the baseline line items and projects `opts.months` months from `opts.start`. */
 export function applyScenario(base: ScenarioBaseline, adjustments: ScenarioAdjustment[], opts: ProjectionOptions = {}): ScenarioResult {
-  const factors = projectionFactors({ businessType: base.businessType, inflationRate: base.inflationRateAssumed, start: opts.start, months: opts.months, flat: opts.flat });
+  const factors = projectionFactors({
+    businessType: base.businessType,
+    inflationRate: base.inflationRateAssumed,
+    start: opts.start,
+    months: opts.months,
+    flat: opts.flat,
+    seasonality: opts.seasonality,
+    inflation: opts.inflation,
+  });
   const months = factors.length;
   const revTotals = splitTotals(base.itemizedRevenue);
   const expTotals = splitTotals(base.itemizedExpenses);
@@ -621,21 +702,32 @@ export function applyScenario(base: ScenarioBaseline, adjustments: ScenarioAdjus
     .map((a) => a.description);
   const beyondHorizon = adjustments.filter((a) => clampMonth(a.startMonth) > months).map((a) => a.description);
 
-  /** Recurring revenue/expenses for month m before seasonality/inflation. */
-  const raw = (m: number, active: ScenarioAdjustment[]) => {
+  /**
+   * Recurring revenue/expenses for month m before seasonality/inflation. Percent-of-revenue expenses come back
+   * separately (`linked`) already in projected dollars: pct × that month's projected linked revenue, so they follow
+   * revenue changes, revenue seasonality and revenue inflation rather than the expense curve.
+   */
+  const raw = (m: number, active: ScenarioAdjustment[], revFactor: number) => {
     let rev = 0;
+    const revByLine: { label: string; amount: number }[] = [];
     for (const r of recurringRevenue) {
       const mult = active.filter((a) => a.type === "REVENUE_PCT" && matches(a.match, r.label)).reduce((acc, a) => acc * (1 + (a as { pct: number }).pct), 1);
-      rev += r.amount * shareIn(r, m) * mult;
+      const v = r.amount * shareIn(r, m) * mult;
+      rev += v;
+      revByLine.push({ label: r.label, amount: v });
     }
     let exp = 0;
+    let linked = 0;
     for (const e of recurringExpenses) {
       const mult = active.filter((a) => a.type === "EXPENSE_PCT" && matches(a.match, e.category, e.label)).reduce((acc, a) => acc * (1 + (a as { pct: number }).pct), 1);
-      exp += e.amount * shareIn(e, m) * mult;
+      const link = validPercentOf(e.percentOf);
+      const linkBase = link ? linkedRevenueBase(revByLine, link) : null;
+      if (link && linkBase != null) linked += linkBase * revFactor * link.pct * mult;
+      else exp += e.amount * shareIn(e, m) * mult;
     }
     rev += sum(active.filter((a) => a.type === "REVENUE_ADD"), (a) => (a as { amount: number }).amount);
     exp += sum(active.filter((a) => a.type === "EXPENSE_ADD"), (a) => (a as { amount: number }).amount);
-    return { rev, exp };
+    return { rev, exp, linked };
   };
 
   const points: ScenarioPoint[] = [];
@@ -644,12 +736,12 @@ export function applyScenario(base: ScenarioBaseline, adjustments: ScenarioAdjus
     const active = adjustments.filter((a) => m >= clampMonth(a.startMonth));
     const oneTimeRev = m === 1 ? revTotals.oneTime : 0;
     const oneTimeExp = m === 1 ? expTotals.oneTime : 0;
-    const b = raw(m, []);
-    const a = active.length ? raw(m, active) : b;
+    const b = raw(m, [], f.revenue);
+    const a = active.length ? raw(m, active, f.revenue) : b;
     const baselineRevenue = round2(b.rev * f.revenue + oneTimeRev);
-    const baselineExpenses = round2(b.exp * f.expenses + oneTimeExp);
+    const baselineExpenses = round2(b.exp * f.expenses + b.linked + oneTimeExp);
     const adjustedRevenue = round2(a.rev * f.revenue + oneTimeRev);
-    const adjustedExpenses = round2(a.exp * f.expenses + oneTimeExp);
+    const adjustedExpenses = round2(a.exp * f.expenses + a.linked + oneTimeExp);
     const baselineNet = round2(baselineRevenue - baselineExpenses);
     const adjustedNet = round2(adjustedRevenue - adjustedExpenses);
     const prev = points.at(-1);
@@ -707,6 +799,9 @@ export interface ScenarioBreakdown {
   inflationRate: number;
   revenuePassThrough: number;
   seasonalRange: { revenue: [number, number]; expenses: [number, number] };
+  /** Which macro effects were applied (both off by default). */
+  seasonality: boolean;
+  inflation: boolean;
 }
 
 /**
@@ -761,6 +856,8 @@ export function explainScenario(base: ScenarioBaseline, adjustments: ScenarioAdj
     inflationRate: base.inflationRateAssumed,
     revenuePassThrough: INFLATION_PASS_THROUGH[base.businessType],
     seasonalRange: { revenue: range(season.revenue), expenses: range(season.expenses) },
+    seasonality: opts.seasonality === true,
+    inflation: opts.inflation === true,
   };
 }
 

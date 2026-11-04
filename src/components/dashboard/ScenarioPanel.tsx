@@ -77,7 +77,7 @@ export function ScenarioPanel({
     () => ({
       businessType: analysis.businessType,
       itemizedRevenue: analysis.itemizedRevenue.map(({ label, amount, oneTime, firstMonthShare }) => ({ label, amount, oneTime, firstMonthShare })),
-      itemizedExpenses: analysis.itemizedExpenses.map(({ label, amount, category, oneTime, firstMonthShare }) => ({ label, amount, category, oneTime, firstMonthShare })),
+      itemizedExpenses: analysis.itemizedExpenses.map(({ label, amount, category, oneTime, firstMonthShare, percentOf }) => ({ label, amount, category, oneTime, firstMonthShare, percentOf })),
       inflationRateAssumed: analysis.inflationRateAssumed,
     }),
     [analysis],
@@ -92,11 +92,11 @@ export function ScenarioPanel({
     const out = new Map<number, Computed>();
     for (const e of entries) {
       if (!e.plan) continue;
-      const opts = { start, months };
+      const opts = { start, months, seasonality: settings.seasonality, inflation: settings.inflation };
       out.set(e.id, { result: applyScenario(baseline, e.plan.adjustments, opts), breakdown: explainScenario(baseline, e.plan.adjustments, opts) });
     }
     return out;
-  }, [entries, baseline, start, months]);
+  }, [entries, baseline, start, months, settings.seasonality, settings.inflation]);
 
   useEffect(() => {
     if (!workspaceId) return;
@@ -528,12 +528,24 @@ function CalculationBreakdown({ b }: { b: ScenarioBreakdown }) {
               <td className="py-1.5 text-right tabular-nums text-slate-200">{usd.format(b.baseProjected)}</td>
             </tr>
             {row("Straight-line change", b.linearTotal, "Σ monthly Δ × months active (today's dollars)")}
-            {row("Compounding & first-month proration", b.compounding, "Overlapping % changes on the same line multiply (1+a)(1+b) instead of adding; partial-month lines are pro-rated in month 1")}
             {row(
-              "Seasonality & inflation",
-              b.seasonalityInflation,
-              `Each changed amount × that month's seasonal multiplier (revenue ${b.seasonalRange.revenue[0].toFixed(2)}–${b.seasonalRange.revenue[1].toFixed(2)}, expenses ${b.seasonalRange.expenses[0].toFixed(2)}–${b.seasonalRange.expenses[1].toFixed(2)}) × inflation (1 + ${pct(b.inflationRate)})^(month/12) on costs; revenue passes through ${Math.round(b.revenuePassThrough * 100)}% of inflation`,
+              "Compounding & first-month proration",
+              b.compounding,
+              "Overlapping % changes on the same line multiply (1+a)(1+b) instead of adding; partial-month lines are pro-rated in month 1; %-of-revenue expenses move with their linked revenue",
             )}
+            {b.seasonality || b.inflation
+              ? row(
+                  [b.seasonality && "Seasonality", b.inflation && "Inflation"].filter(Boolean).join(" & "),
+                  b.seasonalityInflation,
+                  [
+                    b.seasonality &&
+                      `Each changed amount × that month's seasonal multiplier (revenue ${b.seasonalRange.revenue[0].toFixed(2)}–${b.seasonalRange.revenue[1].toFixed(2)}, expenses ${b.seasonalRange.expenses[0].toFixed(2)}–${b.seasonalRange.expenses[1].toFixed(2)})`,
+                    b.inflation && `inflation (1 + ${pct(b.inflationRate)})^(month/12) on costs; revenue passes through ${Math.round(b.revenuePassThrough * 100)}% of inflation`,
+                  ]
+                    .filter(Boolean)
+                    .join(" × "),
+                )
+              : row("Seasonality & inflation", 0, "Off — the projection repeats your monthly inputs as entered. Turn them on above the projection chart.")}
             {row("Total change", b.delta, undefined, true)}
             <tr className="font-semibold">
               <td className="py-1.5 pr-3 text-slate-100">Adjusted projected</td>
@@ -600,7 +612,11 @@ ${items ? `<table><thead><tr><th>Change</th><th>Monthly Δ</th><th>× Months</th
 <tr><td>Base projected</td><td>${usd.format(b.baseProjected)}</td></tr>
 <tr><td>Straight-line change</td><td class="${cls(b.linearTotal)}">${signedUsd(b.linearTotal)}</td></tr>
 <tr><td>Compounding &amp; first-month proration</td><td class="${cls(b.compounding)}">${signedUsd(b.compounding)}</td></tr>
-<tr><td>Seasonality &amp; inflation (${pct(b.inflationRate)}/yr on costs, ${Math.round(b.revenuePassThrough * 100)}% passed through to revenue)</td><td class="${cls(b.seasonalityInflation)}">${signedUsd(b.seasonalityInflation)}</td></tr>
+<tr><td>${
+    b.seasonality || b.inflation
+      ? `${[b.seasonality && "Seasonality", b.inflation && `inflation (${pct(b.inflationRate)}/yr on costs, ${Math.round(b.revenuePassThrough * 100)}% passed through to revenue)`].filter(Boolean).join(" &amp; ")}`
+      : "Seasonality &amp; inflation (off)"
+  }</td><td class="${cls(b.seasonalityInflation)}">${signedUsd(b.seasonalityInflation)}</td></tr>
 <tr><td><strong>Adjusted projected</strong></td><td><strong>${usd.format(b.adjustedProjected)}</strong></td></tr>
 </tbody></table>
 ${plan.assumptions.length ? `<h2>Assumptions</h2><ul>${plan.assumptions.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : ""}

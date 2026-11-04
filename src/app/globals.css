@@ -14,6 +14,23 @@
   --font-mono: var(--font-geist-mono);
 }
 
+/*
+ * Native <select> popups ignore the page's translucent backgrounds; on Windows/Chrome they fall back to a white list
+ * with the select's light text color (white-on-white). Give every select and option an explicit dark surface.
+ */
+select {
+  color-scheme: dark;
+}
+select option,
+select optgroup {
+  background-color: #0f172a;
+  color: #e2e8f0;
+}
+select option:checked {
+  background-color: #312e81;
+  color: #ffffff;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);

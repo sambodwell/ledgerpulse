@@ -14,9 +14,16 @@ import type { UserProfile, WorkspaceMode, WorkspaceProfile } from "@/lib/schemas
 import { AuthDialog } from "@/components/AuthDialog";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 
-interface UiHints {
+/** Non-financial UI state shared with the chat assistant so it can talk about what's on screen. */
+export interface UiHints {
   mode: WorkspaceMode;
   hasAnalysis: boolean;
+  hasWorkspace: boolean;
+  seasonality: boolean;
+  inflation: boolean;
+  horizonMonths: number;
+  trackerForecastMode: "TRAILING" | "BASELINE" | null;
+  goalMetric: "REVENUE" | "NET" | null;
 }
 
 interface AppState {
@@ -49,7 +56,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<WorkspaceProfile[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<"signin" | "signup" | null>(null);
-  const [uiHints, setUiHintsState] = useState<UiHints>({ mode: "BUSINESS", hasAnalysis: false });
+  const [uiHints, setUiHintsState] = useState<UiHints>({
+    mode: "BUSINESS",
+    hasAnalysis: false,
+    hasWorkspace: false,
+    seasonality: false,
+    inflation: false,
+    horizonMonths: 12,
+    trackerForecastMode: null,
+    goalMetric: null,
+  });
   const loadedFor = useRef<string | null | undefined>(undefined);
 
   const refreshProfile = useCallback(async () => {

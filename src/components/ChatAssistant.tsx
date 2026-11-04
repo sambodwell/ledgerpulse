@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { Loader2, MessageCircle, Send, Sparkles, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { GripHorizontal, Loader2, MessageCircle, Send, Sparkles, X } from "lucide-react";
 import { useApp } from "@/components/AppProvider";
 import { cn, errorMessage, glass, inputCls } from "@/components/ui";
 import { authHeaders } from "@/lib/supabase";
@@ -12,29 +12,124 @@ interface ChatMessage {
 }
 
 const SUGGESTIONS = [
-  "How do I upload a bank statement?",
-  "What does the free plan include?",
+  "What's the difference between trailing average and baseline?",
+  "How do I set a year-end goal?",
   "What kinds of scenarios can I forecast?",
   "How do workspaces work?",
 ];
 
 const GREETING: ChatMessage = {
   role: "assistant",
-  content: "Hi! I'm the LedgerPulse guide. Ask me how to use the dashboard, what the plans include, or how to phrase a \"what if\" scenario.",
+  content: "Hi! I'm the LedgerPulse guide. Ask about anything on this page — the projection, the Fiscal Year Tracker, goals, plans, or how to phrase a \"what if\" scenario. Drag me anywhere if I'm in the way.",
 };
 
-/** Bottom-right floating help + scenario-phrasing assistant. Sees no financial data. */
+/** Offset of the launcher from the bottom-right corner of the viewport, in px. */
+interface Offset {
+  right: number;
+  bottom: number;
+}
+
+const POS_KEY = "lp:chatPos";
+const BUBBLE = 56; // launcher size (h-14)
+const MARGIN = 8;
+const DRAG_THRESHOLD = 5;
+
+function clampOffset(o: Offset): Offset {
+  if (typeof window === "undefined") return o;
+  const maxRight = Math.max(MARGIN, window.innerWidth - BUBBLE - MARGIN);
+  const maxBottom = Math.max(MARGIN, window.innerHeight - BUBBLE - MARGIN);
+  return { right: Math.min(maxRight, Math.max(MARGIN, o.right)), bottom: Math.min(maxBottom, Math.max(MARGIN, o.bottom)) };
+}
+
+function readOffset(): Offset | null {
+  try {
+    const v: unknown = JSON.parse(window.localStorage.getItem(POS_KEY) ?? "null");
+    if (v && typeof v === "object" && Number.isFinite((v as Offset).right) && Number.isFinite((v as Offset).bottom)) return clampOffset(v as Offset);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * Floating help + scenario-phrasing assistant. Draggable (launcher or panel header) so it never blocks data; the
+ * position is remembered on this device. Sees no financial data — only which page and features are on screen.
+ */
 export function ChatAssistant() {
   const { profile, uiHints } = useApp();
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([GREETING]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [offset, setOffset] = useState<Offset>({ right: 24, bottom: 24 });
+  const [dragging, setDragging] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ x: number; y: number; start: Offset; moved: boolean; pointerId: number } | null>(null);
+  const suppressClick = useRef(false);
+
+  // Restore the saved position after mount (localStorage is client-only) and keep it on-screen on resize.
+  useEffect(() => {
+    const saved = readOffset();
+    if (saved) setOffset(saved);
+    const onResize = () => setOffset((o) => clampOffset(o));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, open]);
+
+  const onPointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLElement>) => {
+      if (e.button !== 0) return;
+      drag.current = { x: e.clientX, y: e.clientY, start: offset, moved: false, pointerId: e.pointerId };
+    },
+    [offset],
+  );
+
+  const onPointerMove = useCallback((e: ReactPointerEvent<HTMLElement>) => {
+    const d = drag.current;
+    if (!d || d.pointerId !== e.pointerId) return;
+    const dx = e.clientX - d.x;
+    const dy = e.clientY - d.y;
+    if (!d.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+    if (!d.moved) {
+      d.moved = true;
+      setDragging(true);
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+    setOffset(clampOffset({ right: d.start.right - dx, bottom: d.start.bottom - dy }));
+  }, []);
+
+  const onPointerUp = useCallback((e: ReactPointerEvent<HTMLElement>) => {
+    const d = drag.current;
+    drag.current = null;
+    if (!d || !d.moved) return;
+    suppressClick.current = true; // the click that ends a drag must not toggle the panel
+    setDragging(false);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+    setOffset((o) => {
+      try {
+        window.localStorage.setItem(POS_KEY, JSON.stringify(o));
+      } catch {
+        /* ignore */
+      }
+      return o;
+    });
+  }, []);
+
+  const dragHandlers = { onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp };
+
+  /** Arrow keys nudge the widget for keyboard users (with the launcher focused). */
+  const onKeyNudge = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 64 : 16;
+    const delta: Record<string, Offset> = { ArrowLeft: { right: step, bottom: 0 }, ArrowRight: { right: -step, bottom: 0 }, ArrowUp: { right: 0, bottom: step }, ArrowDown: { right: 0, bottom: -step } };
+    const d = delta[e.key];
+    if (!d) return;
+    e.preventDefault();
+    setOffset((o) => clampOffset({ right: o.right + d.right, bottom: o.bottom + d.bottom }));
+  };
 
   const send = async (text: string) => {
     const content = text.trim();
@@ -49,7 +144,7 @@ export function ChatAssistant() {
         headers: { "Content-Type": "application/json", ...(await authHeaders()) },
         body: JSON.stringify({
           messages: next.filter((m) => m !== GREETING),
-          context: { page: window.location.pathname, mode: uiHints.mode, hasAnalysis: uiHints.hasAnalysis, tier: profile?.tier ?? "free" },
+          context: { page: window.location.pathname, tier: profile?.tier ?? "free", ...uiHints },
         }),
       });
       if (!res.ok) throw new Error(await errorMessage(res));
@@ -62,15 +157,23 @@ export function ChatAssistant() {
     }
   };
 
+  // Open the panel toward the roomier side of the screen.
+  const onLeftHalf = typeof window !== "undefined" && offset.right > window.innerWidth / 2 - BUBBLE / 2;
+  const nearTop = typeof window !== "undefined" && offset.bottom > window.innerHeight / 2;
+
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col items-end gap-3 sm:bottom-6 sm:right-6">
+    <div
+      className={cn("fixed z-50 flex gap-3", nearTop ? "flex-col-reverse" : "flex-col", onLeftHalf ? "items-start" : "items-end", dragging && "select-none")}
+      style={{ right: offset.right, bottom: nearTop ? undefined : offset.bottom, top: nearTop ? `calc(100vh - ${offset.bottom + BUBBLE}px)` : undefined }}
+    >
       {open && (
         <section aria-label="LedgerPulse assistant" className={cn(glass, "flex h-[min(32rem,calc(100vh-7rem))] w-[min(22rem,calc(100vw-2rem))] flex-col bg-slate-900/95")}>
-          <header className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <header className={cn("flex touch-none items-center justify-between border-b border-white/10 px-4 py-3", dragging ? "cursor-grabbing" : "cursor-grab")} {...dragHandlers} title="Drag to move">
             <h2 className="flex items-center gap-2 text-sm font-semibold">
               <Sparkles className="h-4 w-4 text-indigo-300" /> LedgerPulse Guide
+              <GripHorizontal className="h-4 w-4 text-slate-500" aria-hidden />
             </h2>
-            <button onClick={() => setOpen(false)} aria-label="Close assistant" className="text-slate-400 hover:text-white">
+            <button onPointerDown={(e) => e.stopPropagation()} onClick={() => setOpen(false)} aria-label="Close assistant" className="text-slate-400 hover:text-white">
               <X className="h-4 w-4" />
             </button>
           </header>
@@ -120,10 +223,22 @@ export function ChatAssistant() {
       )}
 
       <button
-        onClick={() => setOpen((o) => !o)}
-        aria-label={open ? "Close assistant" : "Open assistant"}
+        {...dragHandlers}
+        onClick={() => {
+          if (suppressClick.current) {
+            suppressClick.current = false;
+            return;
+          }
+          setOpen((o) => !o);
+        }}
+        onKeyDown={onKeyNudge}
+        aria-label={open ? "Close assistant (drag or use arrow keys to move)" : "Open assistant (drag or use arrow keys to move)"}
         aria-expanded={open}
-        className="grid h-14 w-14 place-items-center rounded-full bg-indigo-500 text-white shadow-xl shadow-indigo-500/30 transition hover:scale-105 hover:bg-indigo-400"
+        title="Click to chat · drag to move"
+        className={cn(
+          "grid h-14 w-14 touch-none place-items-center rounded-full bg-indigo-500 text-white shadow-xl shadow-indigo-500/30 transition hover:bg-indigo-400",
+          dragging ? "scale-105 cursor-grabbing" : "cursor-grab hover:scale-105",
+        )}
       >
         {open ? <X className="h-6 w-6" /> : <MessageCircle className="h-6 w-6" />}
       </button>

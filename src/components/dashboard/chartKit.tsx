@@ -32,11 +32,13 @@ export function ChartTooltip({
   payload?: ReadonlyArray<{ name?: string | number; value?: unknown; color?: string }>;
   label?: string | number;
 }) {
-  if (!active || !payload?.length) return null;
+  // Series with no value at this point (e.g. "actual" after the last logged month) are left out.
+  const rows = payload?.filter((p) => p.value != null && Number.isFinite(Number(p.value))) ?? [];
+  if (!active || !rows.length) return null;
   return (
     <div className="rounded-lg border border-white/10 bg-slate-900/95 px-3 py-2 text-xs shadow-xl backdrop-blur">
       <p className="mb-1 font-medium text-slate-200">{label}</p>
-      {payload.map((p) => (
+      {rows.map((p) => (
         <p key={String(p.name)} className="flex items-center gap-2 text-slate-300">
           <span className="inline-block h-2 w-2 rounded-full" style={{ background: p.color }} />
           <span className="text-slate-400">{p.name}</span>
