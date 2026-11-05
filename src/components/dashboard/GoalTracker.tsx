@@ -1,37 +1,30 @@
 "use client";
 
 import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { Flag, TrendingDown, TrendingUp } from "lucide-react";
-import { paceWords, signedMoney, type GoalMetric, type GoalPace } from "@/lib/fiscal";
+import { CheckCircle2, Cloud, Flag, Loader2, RotateCw, TrendingDown, TrendingUp } from "lucide-react";
+import { GOAL_METRICS, GOAL_METRIC_LABEL, annualDeltaWords, exactMoney, paceWords, signedMoney, targetKeyFor, type GoalMetric, type GoalPace } from "@/lib/fiscal";
+import { round2 } from "@/lib/schemas";
 import { InfoTip } from "@/components/InfoTip";
 import { ChartTooltip, COLOR, axisProps } from "@/components/dashboard/chartKit";
 import { MoneyNumberInput } from "@/components/dashboard/MoneyInput";
-import { cn, usd, usdCompact } from "@/components/ui";
+import type { FiscalTrackerHandle, SaveStatus } from "@/components/dashboard/useFiscalTracker";
+import { cn, usdCompact } from "@/components/ui";
 
-const METRIC_LABEL: Record<GoalMetric, string> = { REVENUE: "Revenue", NET: "Net income" };
+/** Tone for a pace variance (already signed so positive = good): ahead is green, behind is red. Always paired with words. */
+const toneCls = (v: number) => (Math.abs(v) < 0.005 ? "text-slate-300" : v > 0 ? "text-emerald-300" : "text-rose-300");
 
-/** Tone for a pace variance: ahead (≥ 0) is good, behind is bad. Always paired with a sign and the word ahead/behind. */
-const toneCls = (v: number) => (Math.abs(v) < 0.5 ? "text-slate-300" : v > 0 ? "text-emerald-300" : "text-rose-300");
+const GOAL_NOUN: Record<GoalMetric, string> = { NET: "net income goal", REVENUE: "revenue goal", EXPENSE: "expense budget" };
 
 /**
- * Year-end goal setter + goal-vs-trajectory chart + monthly / quarterly / annual pace breakdown.
- * The goal is spread evenly across the fiscal year (goal ÷ 12 per month).
+ * Goal Tracker: pick Net income (default), Revenue or an Expense budget, set an annual (or monthly) target, and see the
+ * year-end delta, the pace chart and the monthly / quarterly breakdown. The goal is spread evenly (goal ÷ 12 per month).
  */
-export function GoalTracker({
-  metric,
-  goal,
-  pace,
-  fyLabel,
-  onMetricChange,
-  onGoalChange,
-}: {
-  metric: GoalMetric;
-  goal: number | null;
-  pace: GoalPace | null;
-  fyLabel: string;
-  onMetricChange: (m: GoalMetric) => void;
-  onGoalChange: (v: number | null) => void;
-}) {
+export function GoalTracker({ tracker, id }: { tracker: FiscalTrackerHandle; id?: string }) {
+  const { state, update, pace, goal, fyLabel, status, loadFailed } = tracker;
+  const metric = state.goalMetric;
+  const label = GOAL_METRIC_LABEL[metric];
+  const setGoal = (v: number | null) => update((s) => ({ ...s, targets: { ...s.targets, [targetKeyFor(s.goalMetric)]: v } }));
+
   const lastActual = pace ? pace.months.reduce((acc, m, i) => (m.status === "ACTUAL" ? i : acc), -1) : -1;
   const rows =
     pace?.months.map((m, i) => ({
@@ -41,168 +34,308 @@ export function GoalTracker({
       // Starts at the last logged month so the projected segment continues the actual line without a gap.
       projected: i >= Math.max(0, lastActual) ? m.cumulativeValue : null,
     })) ?? [];
-  const good = pace ? pace.annual.variance >= 0 : true;
-  const Icon = good ? TrendingUp : TrendingDown;
+
+  const disabled = status === "loading" || loadFailed;
 
   return (
-    <div className="rounded-xl border border-indigo-300/20 bg-gradient-to-br from-indigo-500/[0.07] to-transparent p-4">
+    <section id={id} aria-label="Goal Tracker" className="scroll-mt-6 rounded-2xl border border-indigo-300/25 bg-gradient-to-br from-indigo-500/[0.09] via-white/[0.02] to-transparent p-5 shadow-[0_8px_32px_rgba(0,0,0,0.35)] backdrop-blur-xl sm:p-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h3 className="flex items-center gap-2 text-sm font-medium text-slate-100">
-            <Flag className="h-4 w-4 text-indigo-300" /> Year-end goal · {fyLabel}
+          <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-100">
+            <Flag className="h-5 w-5 text-indigo-300" /> Goal Tracker
+            <span className="text-sm font-normal text-slate-400">· {fyLabel}</span>
             <InfoTip label="How pace is measured" align="left">
-              Your goal is spread evenly across the 12 fiscal months (goal ÷ 12). Each month, quarter and the full year compare logged actuals — and the forecast
-              for months not yet logged — against that straight-line path.
+              Your annual goal is spread evenly across the 12 fiscal months (goal ÷ 12, split to the cent). Months you&apos;ve logged use actuals; the rest use the
+              Fiscal Year Tracker&apos;s forecast. Expense budgets count as &ldquo;ahead&rdquo; when you&apos;re under budget.
             </InfoTip>
-          </h3>
-          <p className="mt-0.5 text-xs text-slate-400">Set a target for the fiscal year and see whether you&apos;re ahead or behind, month by month.</p>
+          </h2>
+          <p className="mt-0.5 text-sm text-slate-400">Set a year-end target and see exactly how far ahead or behind you are.</p>
         </div>
-        <div className="flex flex-wrap items-end gap-2">
-          <div role="radiogroup" aria-label="Goal metric" className="inline-flex rounded-lg border border-white/10 p-0.5 text-xs">
-            {(["REVENUE", "NET"] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                role="radio"
-                aria-checked={metric === m}
-                onClick={() => onMetricChange(m)}
-                className={cn("rounded-md px-2.5 py-1.5 font-medium transition", metric === m ? "bg-indigo-500/80 text-white" : "text-slate-400 hover:text-slate-200")}
-              >
-                {METRIC_LABEL[m]}
-              </button>
-            ))}
-          </div>
-          <label className="block w-44">
-            <span className="sr-only">{METRIC_LABEL[metric]} goal for the year</span>
-            <MoneyNumberInput aria-label={`${METRIC_LABEL[metric]} goal for the year`} value={goal} onChange={onGoalChange} placeholder={`Year-end ${METRIC_LABEL[metric].toLowerCase()} goal`} />
-          </label>
-        </div>
+        <TrackerSaveBadge tracker={tracker} />
       </div>
 
-      {!pace ? (
-        <p className="mt-4 rounded-lg border border-dashed border-white/10 px-3 py-4 text-center text-xs text-slate-400">
-          Enter a year-end {METRIC_LABEL[metric].toLowerCase()} goal to see your pace chart and the monthly, quarterly and annual breakdown.
+      {loadFailed ? (
+        <LoadFailed tracker={tracker} />
+      ) : status === "loading" ? (
+        <p className="mt-5 flex items-center gap-2 text-sm text-slate-400">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading your goals…
         </p>
       ) : (
         <>
-          <p className={cn("mt-4 flex items-start gap-2 text-sm font-medium", good ? "text-emerald-200" : "text-rose-200")} role="status">
-            <Icon className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-            <span>
-              {pace.headline.charAt(0).toUpperCase() + pace.headline.slice(1)}.
-            </span>
-          </p>
-
-          <div className="mt-3 grid gap-4 lg:grid-cols-5">
-            <div className="lg:col-span-3">
-              <div className="h-56">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
-                    <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                    <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0]} minTickGap={8} />
-                    <YAxis {...axisProps} width={60} tickFormatter={(v: number) => usdCompact.format(v)} />
-                    <ReferenceLine y={0} stroke="rgba(255,255,255,0.2)" />
-                    <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
-                    <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
-                    <Line name="Goal path" type="linear" dataKey="target" stroke={COLOR.baseline} strokeWidth={2} strokeDasharray="6 4" dot={false} isAnimationActive={false} />
-                    <Line name="Actual" type="linear" dataKey="actual" stroke={COLOR.cash} strokeWidth={2.5} dot={{ r: 3, strokeWidth: 0, fill: COLOR.cash }} connectNulls={false} isAnimationActive={false} />
-                    <Line name="Projected" type="linear" dataKey="projected" stroke={COLOR.cash} strokeOpacity={0.7} strokeWidth={2} strokeDasharray="3 3" dot={false} connectNulls={false} isAnimationActive={false} />
-                  </LineChart>
-                </ResponsiveContainer>
+          {/* Goal type + annual / monthly target */}
+          <div className="mt-5 grid gap-4 lg:grid-cols-[auto_1fr] lg:items-end">
+            <div>
+              <p className="text-xs uppercase tracking-wide text-slate-500">Goal type</p>
+              <div role="radiogroup" aria-label="Goal type" className="mt-1 inline-flex rounded-xl border border-white/10 bg-slate-900/60 p-1 text-sm">
+                {GOAL_METRICS.map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    role="radio"
+                    aria-checked={metric === m}
+                    disabled={disabled}
+                    onClick={() => update((s) => ({ ...s, goalMetric: m }))}
+                    className={cn("rounded-lg px-3 py-1.5 font-medium transition", metric === m ? "bg-indigo-500 text-white shadow" : "text-slate-400 hover:text-slate-200")}
+                  >
+                    {GOAL_METRIC_LABEL[m]}
+                  </button>
+                ))}
               </div>
-              <p className="mt-1 text-[11px] text-slate-500">Cumulative {METRIC_LABEL[metric].toLowerCase()} for the fiscal year. Solid = logged actuals, dotted = forecast for the remaining months.</p>
             </div>
-
-            <div className="space-y-3 lg:col-span-2">
-              <dl className="grid grid-cols-2 gap-2 text-xs">
-                <PaceStat label={`Year-to-date (${pace.ytd.months} mo logged)`} value={pace.ytd.months ? paceWords(pace.ytd.variance) : "—"} tone={pace.ytd.months ? pace.ytd.variance : 0} sub={pace.ytd.months ? `${usd.format(pace.ytd.value)} vs ${usd.format(pace.ytd.target)}` : "Log a month to start"} />
-                <PaceStat label="Full year (projected)" value={paceWords(pace.annual.variance)} tone={pace.annual.variance} sub={`${usd.format(pace.annual.projected)} vs ${usd.format(pace.annual.goal)}`} />
-              </dl>
-              {pace.requiredMonthly != null && (
-                <p className="rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2 text-xs text-slate-300">
-                  To land exactly on the goal you need <span className="font-semibold tabular-nums text-slate-100">{usd.format(pace.requiredMonthly)}</span>/mo for each month not yet logged (goal pace is{" "}
-                  {usd.format(pace.monthlyTarget)}/mo).
-                </p>
-              )}
-              <div>
-                <p className="text-[11px] uppercase tracking-wide text-slate-500">By quarter</p>
-                <ul className="mt-1 grid grid-cols-2 gap-2 text-xs">
-                  {pace.quarters.map((q) => (
-                    <li key={q.label} className="rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-2">
-                      <p className="flex items-center justify-between text-slate-400">
-                        <span className="font-medium text-slate-200">{q.label}</span>
-                        <span className="text-[10px] uppercase">{q.basis === "ACTUAL" ? "Actual" : q.basis === "MIXED" ? "Partly actual" : "Forecast"}</span>
-                      </p>
-                      <p className={cn("mt-0.5 font-semibold tabular-nums", toneCls(q.variance))}>{paceWords(q.variance)}</p>
-                      <p className="text-[10px] text-slate-500">{q.months}</p>
-                    </li>
-                  ))}
-                </ul>
-              </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="block">
+                <span className="text-xs uppercase tracking-wide text-slate-500">Annual {metric === "EXPENSE" ? "budget" : "target"}</span>
+                <MoneyNumberInput aria-label={`Annual ${GOAL_NOUN[metric]}`} value={goal} onChange={setGoal} placeholder={`e.g. ${metric === "REVENUE" ? "250,000.00" : metric === "EXPENSE" ? "180,000.00" : "60,000.00"}`} className="mt-1 text-base font-semibold" />
+              </label>
+              <label className="block">
+                <span className="text-xs uppercase tracking-wide text-slate-500">
+                  Monthly {metric === "EXPENSE" ? "budget" : "target"} <span className="normal-case text-slate-600">(annual ÷ 12)</span>
+                </span>
+                <MoneyNumberInput
+                  aria-label={`Monthly ${GOAL_NOUN[metric]}`}
+                  value={goal != null ? round2(goal / 12) : null}
+                  onChange={(v) => setGoal(v == null ? null : round2(v * 12))}
+                  placeholder="or set it per month"
+                  className="mt-1"
+                />
+              </label>
             </div>
           </div>
+          {metric === "NET" && <p className="mt-2 text-[11px] text-slate-500">Net income = revenue − expenses, actuals for logged months plus the forecast for the rest.</p>}
 
-          <details className="group mt-3 text-xs">
-            <summary className="cursor-pointer select-none text-indigo-300 hover:text-indigo-200">Monthly pace</summary>
-            <div className="mt-2 overflow-x-auto">
-              <table className="w-full min-w-[30rem] tabular-nums">
-                <thead className="text-left text-[11px] uppercase text-slate-500">
-                  <tr>
-                    <th className="py-1.5 font-medium">Month</th>
-                    <th className="py-1.5 text-right font-medium">{METRIC_LABEL[metric]}</th>
-                    <th className="py-1.5 text-right font-medium">Goal pace</th>
-                    <th className="py-1.5 text-right font-medium">Ahead / behind</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5">
-                  {pace.months.map((m) => (
-                    <tr key={m.key}>
-                      <td className="py-1.5 text-slate-300">
-                        {m.label} <span className="text-[10px] uppercase text-slate-500">{m.status === "ACTUAL" ? "actual" : "forecast"}</span>
-                      </td>
-                      <td className="py-1.5 text-right text-slate-200">{usd.format(m.value)}</td>
-                      <td className="py-1.5 text-right text-slate-400">{usd.format(m.target)}</td>
-                      <td className={cn("py-1.5 text-right font-medium", toneCls(m.variance))}>{signedMoney(m.variance)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </details>
+          {!pace ? (
+            <p className="mt-5 rounded-xl border border-dashed border-white/15 px-4 py-5 text-center text-sm text-slate-400">
+              Enter an annual {GOAL_NOUN[metric]} to see your pace, the year-end delta and the month-by-month breakdown.
+            </p>
+          ) : (
+            <>
+              <GoalPaceBanner pace={pace} className="mt-5" />
+              <GoalPaceDetail pace={pace} rows={rows} label={label} />
+            </>
+          )}
         </>
       )}
+    </section>
+  );
+}
+
+/** The prominent year-end delta: "$1,200.00 ahead of annual target", with actuals-to-date and what's still needed. */
+export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { pace: GoalPace; fyLabel?: string; className?: string; compact?: boolean }) {
+  const good = pace.annual.variance >= -0.004;
+  const Icon = good ? TrendingUp : TrendingDown;
+  const expense = pace.metric === "EXPENSE";
+  const label = GOAL_METRIC_LABEL[pace.metric];
+  const progress = pace.goal !== 0 ? Math.max(0, Math.min(1, pace.ytd.value / pace.goal)) : 0;
+  const remainingMonths = 12 - pace.ytd.months;
+  return (
+    <div
+      role="status"
+      className={cn(
+        "rounded-xl border px-4 py-3",
+        good ? "border-emerald-300/30 bg-emerald-500/[0.08]" : "border-rose-300/30 bg-rose-500/[0.08]",
+        className,
+      )}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
+        <p className={cn("flex items-center gap-2 font-semibold tabular-nums", compact ? "text-base" : "text-xl", good ? "text-emerald-100" : "text-rose-100")}>
+          <Icon className={cn("shrink-0", compact ? "h-4 w-4" : "h-5 w-5")} aria-hidden />
+          {annualDeltaWords(pace)}
+        </p>
+        <p className="text-xs text-slate-400">
+          {label} {expense ? "budget" : "goal"} {exactMoney(pace.goal)}
+          {fyLabel ? ` · ${fyLabel}` : ""} · projected {exactMoney(pace.annual.projected)}
+        </p>
+      </div>
+      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/10" aria-hidden>
+        <div className={cn("h-full rounded-full", good ? "bg-emerald-400/80" : "bg-rose-400/80")} style={{ width: `${progress * 100}%` }} />
+      </div>
+      <p className="mt-2 text-xs text-slate-300">
+        {pace.ytd.months > 0 ? (
+          <>
+            Actuals so far: <span className="font-medium tabular-nums text-slate-100">{exactMoney(pace.ytd.value)}</span> over {pace.ytd.months} logged month
+            {pace.ytd.months === 1 ? "" : "s"} vs {exactMoney(pace.ytd.target)} goal pace (<span className={toneCls(pace.ytd.variance)}>{paceWords(pace.ytd.variance, pace.metric)}</span>).{" "}
+          </>
+        ) : (
+          <>No months logged yet — this is based on your forecast. Log actuals in the Fiscal Year Tracker to track real pace. </>
+        )}
+        {pace.requiredMonthly != null && (
+          <>
+            {expense ? (
+              <>
+                {exactMoney(Math.max(0, pace.remainingToGoal))} of budget left: up to <span className="font-medium tabular-nums text-slate-100">{exactMoney(Math.max(0, pace.requiredMonthly))}/mo</span>{" "}
+                for the remaining {remainingMonths} month{remainingMonths === 1 ? "" : "s"}.
+              </>
+            ) : (
+              <>
+                {exactMoney(pace.remainingToGoal)} to go: <span className="font-medium tabular-nums text-slate-100">{exactMoney(pace.requiredMonthly)}/mo</span> needed for the remaining{" "}
+                {remainingMonths} month{remainingMonths === 1 ? "" : "s"}.
+              </>
+            )}
+          </>
+        )}
+      </p>
     </div>
   );
 }
 
-function PaceStat({ label, value, tone, sub }: { label: string; value: string; tone: number; sub: string }) {
+function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: string; target: number; actual: number | null; projected: number | null }[]; label: string }) {
   return (
-    <div className="rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-2">
-      <dt className="text-[11px] text-slate-500">{label}</dt>
-      <dd className={cn("mt-0.5 text-sm font-semibold tabular-nums", toneCls(tone))}>{value}</dd>
-      <dd className="text-[10px] tabular-nums text-slate-500">{sub}</dd>
+    <>
+      <div className="mt-4 grid gap-4 lg:grid-cols-5">
+        <div className="lg:col-span-3">
+          <div className="h-56">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
+                <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0]} minTickGap={8} />
+                <YAxis {...axisProps} width={60} tickFormatter={(v: number) => usdCompact.format(v)} />
+                <ReferenceLine y={0} stroke="rgba(255,255,255,0.2)" />
+                <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
+                <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
+                <Line name={pace.metric === "EXPENSE" ? "Budget path" : "Goal path"} type="linear" dataKey="target" stroke={COLOR.baseline} strokeWidth={2} strokeDasharray="6 4" dot={false} isAnimationActive={false} />
+                <Line name="Actual" type="linear" dataKey="actual" stroke={COLOR.cash} strokeWidth={2.5} dot={{ r: 3, strokeWidth: 0, fill: COLOR.cash }} connectNulls={false} isAnimationActive={false} />
+                <Line name="Projected" type="linear" dataKey="projected" stroke={COLOR.cash} strokeOpacity={0.7} strokeWidth={2} strokeDasharray="3 3" dot={false} connectNulls={false} isAnimationActive={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="mt-1 text-[11px] text-slate-500">Cumulative {label.toLowerCase()} for the fiscal year. Solid = logged actuals, dotted = forecast for the remaining months.</p>
+        </div>
+
+        <div className="lg:col-span-2">
+          <p className="text-[11px] uppercase tracking-wide text-slate-500">By quarter</p>
+          <ul className="mt-1 grid grid-cols-2 gap-2 text-xs">
+            {pace.quarters.map((q) => (
+              <li key={q.label} className="rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-2">
+                <p className="flex items-center justify-between text-slate-400">
+                  <span className="font-medium text-slate-200">{q.label}</span>
+                  <span className="text-[10px] uppercase">{q.basis === "ACTUAL" ? "Actual" : q.basis === "MIXED" ? "Partly actual" : "Forecast"}</span>
+                </p>
+                <p className={cn("mt-0.5 font-semibold tabular-nums", toneCls(q.variance))}>{paceWords(q.variance, pace.metric)}</p>
+                <p className="text-[10px] tabular-nums text-slate-500">
+                  {exactMoney(q.value)} vs {exactMoney(q.target)}
+                </p>
+                <p className="text-[10px] text-slate-500">{q.months}</p>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+
+      <details className="group mt-3 text-xs">
+        <summary className="cursor-pointer select-none text-indigo-300 hover:text-indigo-200">Monthly pace</summary>
+        <div className="mt-2 overflow-x-auto overscroll-x-contain">
+          <table className="w-full min-w-[30rem] tabular-nums">
+            <thead className="text-left text-[11px] uppercase text-slate-500">
+              <tr>
+                <th className="py-1.5 font-medium">Month</th>
+                <th className="py-1.5 text-right font-medium">{label}</th>
+                <th className="py-1.5 text-right font-medium">{pace.metric === "EXPENSE" ? "Budget" : "Goal pace"}</th>
+                <th className="py-1.5 text-right font-medium">{pace.metric === "EXPENSE" ? "Under / over" : "Ahead / behind"}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/5">
+              {pace.months.map((m) => (
+                <tr key={m.key}>
+                  <td className="py-1.5 text-slate-300">
+                    {m.label} <span className="text-[10px] uppercase text-slate-500">{m.status === "ACTUAL" ? "actual" : "forecast"}</span>
+                  </td>
+                  <td className="py-1.5 text-right text-slate-200">{exactMoney(m.value)}</td>
+                  <td className="py-1.5 text-right text-slate-400">{exactMoney(m.target)}</td>
+                  <td className={cn("py-1.5 text-right font-medium", toneCls(m.variance))}>{signedMoney(m.variance)}</td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot className="border-t border-white/10 font-medium">
+              <tr>
+                <td className="py-1.5 text-slate-300">Full year</td>
+                <td className="py-1.5 text-right">{exactMoney(pace.annual.projected)}</td>
+                <td className="py-1.5 text-right text-slate-400">{exactMoney(pace.goal)}</td>
+                <td className={cn("py-1.5 text-right", toneCls(pace.annual.variance))}>{signedMoney(pace.annual.variance)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      </details>
+    </>
+  );
+}
+
+function LoadFailed({ tracker }: { tracker: FiscalTrackerHandle }) {
+  return (
+    <div role="alert" className="mt-5 flex flex-wrap items-center gap-3 rounded-xl border border-rose-300/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+      <span className="flex-1">{tracker.error ?? "Couldn't load your tracker."} Your saved numbers are safe — nothing is overwritten until it loads.</span>
+      <button type="button" onClick={tracker.retry} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200/30 px-3 py-1.5 text-xs hover:bg-rose-400/10">
+        <RotateCw className="h-3.5 w-3.5" /> Retry
+      </button>
     </div>
   );
+}
+
+const SAVE_TEXT: Record<SaveStatus, string> = { idle: "", loading: "Loading…", saving: "Saving…", saved: "Saved", error: "" };
+
+/** Save state for the tracker (shared by the Goal Tracker and the Fiscal Year Tracker). */
+export function TrackerSaveBadge({ tracker }: { tracker: FiscalTrackerHandle }) {
+  const { status, error, workspaceId, loadFailed } = tracker;
+  if (status === "error" && !loadFailed)
+    return (
+      <p className="flex max-w-xs items-center gap-2 text-right text-xs text-rose-300" role="alert">
+        {error ?? "Couldn't save."}
+        <button type="button" onClick={tracker.retry} className="shrink-0 rounded-md border border-rose-300/30 px-2 py-0.5 text-rose-100 hover:bg-rose-400/10">
+          Retry
+        </button>
+      </p>
+    );
+  if (loadFailed) return null;
+  return (
+    <p className="inline-flex items-center gap-1.5 text-xs text-slate-500" role="status">
+      {status === "saving" || status === "loading" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : status === "saved" ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-300" /> : <Cloud className="h-3.5 w-3.5" />}
+      {SAVE_TEXT[status] || (workspaceId ? "Saved to this workspace" : "Saved on this device — create a workspace to sync")}
+      {status === "saved" && workspaceId ? " to this workspace" : ""}
+    </p>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Executive report (light paper)
+// ---------------------------------------------------------------------------
+
+/** Prominent pace summary for the top of the executive PDF. */
+export function goalPaceBannerHtml(pace: GoalPace, fyLabel: string, esc: (s: string) => string): string {
+  const good = pace.annual.variance >= -0.004;
+  const label = GOAL_METRIC_LABEL[pace.metric];
+  const expense = pace.metric === "EXPENSE";
+  const ytd =
+    pace.ytd.months > 0
+      ? `Actuals so far: <b>${exactMoney(pace.ytd.value)}</b> over ${pace.ytd.months} logged month${pace.ytd.months === 1 ? "" : "s"} vs ${exactMoney(pace.ytd.target)} goal pace (${esc(paceWords(pace.ytd.variance, pace.metric))}).`
+      : "No months logged yet — based on the tracker forecast.";
+  const need =
+    pace.requiredMonthly == null
+      ? ""
+      : expense
+        ? ` ${exactMoney(Math.max(0, pace.remainingToGoal))} of budget left (up to ${exactMoney(Math.max(0, pace.requiredMonthly))}/mo).`
+        : ` ${exactMoney(pace.remainingToGoal)} to go (${exactMoney(pace.requiredMonthly)}/mo needed).`;
+  return `<div class="pace-banner ${good ? "pace-good" : "pace-bad"}">
+<div class="pace-head">${esc(annualDeltaWords(pace))}</div>
+<div class="muted">${esc(label)} ${expense ? "budget" : "goal"} ${exactMoney(pace.goal)} · ${esc(fyLabel)} · projected year-end ${exactMoney(pace.annual.projected)}</div>
+<div style="margin-top:4px">${ytd}${need}</div>
+</div>`;
 }
 
 /** Printable (light paper) pace section for the executive report. */
 export function goalPaceReportHtml(pace: GoalPace, fyLabel: string, esc: (s: string) => string): string {
-  const cls = (v: number) => (Math.abs(v) < 0.5 ? "" : v > 0 ? "pos" : "neg");
-  const metric = METRIC_LABEL[pace.metric];
+  const cls = (v: number) => (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg");
+  const metric = GOAL_METRIC_LABEL[pace.metric];
+  const words = (v: number) => esc(paceWords(v, pace.metric));
   const q = pace.quarters
-    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">(${esc(x.months)} · ${x.basis === "ACTUAL" ? "actual" : x.basis === "MIXED" ? "partly actual" : "forecast"})</span></td><td>${usd.format(x.value)}</td><td>${usd.format(x.target)}</td><td class="${cls(x.variance)}">${esc(paceWords(x.variance))}</td></tr>`)
+    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">(${esc(x.months)} · ${x.basis === "ACTUAL" ? "actual" : x.basis === "MIXED" ? "partly actual" : "forecast"})</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${words(x.variance)}</td></tr>`)
     .join("");
   const m = pace.months
-    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">${x.status === "ACTUAL" ? "actual" : "forecast"}</span></td><td>${usd.format(x.value)}</td><td>${usd.format(x.target)}</td><td class="${cls(x.variance)}">${esc(signedMoney(x.variance))}</td></tr>`)
+    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">${x.status === "ACTUAL" ? "actual" : "forecast"}</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${esc(signedMoney(x.variance))}</td></tr>`)
     .join("");
-  return `<h2>Goal pace · ${esc(fyLabel)}</h2>
-<p><strong>${esc(metric)} goal: ${usd.format(pace.goal)}</strong> (${usd.format(pace.monthlyTarget)}/mo straight-line). ${esc(pace.headline.charAt(0).toUpperCase() + pace.headline.slice(1))}.</p>
-<div class="kpis" style="grid-template-columns:repeat(3,1fr)">
-<div class="kpi">Year-to-date (${pace.ytd.months} mo logged)<b class="${cls(pace.ytd.variance)}">${pace.ytd.months ? esc(paceWords(pace.ytd.variance)) : "—"}</b></div>
-<div class="kpi">Full year (projected)<b class="${cls(pace.annual.variance)}">${esc(paceWords(pace.annual.variance))}</b><span class="muted">${usd.format(pace.annual.projected)} vs ${usd.format(pace.annual.goal)}</span></div>
-<div class="kpi">Needed per remaining month<b>${pace.requiredMonthly != null ? usd.format(pace.requiredMonthly) : "—"}</b></div>
-</div>
+  return `<h2>Goal pace detail · ${esc(fyLabel)}</h2>
+<p><strong>${esc(metric)} ${pace.metric === "EXPENSE" ? "budget" : "goal"}: ${exactMoney(pace.goal)}</strong> (${exactMoney(pace.monthlyTarget)}/mo straight-line). ${esc(pace.headline.charAt(0).toUpperCase() + pace.headline.slice(1))}.</p>
 <h3 style="font-size:14px;margin:16px 0 6px">Quarterly pace</h3>
-<table><thead><tr><th>Quarter</th><th>${esc(metric)}</th><th>Goal</th><th>Ahead / behind</th></tr></thead><tbody>${q}</tbody></table>
+<table><thead><tr><th>Quarter</th><th>${esc(metric)}</th><th>${pace.metric === "EXPENSE" ? "Budget" : "Goal"}</th><th>${pace.metric === "EXPENSE" ? "Under / over" : "Ahead / behind"}</th></tr></thead><tbody>${q}</tbody></table>
 <h3 style="font-size:14px;margin:16px 0 6px">Monthly pace</h3>
-<table><thead><tr><th>Month</th><th>${esc(metric)}</th><th>Goal pace</th><th>Ahead / behind</th></tr></thead><tbody>${m}</tbody></table>`;
+<table><thead><tr><th>Month</th><th>${esc(metric)}</th><th>${pace.metric === "EXPENSE" ? "Budget" : "Goal pace"}</th><th>${pace.metric === "EXPENSE" ? "Under / over" : "Ahead / behind"}</th></tr></thead><tbody>${m}</tbody></table>`;
 }

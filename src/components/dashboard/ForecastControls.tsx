@@ -1,7 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import { CalendarRange } from "lucide-react";
-import { DEFAULT_INFLATION_RATE, HORIZON_OPTIONS, MONTH_NAMES, monthKey, resolveForecastStart, type ForecastSettings, type ForecastStartMode } from "@/lib/schemas";
+import { HORIZON_OPTIONS, MONTH_NAMES, effectiveInflationRate, monthKey, resolveForecastStart, type CpiReading, type ForecastSettings, type ForecastStartMode } from "@/lib/schemas";
 import { InfoTip } from "@/components/InfoTip";
 import { cn, inputCls, pct } from "@/components/ui";
 
@@ -14,18 +15,20 @@ const START_LABELS: Record<ForecastStartMode, string> = {
 
 const RANGE_FMT = new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric", timeZone: "UTC" });
 
-/** Projection start month + horizon quick-selects. Shared by the baseline projection and scenario forecasting. */
+/** Projection start month + horizon quick-selects, plus the seasonality / inflation switches and the inflation rate source. */
 export function ForecastControls({
   settings,
   onChange,
   className,
-  inflationRate = DEFAULT_INFLATION_RATE,
+  cpi,
 }: {
   settings: ForecastSettings;
   onChange: (s: ForecastSettings) => void;
   className?: string;
-  inflationRate?: number;
+  /** Latest live CPI reading (null while loading). */
+  cpi: CpiReading | null;
 }) {
+  const rate = effectiveInflationRate(settings, cpi);
   const start = resolveForecastStart(settings);
   const end = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + settings.months - 1, 1));
   const set = (patch: Partial<ForecastSettings>) => onChange({ ...settings, ...patch });
@@ -85,38 +88,112 @@ export function ForecastControls({
       <span className="text-slate-500 tabular-nums">
         {RANGE_FMT.format(start)} – {RANGE_FMT.format(end)}
       </span>
-      <span className="ml-auto inline-flex flex-wrap items-center gap-1.5">
-        <MacroToggle label="Seasonality" on={settings.seasonality} onChange={(seasonality) => set({ seasonality })} title="Reshape months with your business type's typical seasonal curve (annual total unchanged)" />
-        <MacroToggle
-          label={`Inflation ${pct(inflationRate)}`}
+      <div className="flex w-full flex-wrap items-center gap-2 border-t border-white/5 pt-2">
+        <StatusSwitch label="Seasonality" on={settings.seasonality} onChange={(seasonality) => set({ seasonality })} title="Reshape months with your business type's typical seasonal curve (annual total unchanged)" />
+        <StatusSwitch
+          label="Inflation"
+          detail={settings.inflation ? `${pct(rate)}/yr` : undefined}
           on={settings.inflation}
           onChange={(inflation) => set({ inflation })}
-          title={`Compound ${pct(inflationRate)}/yr inflation on costs (partly passed through to revenue)`}
+          title={`Compound ${pct(rate)}/yr inflation on costs (partly passed through to revenue)`}
         />
+        {settings.inflation && (
+          <div className="inline-flex flex-wrap items-center gap-1.5">
+            <div role="radiogroup" aria-label="Inflation rate source" className="inline-flex rounded-lg border border-white/10 p-0.5">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={settings.inflationSource === "CPI"}
+                onClick={() => set({ inflationSource: "CPI" })}
+                title={cpi?.live ? `Latest year-over-year CPI-U from the U.S. Bureau of Labor Statistics (${cpi.period})` : "Live CPI unavailable right now — using the default assumption"}
+                className={cn("rounded-md px-2.5 py-1 font-medium transition", settings.inflationSource === "CPI" ? "bg-indigo-500/80 text-white" : "text-slate-400 hover:text-slate-200")}
+              >
+                {cpi === null ? "Live CPI…" : cpi.live ? `Live CPI ${pct(cpi.rate)} · ${cpi.period}` : `CPI unavailable · ${pct(cpi.rate)} default`}
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={settings.inflationSource === "CUSTOM"}
+                onClick={() => set({ inflationSource: "CUSTOM" })}
+                title="Set your own rate, e.g. for rent growth or a niche cost index"
+                className={cn("rounded-md px-2.5 py-1 font-medium transition", settings.inflationSource === "CUSTOM" ? "bg-amber-500/80 text-white" : "text-slate-400 hover:text-slate-200")}
+              >
+                Custom rate
+              </button>
+            </div>
+            {settings.inflationSource === "CUSTOM" && <RateInput value={settings.customInflationRate} onChange={(customInflationRate) => set({ customInflationRate })} />}
+          </div>
+        )}
         <InfoTip label="Flat by default">
-          Projections repeat your monthly inputs exactly — $4,100/mo stays $4,100 every month. Turn on Seasonality or Inflation only if you want those adjustments layered on top.
+          Projections repeat your monthly inputs exactly — $4,100/mo stays $4,100 every month. Turn on Seasonality or Inflation only if you want those adjustments layered on top. Inflation
+          defaults to the latest live CPI reading; choose Custom rate for real estate or niche projections (e.g. 5% rent growth).
         </InfoTip>
-      </span>
+      </div>
     </div>
   );
 }
 
-function MacroToggle({ label, on, onChange, title }: { label: string; on: boolean; onChange: (v: boolean) => void; title: string }) {
+/** Annual % input bound to a rate (0.05 = 5%). Keeps the typed text while it round-trips. */
+function RateInput({ value, onChange }: { value: number; onChange: (rate: number) => void }) {
+  const fmt = (r: number) => String(Math.round(r * 10000) / 100);
+  const [text, setText] = useState(fmt(value));
+  const [synced, setSynced] = useState(value);
+  if (value !== synced) {
+    setSynced(value);
+    setText(fmt(value));
+  }
+  return (
+    <label className="relative inline-flex items-center">
+      <span className="sr-only">Custom annual inflation rate (percent)</span>
+      <input
+        type="text"
+        inputMode="decimal"
+        value={text}
+        onChange={(e) => {
+          const neg = e.target.value.trim().startsWith("-");
+          const [w, ...rest] = e.target.value.replace(/[^\d.]/g, "").split(".");
+          const t = `${neg ? "-" : ""}${rest.length ? `${w || "0"}.${rest.join("").slice(0, 2)}` : w}`;
+          setText(t);
+          const n = Number(t);
+          if (t !== "" && t !== "-" && Number.isFinite(n)) {
+            const rate = Math.min(50, Math.max(-10, n)) / 100;
+            setSynced(rate);
+            onChange(rate);
+          }
+        }}
+        className={cn(inputCls, "w-20 border-amber-300/40 py-1 pr-6 text-xs tabular-nums")}
+      />
+      <span aria-hidden className="pointer-events-none absolute right-2 text-xs text-slate-500">
+        %/yr
+      </span>
+    </label>
+  );
+}
+
+/**
+ * On/off switch with an explicit ON / OFF label, colored track and knob, so its state is unmistakable at a glance.
+ * Shared by the projection controls and the Fiscal Year Tracker.
+ */
+export function StatusSwitch({ label, detail, on, onChange, title }: { label: string; detail?: string; on: boolean; onChange: (v: boolean) => void; title: string }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={on}
+      aria-label={`${label}: ${on ? "on" : "off"}`}
       title={title}
       onClick={() => onChange(!on)}
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-medium transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300",
-        on ? "border-indigo-300/50 bg-indigo-500/20 text-indigo-100" : "border-white/10 text-slate-400 hover:text-slate-200",
+        "inline-flex items-center gap-2 rounded-full border py-1 pl-1.5 pr-2.5 text-xs font-medium transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300",
+        on ? "border-emerald-300/50 bg-emerald-500/15 text-emerald-50" : "border-white/15 bg-slate-900/60 text-slate-400 hover:text-slate-200",
       )}
     >
-      <span aria-hidden className={cn("h-1.5 w-1.5 rounded-full", on ? "bg-indigo-300" : "bg-slate-600")} />
+      <span aria-hidden className={cn("relative h-4 w-7 shrink-0 rounded-full transition", on ? "bg-emerald-400" : "bg-slate-700")}>
+        <span className={cn("absolute top-0.5 h-3 w-3 rounded-full bg-white shadow transition-all", on ? "left-3.5" : "left-0.5")} />
+      </span>
       {label}
-      <span className="sr-only">{on ? "on" : "off"}</span>
+      {detail && <span className="tabular-nums text-emerald-200/90">{detail}</span>}
+      <span aria-hidden className={cn("rounded px-1 py-px text-[10px] font-bold tracking-wide", on ? "bg-emerald-400/25 text-emerald-100" : "bg-white/5 text-slate-500")}>{on ? "ON" : "OFF"}</span>
     </button>
   );
 }

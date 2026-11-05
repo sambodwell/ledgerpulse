@@ -313,10 +313,14 @@ export async function deleteScenario(id: string) {
 // Fiscal Year Tracker (one row per workspace; monthly totals only)
 // ---------------------------------------------------------------------------
 
-export async function loadFiscalTracker(workspaceId: string): Promise<unknown | null> {
-  const { data, error } = await requireClient().from("fiscal_trackers").select("state").eq("workspace_id", workspaceId).maybeSingle<{ state: unknown }>();
+export async function loadFiscalTracker(workspaceId: string): Promise<{ state: unknown; updatedAt: string | null } | null> {
+  const { data, error } = await requireClient()
+    .from("fiscal_trackers")
+    .select("state,updated_at")
+    .eq("workspace_id", workspaceId)
+    .maybeSingle<{ state: unknown; updated_at: string | null }>();
   if (error) throw new Error(error.message);
-  return data?.state ?? null;
+  return data ? { state: data.state, updatedAt: data.updated_at } : null;
 }
 
 export async function saveFiscalTracker(workspaceId: string, state: unknown): Promise<void> {

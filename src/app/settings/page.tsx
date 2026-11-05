@@ -13,7 +13,7 @@ import {
   type PlanCategory,
   type WorkspaceProfile,
 } from "@/lib/schemas";
-import { authHeaders, createWorkspace, deleteWorkspace, updatePlanCategory, updateWorkspace } from "@/lib/supabase";
+import { authHeaders, createWorkspace, updatePlanCategory, updateWorkspace } from "@/lib/supabase";
 import { useApp } from "@/components/AppProvider";
 import { ProfileMenu, TierBadge } from "@/components/ProfileMenu";
 import { PlanCard } from "@/components/PlanCard";
@@ -229,7 +229,7 @@ function SubscriptionCard() {
 }
 
 function WorkspacesCard() {
-  const { workspaces, activeWorkspace, refreshWorkspaces, setActiveWorkspaceId } = useApp();
+  const { workspaces, activeWorkspace, refreshWorkspaces, setActiveWorkspaceId, removeWorkspace } = useApp();
   const [name, setName] = useState("");
   const [type, setType] = useState<BusinessType>("REAL_ESTATE");
   const [busy, setBusy] = useState(false);
@@ -261,7 +261,7 @@ function WorkspacesCard() {
       <ul className="mt-4 divide-y divide-white/5">
         {workspaces.length === 0 && <li className="py-3 text-sm text-slate-500">No workspaces yet — add your first below.</li>}
         {workspaces.map((w) => (
-          <WorkspaceRow key={w.id} ws={w} active={activeWorkspace?.id === w.id} onChanged={refreshWorkspaces} onActivate={() => setActiveWorkspaceId(w.id)} />
+          <WorkspaceRow key={w.id} ws={w} active={activeWorkspace?.id === w.id} onChanged={refreshWorkspaces} onDelete={() => removeWorkspace(w.id)} onActivate={() => setActiveWorkspaceId(w.id)} />
         ))}
       </ul>
 
@@ -283,7 +283,19 @@ function WorkspacesCard() {
   );
 }
 
-function WorkspaceRow({ ws, active, onChanged, onActivate }: { ws: WorkspaceProfile; active: boolean; onChanged: () => Promise<unknown>; onActivate: () => void }) {
+function WorkspaceRow({
+  ws,
+  active,
+  onChanged,
+  onDelete,
+  onActivate,
+}: {
+  ws: WorkspaceProfile;
+  active: boolean;
+  onChanged: () => Promise<unknown>;
+  onDelete: () => Promise<void>;
+  onActivate: () => void;
+}) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(ws.name);
   const [type, setType] = useState<BusinessType>(ws.businessType);
@@ -344,7 +356,7 @@ function WorkspaceRow({ ws, active, onChanged, onActivate }: { ws: WorkspaceProf
             <Pencil className="h-4 w-4" />
           </button>
           <button
-            onClick={() => window.confirm(`Delete "${ws.name}" and its saved scenarios?`) && run(() => deleteWorkspace(ws.id))}
+            onClick={() => window.confirm(`Permanently delete "${ws.name}"? Its Fiscal Year Tracker (monthly actuals, goals, savings) and saved scenarios are deleted too. This can't be undone.`) && run(onDelete)}
             aria-label={`Delete ${ws.name}`}
             disabled={busy}
             className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-rose-300"

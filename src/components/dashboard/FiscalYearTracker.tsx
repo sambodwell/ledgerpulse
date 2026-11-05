@@ -1,47 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Cloud, Loader2, PiggyBank, Plus, Target, Trash2, TrendingDown, TrendingUp, Upload } from "lucide-react";
-import { MONTH_NAMES, isExtractedLineItems, monthKey, splitTotals, sum, round2, type BusinessType, type FinancialAnalysis } from "@/lib/schemas";
-import {
-  currentFiscalYearStart,
-  defaultTrackerState,
-  fiscalYearLabel,
-  goalPace,
-  normalizeTrackerState,
-  summarizeFiscalYear,
-  type FiscalTrackerState,
-  type GoalPace,
-  type MonthActual,
-  type PaceResult,
-} from "@/lib/fiscal";
-import { authHeaders, loadFiscalTracker, saveFiscalTracker } from "@/lib/supabase";
-import { useApp } from "@/components/AppProvider";
+import { CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Loader2, PiggyBank, Plus, Repeat1, RotateCw, Trash2, Upload } from "lucide-react";
+import { MONTH_NAMES, isExtractedLineItems, monthKey, splitTotals, type FinancialAnalysis } from "@/lib/schemas";
+import { currentFiscalYearStart, exactMoney, fiscalYearLabel, oneTimeOf, subMoney, sumMoney, summarizeFiscalYear, type FiscalTrackerState, type GoalPace, type MonthActual } from "@/lib/fiscal";
+import { authHeaders } from "@/lib/supabase";
 import { InfoTip } from "@/components/InfoTip";
 import { ChartTooltip, COLOR, axisProps, signedUsd } from "@/components/dashboard/chartKit";
-import { GoalTracker } from "@/components/dashboard/GoalTracker";
+import { TrackerSaveBadge } from "@/components/dashboard/GoalTracker";
 import { MoneyNumberInput } from "@/components/dashboard/MoneyInput";
-import { cn, errorMessage, glass, inputCls, secondaryBtn, usd, usdCompact } from "@/components/ui";
+import { StatusSwitch } from "@/components/dashboard/ForecastControls";
+import type { FiscalTrackerHandle } from "@/components/dashboard/useFiscalTracker";
+import { cn, errorMessage, glass, inputCls, secondaryBtn, usdCompact } from "@/components/ui";
+
+export { clearLocalTracker, readLocalTracker } from "@/components/dashboard/useFiscalTracker";
 
 const FORECAST_FILL = "rgba(25,158,112,0.35)";
-
-type SaveStatus = "idle" | "loading" | "saving" | "saved" | "error";
-
-const localKey = (userId: string) => `lp:fiscalTracker:${userId}:guest`;
-
-/** The device-only tracker used before a workspace exists (moved into the workspace when one is saved). */
-export function readLocalTracker(userId: string): unknown {
-  return readLocal(userId);
-}
-
-export function clearLocalTracker(userId: string) {
-  try {
-    window.localStorage.removeItem(localKey(userId));
-  } catch {
-    /* ignore */
-  }
-}
 
 /** Goal pace + label, reported up so the executive PDF can include it. */
 export interface GoalReport {
@@ -49,114 +24,22 @@ export interface GoalReport {
   fyLabel: string;
 }
 
-function readLocal(userId: string): unknown {
-  try {
-    const raw = window.localStorage.getItem(localKey(userId));
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeLocal(userId: string, state: FiscalTrackerState) {
-  try {
-    window.localStorage.setItem(localKey(userId), JSON.stringify(state));
-  } catch {
-    /* storage unavailable: the tracker still works for this session */
-  }
-}
-
 /**
  * Fiscal Year Tracker: set the fiscal year, log (or import) each month's actuals as it closes, re-forecast the rest
- * of the year from trailing averages or the original plan, and track pace against targets and captured savings.
+ * of the year from trailing averages or the original plan, and track captured savings. State, loading and autosave
+ * live in `useFiscalTracker` (shared with the Goal Tracker at the top of the dashboard).
  */
-export function FiscalYearTracker({
-  userId,
-  workspaceId,
-  businessType,
-  analysis,
-  onGoalReport,
-}: {
-  userId: string;
-  workspaceId: string | null;
-  businessType: BusinessType;
-  analysis: FinancialAnalysis | null;
-  onGoalReport?: (r: GoalReport | null) => void;
-}) {
-  const [state, setState] = useState<FiscalTrackerState>(() => defaultTrackerState(businessType));
-  const [status, setStatus] = useState<SaveStatus>("loading");
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const dirty = useRef(false);
-
-  // Load once per workspace.
-  useEffect(() => {
-    let cancelled = false;
-    dirty.current = false;
-    (async () => {
-      setStatus("loading");
-      try {
-        const raw = workspaceId ? await loadFiscalTracker(workspaceId) : readLocal(userId);
-        if (cancelled) return;
-        const s = raw ? normalizeTrackerState(raw, businessType) : defaultTrackerState(businessType);
-        if (!raw) s.fyStartYear = currentFiscalYearStart(s.fyStartMonth);
-        setState(s);
-        setStatus("idle");
-      } catch (e) {
-        if (cancelled) return;
-        setState(defaultTrackerState(businessType));
-        setSaveError(e instanceof Error ? e.message : "Couldn't load your tracker.");
-        setStatus("error");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [workspaceId, userId, businessType]);
-
-  // Debounced autosave after the owner changes something.
-  useEffect(() => {
-    if (!dirty.current) return;
-    const t = setTimeout(async () => {
-      setStatus("saving");
-      setSaveError(null);
-      try {
-        if (workspaceId) await saveFiscalTracker(workspaceId, state);
-        else writeLocal(userId, state);
-        setStatus("saved");
-      } catch (e) {
-        setSaveError(e instanceof Error ? e.message : "Couldn't save.");
-        setStatus("error");
-      }
-    }, 800);
-    return () => clearTimeout(t);
-  }, [state, workspaceId, userId]);
-
-  const update = useCallback((fn: (s: FiscalTrackerState) => FiscalTrackerState) => {
-    dirty.current = true;
-    setState(fn);
-  }, []);
-
-  const summary = useMemo(() => summarizeFiscalYear(state), [state]);
+export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTrackerHandle; analysis: FinancialAnalysis | null; id?: string }) {
+  const { state, update, summary, status, loadFailed } = tracker;
   const currentKey = monthKey(new Date());
-  const goal = state.goalMetric === "NET" ? state.targets.net : state.targets.revenue;
-  const pace = useMemo(() => goalPace(summary, state.goalMetric, goal), [summary, state.goalMetric, goal]);
-  const fyLabel = fiscalYearLabel(state);
-
-  // Report goal pace up for the executive PDF, and share non-financial tracker state with the chat assistant.
-  useEffect(() => {
-    onGoalReport?.(pace && status !== "loading" ? { pace, fyLabel } : null);
-  }, [pace, fyLabel, status, onGoalReport]);
-  const { setUiHints } = useApp();
-  useEffect(() => {
-    setUiHints({ trackerForecastMode: state.forecastMode, goalMetric: goal != null ? state.goalMetric : null });
-  }, [state.forecastMode, state.goalMetric, goal, setUiHints]);
 
   const setActual = (key: string, field: keyof MonthActual, v: number | null) =>
     update((s) => {
       const actuals = { ...s.actuals };
       const prev = actuals[key];
-      const next = { revenue: prev?.revenue ?? 0, expenses: prev?.expenses ?? 0, [field]: v ?? 0 };
-      if (v == null && !(field === "revenue" ? prev?.expenses : prev?.revenue)) delete actuals[key];
+      const next: MonthActual = { revenue: prev?.revenue ?? 0, expenses: prev?.expenses ?? 0, ...(prev?.oneTimeExpenses ? { oneTimeExpenses: prev.oneTimeExpenses } : {}), [field]: v ?? 0 };
+      if (!next.oneTimeExpenses) delete next.oneTimeExpenses;
+      if (!next.revenue && !next.expenses && !next.oneTimeExpenses && v == null) delete actuals[key];
       else actuals[key] = next;
       return { ...s, actuals };
     });
@@ -168,16 +51,19 @@ export function FiscalYearTracker({
       return { ...s, actuals };
     });
 
-  // Statement import for one month: reuse the extract endpoint, then total every line (actuals include one-time items).
+  // Statement import for one month: reuse the extract endpoint and total every line to the cent. One-time
+  // expenses are recorded separately so they don't skew the trailing average.
   const fileRef = useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [importNote, setImportNote] = useState<string | null>(null);
   const importFor = useRef<string | null>(null);
   const importStatement = async (file: File) => {
     const key = importFor.current;
     if (!key) return;
     setImporting(key);
     setImportError(null);
+    setImportNote(null);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -187,9 +73,11 @@ export function FiscalYearTracker({
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = (await res.json()) as { items?: unknown };
       if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response.");
-      const revenue = round2(sum(data.items.revenue, (r) => r.amount));
-      const expenses = round2(sum(data.items.expenses, (e) => e.amount));
-      update((s) => ({ ...s, actuals: { ...s.actuals, [key]: { revenue, expenses } } }));
+      const revenue = sumMoney(data.items.revenue, (r) => r.amount);
+      const expenses = sumMoney(data.items.expenses, (e) => e.amount);
+      const oneTimeExpenses = sumMoney(data.items.expenses.filter((e) => e.oneTime), (e) => e.amount);
+      update((s) => ({ ...s, actuals: { ...s.actuals, [key]: { revenue, expenses, ...(oneTimeExpenses > 0 ? { oneTimeExpenses } : {}) } } }));
+      if (oneTimeExpenses > 0) setImportNote(`${exactMoney(oneTimeExpenses)} of one-time expenses found — logged, but left out of the trailing average.`);
     } catch (e) {
       setImportError(e instanceof Error ? e.message : "Couldn't read that statement.");
     } finally {
@@ -200,11 +88,13 @@ export function FiscalYearTracker({
 
   const analysisBaseline = analysis ? { revenue: analysis.monthlyRevenue, expenses: splitTotals(analysis.itemizedExpenses).recurring } : null;
   const importableSavings = (analysis?.auditFlags ?? []).filter((f) => f.potentialSavings > 0 && !state.savings.some((s) => s.title === f.title));
-  const chartRows = summary.months.map((m) => ({ month: m.label, net: round2(m.revenue - m.expenses), actual: m.status === "ACTUAL" }));
+  const chartRows = summary.months.map((m) => ({ month: m.label, net: subMoney(m.revenue, m.expenses), actual: m.status === "ACTUAL" }));
   const noBaseline = state.baseline.revenue === 0 && state.baseline.expenses === 0;
+  const projectedNet = subMoney(summary.projectedTotal.revenue, summary.projectedTotal.expenses);
+  const projectedOneTime = sumMoney(summary.months, (m) => (m.actual ? oneTimeOf(m.actual) : 0));
 
   return (
-    <div className={cn(glass, "p-6")}>
+    <div id={id} className={cn(glass, "scroll-mt-6 p-6")}>
       <input
         ref={fileRef}
         type="file"
@@ -221,12 +111,19 @@ export function FiscalYearTracker({
           <h2 className="flex items-center gap-2 text-lg font-semibold">
             <CalendarDays className="h-5 w-5 text-indigo-300" /> Fiscal Year Tracker
           </h2>
-          <p className="text-sm text-slate-400">Log actuals as each month closes. The rest of the year re-forecasts automatically.</p>
+          <p className="text-sm text-slate-400">Log actuals as each month closes. The rest of the year re-forecasts automatically and feeds the Goal Tracker above.</p>
         </div>
-        <SaveBadge status={status} workspace={!!workspaceId} error={saveError} />
+        <TrackerSaveBadge tracker={tracker} />
       </div>
 
-      {status === "loading" ? (
+      {loadFailed ? (
+        <div role="alert" className="mt-5 flex flex-wrap items-center gap-3 rounded-xl border border-rose-300/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+          <span className="flex-1">{tracker.error ?? "Couldn't load your tracker."} Nothing is overwritten until it loads.</span>
+          <button type="button" onClick={tracker.retry} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200/30 px-3 py-1.5 text-xs hover:bg-rose-400/10">
+            <RotateCw className="h-3.5 w-3.5" /> Retry
+          </button>
+        </div>
+      ) : status === "loading" ? (
         <p className="mt-6 flex items-center gap-2 text-sm text-slate-400">
           <Loader2 className="h-4 w-4 animate-spin" /> Loading tracker…
         </p>
@@ -284,14 +181,18 @@ export function FiscalYearTracker({
               </div>
               {analysisBaseline && (analysisBaseline.revenue !== state.baseline.revenue || analysisBaseline.expenses !== state.baseline.expenses) && (
                 <button type="button" onClick={() => update((s) => ({ ...s, baseline: analysisBaseline, businessType: analysis!.businessType }))} className="text-xs text-indigo-300 hover:text-indigo-200">
-                  Use current analysis ({usd.format(analysisBaseline.revenue)} / {usd.format(analysisBaseline.expenses)})
+                  Use current analysis ({exactMoney(analysisBaseline.revenue)} / {exactMoney(analysisBaseline.expenses)} recurring)
                 </button>
               )}
-              <label className="flex items-center gap-2 text-[11px] text-slate-400">
-                <input type="checkbox" checked={state.seasonality} onChange={(e) => update((s) => ({ ...s, seasonality: e.target.checked }))} className="accent-indigo-400" />
-                Apply seasonality for your business type
-                <span className="text-slate-500">({state.seasonality ? "on" : "off — every month uses the same baseline"})</span>
-              </label>
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <StatusSwitch
+                  label="Seasonality"
+                  on={state.seasonality}
+                  onChange={(seasonality) => update((s) => ({ ...s, seasonality }))}
+                  title="Apply your business type's seasonal curve to the baseline plan"
+                />
+                <span className="text-[11px] text-slate-500">{state.seasonality ? "Baseline follows your business type's seasonal curve." : "Every month uses the same baseline."}</span>
+              </div>
             </fieldset>
 
             <fieldset className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-4 text-sm">
@@ -300,7 +201,7 @@ export function FiscalYearTracker({
                 <InfoTip label="Trailing average vs. baseline">
                   <span className="block">
                     <strong className="font-medium text-slate-100">Use Trailing Average</strong> forecasts each unlogged month as the average of your most recent logged
-                    months — best when recent results reflect your real run-rate.
+                    months — best when recent results reflect your real run-rate. One-time expenses are left out of the average.
                   </span>
                   <span className="mt-1 block">
                     <strong className="font-medium text-slate-100">Maintain Original Baseline</strong> keeps the plan you set — best when recent months were unusual.
@@ -342,12 +243,18 @@ export function FiscalYearTracker({
               <p className="text-[11px] text-slate-500">
                 {state.forecastMode === "TRAILING"
                   ? summary.trailing
-                    ? `Forecast = ${usd.format(summary.trailing.revenue)} revenue / ${usd.format(summary.trailing.expenses)} expenses per month (avg of ${summary.trailingKeys.length} month${summary.trailingKeys.length === 1 ? "" : "s"}).`
+                    ? `Forecast = ${exactMoney(summary.trailing.revenue)} revenue / ${exactMoney(summary.trailing.expenses)} recurring expenses per month (avg of ${summary.trailingKeys.length} month${summary.trailingKeys.length === 1 ? "" : "s"}).`
                     : "No actuals yet: using the original baseline until you log a month."
                   : state.seasonality
                     ? "Future months follow the original baseline × seasonality."
                     : "Future months follow the original baseline as entered."}
               </p>
+              {state.forecastMode === "TRAILING" && summary.trailingOneTimeExcluded > 0 && (
+                <p className="flex items-start gap-1.5 rounded-md border border-amber-300/25 bg-amber-400/[0.07] px-2 py-1.5 text-[11px] text-amber-100">
+                  <Repeat1 className="mt-0.5 h-3 w-3 shrink-0" />
+                  {exactMoney(summary.trailingOneTimeExcluded)} of one-time expenses excluded from the average so they don&apos;t skew your recurring run-rate.
+                </p>
+              )}
             </fieldset>
           </div>
 
@@ -357,55 +264,42 @@ export function FiscalYearTracker({
             </p>
           )}
 
-          {/* Year-end goal vs pace */}
-          <div className="mt-6 space-y-4">
-            <GoalTracker
-              metric={state.goalMetric}
-              goal={goal}
-              pace={pace}
-              fyLabel={fyLabel}
-              onMetricChange={(goalMetric) => update((s) => ({ ...s, goalMetric }))}
-              onGoalChange={(v) => update((s) => ({ ...s, targets: { ...s.targets, [s.goalMetric === "NET" ? "net" : "revenue"]: v } }))}
-            />
-            <PaceCard
-              title="Annual expense cap"
-              value={state.targets.expenseCap}
-              onChange={(v) => update((s) => ({ ...s, targets: { ...s.targets, expenseCap: v } }))}
-              pace={summary.expensePace}
-              kind="expense"
-              ytd={summary.ytd.expenses}
-            />
-          </div>
-
           {/* Monthly actuals */}
           <div className="mt-6 grid gap-6 xl:grid-cols-5">
-            <div className="xl:col-span-3">
+            <div className="min-w-0 xl:col-span-3">
               <h3 className="text-sm font-medium text-slate-300">
-                Monthly actuals <span className="text-xs font-normal text-slate-500">· {summary.loggedCount} of 12 logged</span>
+                Monthly actuals <span className="text-xs font-normal text-slate-500">· {summary.loggedCount} of 12 logged · exact to the cent</span>
               </h3>
               {importError && <p className="mt-2 text-xs text-rose-300">{importError}</p>}
+              {importNote && <p className="mt-2 text-xs text-amber-200">{importNote}</p>}
               {/*
                 Sticky header: the inputs below are positioned (relative wrappers for the $ prefix), so without its own
                 stacking layer and an opaque fill the header would be painted under the scrolling rows.
               */}
-              <div className="relative mt-2 max-h-[28rem] overflow-auto rounded-lg border border-white/5 pr-1">
-                <table className="w-full min-w-[34rem] text-sm tabular-nums">
+              <div className="relative mt-2 max-h-[30rem] overflow-auto overscroll-contain rounded-lg border border-white/5 [scrollbar-gutter:stable]">
+                <table className="w-full min-w-[44rem] text-sm tabular-nums">
                   <thead className="sticky top-0 z-20 bg-slate-900 text-left text-[11px] uppercase text-slate-400 shadow-[0_1px_0_rgba(255,255,255,0.08)]">
                     <tr>
                       <th className="bg-slate-900 py-2 pl-2 font-medium">Month</th>
                       <th className="bg-slate-900 py-2 font-medium">Revenue</th>
-                      <th className="bg-slate-900 py-2 font-medium">Expenses</th>
-                      <th className="bg-slate-900 py-2 text-right font-medium">Net</th>
+                      <th className="bg-slate-900 py-2 font-medium">Expenses (total)</th>
+                      <th className="bg-slate-900 py-2 font-medium">
+                        <span className="inline-flex items-center gap-1">
+                          of which one-time
+                          <InfoTip label="One-time expenses">Part of the month&apos;s expenses that won&apos;t repeat (a repair, a single purchase). It counts toward the month&apos;s total but is left out of the trailing average.</InfoTip>
+                        </span>
+                      </th>
+                      <th className="bg-slate-900 py-2 pr-2 text-right font-medium">Net</th>
                       <th className="bg-slate-900 py-2" />
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
                     {summary.months.map((m) => {
                       const loggable = m.status !== "FUTURE";
-                      const net = m.revenue - m.expenses;
+                      const net = subMoney(m.revenue, m.expenses);
                       return (
                         <tr key={m.key} className={cn(m.key === currentKey && "bg-indigo-500/[0.06]")}>
-                          <td className="py-1.5 pl-2 pr-2 text-slate-300">
+                          <td className="whitespace-nowrap py-1.5 pl-2 pr-2 text-slate-300">
                             {m.label}
                             <span
                               className={cn(
@@ -419,19 +313,29 @@ export function FiscalYearTracker({
                           {loggable ? (
                             <>
                               <td className="w-36 py-1.5 pr-2">
-                                <MoneyNumberInput aria-label={`${m.label} revenue`} value={m.actual?.revenue ?? null} placeholder={m.forecastRevenue.toFixed(0)} onChange={(v) => setActual(m.key, "revenue", v)} className="py-1" />
+                                <MoneyNumberInput aria-label={`${m.label} revenue`} value={m.actual?.revenue ?? null} placeholder={m.forecastRevenue.toFixed(2)} onChange={(v) => setActual(m.key, "revenue", v)} className="py-1" />
                               </td>
                               <td className="w-36 py-1.5 pr-2">
-                                <MoneyNumberInput aria-label={`${m.label} expenses`} value={m.actual?.expenses ?? null} placeholder={m.forecastExpenses.toFixed(0)} onChange={(v) => setActual(m.key, "expenses", v)} className="py-1" />
+                                <MoneyNumberInput aria-label={`${m.label} expenses`} value={m.actual?.expenses ?? null} placeholder={m.forecastExpenses.toFixed(2)} onChange={(v) => setActual(m.key, "expenses", v)} className="py-1" />
+                              </td>
+                              <td className="w-32 py-1.5 pr-2">
+                                <MoneyNumberInput
+                                  aria-label={`${m.label} one-time expenses`}
+                                  value={m.actual?.oneTimeExpenses ?? null}
+                                  placeholder="0.00"
+                                  onChange={(v) => setActual(m.key, "oneTimeExpenses", v)}
+                                  className={cn("py-1", m.actual?.oneTimeExpenses ? "border-amber-300/40 text-amber-100" : "")}
+                                />
                               </td>
                             </>
                           ) : (
                             <>
-                              <td className="py-1.5 pl-3 text-slate-500">{usd.format(m.forecastRevenue)}</td>
-                              <td className="py-1.5 pl-3 text-slate-500">{usd.format(m.forecastExpenses)}</td>
+                              <td className="py-1.5 pl-3 text-slate-500">{exactMoney(m.forecastRevenue)}</td>
+                              <td className="py-1.5 pl-3 text-slate-500">{exactMoney(m.forecastExpenses)}</td>
+                              <td className="py-1.5 pl-3 text-slate-600">—</td>
                             </>
                           )}
-                          <td className={cn("py-1.5 text-right", net < 0 ? "text-rose-300" : m.status === "ACTUAL" ? "text-slate-100" : "text-slate-500")}>{usd.format(net)}</td>
+                          <td className={cn("py-1.5 pr-2 text-right", net < 0 ? "text-rose-300" : m.status === "ACTUAL" ? "text-slate-100" : "text-slate-500")}>{exactMoney(net)}</td>
                           <td className="w-16 py-1.5 pl-2 text-right">
                             {loggable && (
                               <span className="inline-flex gap-0.5">
@@ -460,23 +364,25 @@ export function FiscalYearTracker({
                       );
                     })}
                   </tbody>
-                  <tfoot className="border-t border-white/10 text-sm font-medium">
+                  <tfoot className="sticky bottom-0 z-20 border-t border-white/10 bg-slate-900 text-sm font-medium">
                     <tr>
                       <td className="py-2 pl-2 text-slate-300">Projected FY</td>
-                      <td className="py-2 pl-3">{usd.format(summary.projectedTotal.revenue)}</td>
-                      <td className="py-2 pl-3">{usd.format(summary.projectedTotal.expenses)}</td>
-                      <td className={cn("py-2 text-right", summary.projectedTotal.revenue - summary.projectedTotal.expenses < 0 && "text-rose-300")}>
-                        {usd.format(summary.projectedTotal.revenue - summary.projectedTotal.expenses)}
-                      </td>
+                      <td className="py-2 pl-3">{exactMoney(summary.projectedTotal.revenue)}</td>
+                      <td className="py-2 pl-3">{exactMoney(summary.projectedTotal.expenses)}</td>
+                      <td className="py-2 pl-3 text-slate-400">{projectedOneTime > 0 ? exactMoney(projectedOneTime) : "—"}</td>
+                      <td className={cn("py-2 pr-2 text-right", projectedNet < 0 && "text-rose-300")}>{exactMoney(projectedNet)}</td>
                       <td />
                     </tr>
                   </tfoot>
                 </table>
               </div>
-              <p className="mt-2 text-[11px] text-slate-500">Leave a month blank to keep its forecast. Importing reads a statement for that month and totals every line, one-time items included.</p>
+              <p className="mt-2 text-[11px] text-slate-500">
+                Leave a month blank to keep its forecast. Importing reads a statement for that month and totals every line to the cent; one-time items are recorded in their own column and
+                excluded from the trailing average.
+              </p>
             </div>
 
-            <div className="space-y-4 xl:col-span-2">
+            <div className="min-w-0 space-y-4 xl:col-span-2">
               <div>
                 <h3 className="text-sm font-medium text-slate-300">Monthly net · actual vs forecast</h3>
                 <div className="mt-2 h-48">
@@ -514,86 +420,6 @@ export function FiscalYearTracker({
   );
 }
 
-function SaveBadge({ status, workspace, error }: { status: SaveStatus; workspace: boolean; error: string | null }) {
-  if (status === "error")
-    return (
-      <p className="max-w-xs text-right text-xs text-rose-300" role="alert">
-        {error ?? "Couldn't save."}
-      </p>
-    );
-  return (
-    <p className="inline-flex items-center gap-1.5 text-xs text-slate-500" role="status">
-      {status === "saving" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : status === "saved" ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-300" /> : <Cloud className="h-3.5 w-3.5" />}
-      {status === "saving" ? "Saving…" : workspace ? "Monthly totals saved to this workspace" : "Saved on this device (create a workspace to sync)"}
-    </p>
-  );
-}
-
-function PaceCard({
-  title,
-  value,
-  onChange,
-  pace,
-  kind,
-  ytd,
-}: {
-  title: string;
-  value: number | null;
-  onChange: (v: number | null) => void;
-  pace: PaceResult | null;
-  kind: "revenue" | "expense";
-  ytd: number;
-}) {
-  // Revenue: above target is good. Expense cap: above cap is bad.
-  const good = pace ? (kind === "revenue" ? pace.gap >= 0 : pace.gap <= 0) : true;
-  const Icon = good ? TrendingUp : TrendingDown;
-  let headline = "";
-  if (pace) {
-    const amt = usd.format(Math.abs(pace.gap));
-    headline =
-      kind === "revenue"
-        ? pace.gap >= 0
-          ? `On pace for +${amt} over target`
-          : `Off pace by ${amt}`
-        : pace.gap <= 0
-          ? `On pace to finish ${amt} under cap`
-          : `Off pace: ${amt} over cap`;
-  }
-  return (
-    <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <label className="block min-w-[10rem] flex-1">
-          <span className="flex items-center gap-1.5 text-xs uppercase tracking-wide text-slate-500">
-            <Target className="h-3.5 w-3.5" /> {title}
-          </span>
-          <MoneyNumberInput aria-label={title} value={value} onChange={onChange} placeholder="Set a target" className="mt-1" />
-        </label>
-        {pace && (
-          <p className={cn("flex items-center gap-1.5 text-sm font-medium", good ? "text-emerald-300" : "text-rose-300")} role="status">
-            <Icon className="h-4 w-4" aria-hidden /> {headline}
-          </p>
-        )}
-      </div>
-      {pace && (
-        <>
-          <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10" aria-hidden>
-            <div className={cn("h-full rounded-full", good ? "bg-emerald-400/80" : "bg-rose-400/80")} style={{ width: `${Math.min(100, (ytd / Math.max(1, pace.target)) * 100)}%` }} />
-          </div>
-          <p className="mt-2 text-xs text-slate-400">
-            {usd.format(ytd)} logged · projected {usd.format(pace.projected)} of {usd.format(pace.target)}
-            {pace.requiredMonthly != null && (
-              <>
-                {" "}
-                · {kind === "revenue" ? "needs" : "room for"} {usd.format(Math.max(0, pace.requiredMonthly))}/mo for the rest of the year
-              </>
-            )}
-          </p>
-        </>
-      )}
-    </div>
-  );
-}
-
 function SavingsTracker({
   state,
   update,
@@ -623,15 +449,15 @@ function SavingsTracker({
       <dl className="mt-3 grid grid-cols-2 gap-3 text-xs">
         <div>
           <dt className="text-slate-500">Identified (not yet acted on)</dt>
-          <dd className="mt-0.5 text-base font-semibold tabular-nums">{usd.format(summary.identifiedMonthly)}/mo</dd>
+          <dd className="mt-0.5 text-base font-semibold tabular-nums">{exactMoney(summary.identifiedMonthly)}/mo</dd>
         </div>
         <div>
           <dt className="text-slate-500">Implemented</dt>
-          <dd className="mt-0.5 text-base font-semibold tabular-nums text-emerald-200">{usd.format(summary.implementedMonthly)}/mo</dd>
+          <dd className="mt-0.5 text-base font-semibold tabular-nums text-emerald-200">{exactMoney(summary.implementedMonthly)}/mo</dd>
         </div>
         <div>
           <dt className="text-slate-500">Captured this FY so far</dt>
-          <dd className="mt-0.5 font-semibold tabular-nums">{usd.format(summary.realizedYtd)}</dd>
+          <dd className="mt-0.5 font-semibold tabular-nums">{exactMoney(summary.realizedYtd)}</dd>
         </div>
         <div>
           <dt className="text-slate-500">Projected FY savings</dt>
@@ -679,7 +505,7 @@ function SavingsTracker({
               <span className={cn("min-w-0 flex-1 truncate", x.status === "IMPLEMENTED" ? "text-slate-200" : "text-slate-400")} title={x.title}>
                 {x.title}
               </span>
-              <span className="tabular-nums text-slate-300">{usd.format(x.monthly)}/mo</span>
+              <span className="tabular-nums text-slate-300">{exactMoney(x.monthly)}/mo</span>
               <button type="button" aria-label={`Remove "${x.title}"`} onClick={() => update((s) => ({ ...s, savings: s.savings.filter((y) => y.id !== x.id) }))} className="text-slate-500 hover:text-rose-300">
                 <Trash2 className="h-3.5 w-3.5" />
               </button>

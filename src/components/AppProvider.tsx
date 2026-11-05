@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { User } from "@supabase/supabase-js";
 import {
+  deleteWorkspace,
   fetchProfile,
   getSupabase,
   isSupabaseConfigured,
@@ -23,7 +24,7 @@ export interface UiHints {
   inflation: boolean;
   horizonMonths: number;
   trackerForecastMode: "TRAILING" | "BASELINE" | null;
-  goalMetric: "REVENUE" | "NET" | null;
+  goalMetric: "NET" | "REVENUE" | "EXPENSE" | null;
 }
 
 interface AppState {
@@ -36,6 +37,8 @@ interface AppState {
   setActiveWorkspaceId: (id: string | null) => void;
   refreshProfile: () => Promise<UserProfile | null>;
   refreshWorkspaces: () => Promise<WorkspaceProfile[]>;
+  /** Deletes a workspace (and, by cascade, its tracker and scenarios) and switches to another one if it was active. */
+  removeWorkspace: (id: string) => Promise<void>;
   openAuth: (mode?: "signin" | "signup") => void;
   uiHints: UiHints;
   setUiHints: (h: Partial<UiHints>) => void;
@@ -136,6 +139,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
     void setDefaultWorkspace(id).catch(() => {});
   }, []);
 
+  const activeIdRef = useRef(activeId);
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  const removeWorkspace = useCallback(
+    async (id: string) => {
+      await deleteWorkspace(id);
+      const ws = await refreshWorkspaces();
+      if (activeIdRef.current === id || !ws.some((w) => w.id === activeIdRef.current)) {
+        const next = ws[0]?.id ?? null;
+        setActiveId(next);
+        void setDefaultWorkspace(next).catch(() => {});
+      }
+    },
+    [refreshWorkspaces],
+  );
+
   const setUiHints = useCallback((h: Partial<UiHints>) => setUiHintsState((cur) => ({ ...cur, ...h })), []);
 
   const value = useMemo<AppState>(
@@ -149,11 +170,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setActiveWorkspaceId,
       refreshProfile,
       refreshWorkspaces,
+      removeWorkspace,
       openAuth: (mode = "signin") => setAuthMode(mode),
       uiHints,
       setUiHints,
     }),
-    [ready, user, profile, workspaces, activeId, setActiveWorkspaceId, refreshProfile, refreshWorkspaces, uiHints, setUiHints],
+    [ready, user, profile, workspaces, activeId, setActiveWorkspaceId, refreshProfile, refreshWorkspaces, removeWorkspace, uiHints, setUiHints],
   );
 
   return (

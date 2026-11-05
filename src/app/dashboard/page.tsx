@@ -21,6 +21,9 @@ import {
   Plus,
   Repeat,
   Repeat1,
+  FolderPlus,
+  Flag,
+  Settings2,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
@@ -39,10 +42,13 @@ import {
   DEFAULT_FORECAST,
   MODE_COPY,
   PRICING,
+  effectiveInflationRate,
   isAnalysisResponse,
+  isCpiReading,
   isExtractedLineItems,
   isBusinessType,
   modeOf,
+  normalizeForecastSettings,
   projectBaseline,
   projectionOptions,
   resolvePercentExpenses,
@@ -52,6 +58,7 @@ import {
   type AnalysisAccess,
   type AnalysisResponse,
   type BusinessType,
+  type CpiReading,
   type ExpenseLine,
   type ForecastSettings,
   type RevenueLine,
@@ -59,9 +66,10 @@ import {
   type PercentOfRevenue,
   type Severity,
   type WorkspaceMode,
+  type WorkspaceProfile,
 } from "@/lib/schemas";
-import { authHeaders, createWorkspace, saveFiscalTracker } from "@/lib/supabase";
-import { defaultTrackerState, normalizeTrackerState, currentFiscalYearStart } from "@/lib/fiscal";
+import { authHeaders, createWorkspace, saveFiscalTracker, updateWorkspace } from "@/lib/supabase";
+import { normalizeTrackerState } from "@/lib/fiscal";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
@@ -72,8 +80,9 @@ import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml } from "@/components/dashboard/chartKit";
 import { ForecastControls } from "@/components/dashboard/ForecastControls";
 import { ScenarioPanel, scenarioExamples } from "@/components/dashboard/ScenarioPanel";
-import { FiscalYearTracker, clearLocalTracker, readLocalTracker, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
-import { goalPaceReportHtml } from "@/components/dashboard/GoalTracker";
+import { FiscalYearTracker, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
+import { GoalPaceBanner, GoalTracker, goalPaceBannerHtml, goalPaceReportHtml } from "@/components/dashboard/GoalTracker";
+import { clearLocalTracker, clearUnsyncedTracker, readLocalTracker, useFiscalTracker } from "@/components/dashboard/useFiscalTracker";
 import { InfoTip } from "@/components/InfoTip";
 import { FeedbackWidget } from "@/components/dashboard/FeedbackWidget";
 import { MoneyInput } from "@/components/dashboard/MoneyInput";
@@ -81,6 +90,8 @@ import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, 
 
 const PRIVACY_BADGE = "🔒 256-Bit Encrypted | Zero File Retention — Your financial data is parsed in memory and never stored.";
 const PENDING_UNLOCK_KEY = "lp:pendingUnlock";
+/** This tab's analysis results per workspace (sessionStorage; cleared on sign-out). */
+const resultsKey = (userId: string) => `lp:results:${userId}`;
 
 // ---------------------------------------------------------------------------
 // Error boundary
@@ -150,8 +161,29 @@ export default function DashboardPage() {
     if (mustSignIn) router.replace(`/signup?next=${encodeURIComponent("/dashboard")}`);
   }, [mustSignIn, router]);
 
-  // Results live in memory only, per workspace, for this browser tab.
+  // Results live in this browser tab only (sessionStorage), per workspace, so switching workspaces or reloading
+  // the tab keeps each workspace's report. They are never sent to our database.
   const [results, setResults] = useState<Record<string, AnalysisResponse>>({});
+  const userId = app.user?.id ?? null;
+  const resultsLoadedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!userId || resultsLoadedFor.current === userId) return;
+    resultsLoadedFor.current = userId;
+    const stored = safeSession((s) => s.getItem(resultsKey(userId)));
+    if (!stored) return;
+    try {
+      const parsed: unknown = JSON.parse(stored);
+      if (!parsed || typeof parsed !== "object") return;
+      const valid = Object.fromEntries(Object.entries(parsed as Record<string, unknown>).filter(([, v]) => isAnalysisResponse(v))) as Record<string, AnalysisResponse>;
+      setResults((cur) => ({ ...valid, ...cur }));
+    } catch {
+      /* ignore malformed */
+    }
+  }, [userId]);
+  useEffect(() => {
+    if (!userId || resultsLoadedFor.current !== userId) return;
+    safeSession((s) => (Object.keys(results).length ? s.setItem(resultsKey(userId), JSON.stringify(results)) : s.removeItem(resultsKey(userId))));
+  }, [results, userId]);
   const current = results[wsKey] ?? null;
 
   const [tab, setTab] = useState<InputTab>("form");
@@ -162,27 +194,112 @@ export default function DashboardPage() {
   const [pendingUnlock, setPendingUnlock] = useState<{ sealed: string; wsKey: string } | null>(null);
   const [confirmingCheckout, setConfirmingCheckout] = useState(false);
   const [checkoutNotice, setCheckoutNotice] = useState<string | null>(null);
-  /** Projection start month + horizon, shared by the baseline chart, scenarios, KPIs and the executive report. */
-  const [forecast, setForecast] = useState<ForecastSettings>(DEFAULT_FORECAST);
+  /**
+   * Projection start month + horizon + seasonality / inflation, shared by the baseline chart, scenarios, KPIs and the
+   * executive report. Remembered per workspace on this device.
+   */
+  const forecastKey = userId ? `lp:forecast:${userId}:${wsKey}` : null;
+  const [forecastState, setForecastState] = useState<{ key: string | null; value: ForecastSettings }>({ key: null, value: DEFAULT_FORECAST });
+  if (forecastState.key !== forecastKey) {
+    // Workspace (or user) changed: adopt that workspace's saved settings during render, before anything uses them.
+    let stored: unknown = null;
+    try {
+      const raw = forecastKey && typeof window !== "undefined" ? window.localStorage.getItem(forecastKey) : null;
+      stored = raw ? JSON.parse(raw) : null;
+    } catch {
+      stored = null;
+    }
+    setForecastState({ key: forecastKey, value: stored ? normalizeForecastSettings(stored) : DEFAULT_FORECAST });
+  }
+  const forecast = forecastState.value;
+  const setForecast = useCallback(
+    (value: ForecastSettings) => {
+      setForecastState({ key: forecastKey, value });
+      try {
+        if (forecastKey) window.localStorage.setItem(forecastKey, JSON.stringify(value));
+      } catch {
+        /* per-device convenience only */
+      }
+    },
+    [forecastKey],
+  );
+
+  // Live CPI (U.S. BLS, cached server-side for a day) is the default inflation rate; owners can override it.
+  const [cpi, setCpi] = useState<CpiReading | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/cpi")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: unknown) => !cancelled && setCpi(isCpiReading(d) ? d : { rate: DEFAULT_FORECAST.customInflationRate, period: null, source: "Default assumption", live: false }))
+      .catch(() => !cancelled && setCpi({ rate: DEFAULT_FORECAST.customInflationRate, period: null, source: "Default assumption", live: false }));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const inflationRate = effectiveInflationRate(forecast, cpi);
+  const inflationLabel = forecast.inflationSource === "CUSTOM" ? "custom rate" : cpi?.live ? `live CPI, ${cpi.period}` : "default assumption";
+
   const resultsRef = useRef<HTMLDivElement>(null);
+  const ws = app.activeWorkspace;
+  const formDefaultType: BusinessType = mode === "PERSONAL" ? "PERSONAL_FAMILY" : ws && ws.mode === "BUSINESS" ? ws.businessType : "REAL_ESTATE";
+
+  /** Fiscal Year Tracker state (monthly actuals, goals, savings) for the active workspace, shared by the Goal Tracker at the top. */
+  const tracker = useFiscalTracker({ userId: userId ?? "", workspaceId: ws?.id ?? null, businessType: formDefaultType });
+  /** Goal pace included in the executive PDF. */
+  const goalReport: GoalReport | null = tracker.pace && tracker.status !== "loading" && !tracker.loadFailed ? { pace: tracker.pace, fyLabel: tracker.fyLabel } : null;
 
   const { setUiHints, refreshProfile } = app;
   useEffect(
-    () => setUiHints({ mode, hasAnalysis: !!current, hasWorkspace: !!app.activeWorkspace, seasonality: forecast.seasonality, inflation: forecast.inflation, horizonMonths: forecast.months }),
-    [mode, current, app.activeWorkspace, forecast.seasonality, forecast.inflation, forecast.months, setUiHints],
+    () =>
+      setUiHints({
+        mode,
+        hasAnalysis: !!current,
+        hasWorkspace: !!app.activeWorkspace,
+        seasonality: forecast.seasonality,
+        inflation: forecast.inflation,
+        horizonMonths: forecast.months,
+        trackerForecastMode: tracker.state.forecastMode,
+        goalMetric: tracker.goal != null ? tracker.state.goalMetric : null,
+      }),
+    [mode, current, app.activeWorkspace, forecast.seasonality, forecast.inflation, forecast.months, tracker.state.forecastMode, tracker.state.goalMetric, tracker.goal, setUiHints],
   );
-  /** Goal pace from the Fiscal Year Tracker, included in the executive PDF. */
-  const [goalReport, setGoalReport] = useState<GoalReport | null>(null);
-  /** After an analysis without a saved workspace, prompt the owner to name and save one. */
-  const [savePrompt, setSavePrompt] = useState(false);
+
+  /** "Set your goals and log actuals" callout, shown after the first PDF report for a workspace until dismissed. */
+  const calloutKey = userId ? `lp:reportCallout:${userId}:${wsKey}` : null;
+  const [calloutShownFor, setCalloutShownFor] = useState<string | null>(null);
+  const showCallout = !!calloutKey && calloutShownFor === calloutKey;
+  const onReportDownloaded = () => {
+    if (!calloutKey) return;
+    let dismissed = false;
+    try {
+      dismissed = window.localStorage.getItem(calloutKey) === "dismissed";
+    } catch {
+      /* ignore */
+    }
+    if (!dismissed) setCalloutShownFor(calloutKey);
+  };
+  const dismissCallout = () => {
+    setCalloutShownFor(null);
+    try {
+      if (calloutKey) window.localStorage.setItem(calloutKey, "dismissed");
+    } catch {
+      /* ignore */
+    }
+  };
+  const jumpTo = (id: string, focusSelector?: string) => {
+    const el = document.getElementById(id);
+    el?.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
+    if (focusSelector) setTimeout(() => el?.querySelector<HTMLElement>(focusSelector)?.focus({ preventScroll: true }), 350);
+  };
 
   const post = useCallback(async (init: RequestInit) => {
     const auth = await authHeaders();
     return fetch("/api/analyze", { method: "POST", ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...auth } });
   }, []);
 
+  /** Runs the analysis and stores the result under `targetKey` (the workspace chosen in the picker). */
   const runAnalysis = useCallback(
-    async (init: RequestInit): Promise<boolean> => {
+    async (init: RequestInit, targetKey: string): Promise<boolean> => {
       setLoading(true);
       setError(null);
       setPaywallMsg(null);
@@ -191,9 +308,8 @@ export default function DashboardPage() {
         if (!res.ok) throw new Error(await errorMessage(res));
         const data: unknown = await res.json();
         if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
-        setResults((r) => ({ ...r, [wsKey]: data }));
+        setResults((r) => ({ ...r, [targetKey]: data }));
         requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-        if (wsKey === "guest") setSavePrompt(true);
         return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Something went wrong.");
@@ -202,8 +318,48 @@ export default function DashboardPage() {
         setLoading(false);
       }
     },
-    [post, wsKey],
+    [post],
   );
+
+  /**
+   * Every new analysis first asks which project / business it belongs to (current workspace preselected), so
+   * different businesses or jobs never get mixed in one workspace.
+   */
+  const [picker, setPicker] = useState<{ init: RequestInit; businessType: BusinessType; resolve: (ok: boolean) => void } | null>(null);
+  const requestAnalysis = useCallback(
+    (init: RequestInit, businessType: BusinessType) => new Promise<boolean>((resolve) => setPicker({ init, businessType, resolve })),
+    [],
+  );
+  /** New workspace from the picker: the baseline is seeded from its first analysis. */
+  const seedBaselineFor = useRef<string | null>(null);
+  const confirmTarget = async (target: { kind: "existing"; id: string } | { kind: "new"; workspace: WorkspaceProfile } | { kind: "temporary" }) => {
+    if (!picker) return;
+    const { init, resolve } = picker;
+    setPicker(null);
+    let key = "guest";
+    if (target.kind === "new") {
+      await app.refreshWorkspaces();
+      app.setActiveWorkspaceId(target.workspace.id);
+      seedBaselineFor.current = target.workspace.id;
+      key = target.workspace.id;
+    } else if (target.kind === "existing") {
+      if (target.id !== ws?.id) app.setActiveWorkspaceId(target.id);
+      key = target.id;
+    } else if (ws) {
+      app.setActiveWorkspaceId(null);
+    }
+    resolve(await runAnalysis(init, key));
+  };
+
+  // Seed a brand-new workspace's tracker baseline from its first analysis (only while the plan is still empty).
+  const { update: updateTracker } = tracker;
+  useEffect(() => {
+    const a = current?.analysis;
+    if (!a || !ws || seedBaselineFor.current !== ws.id || tracker.status === "loading" || tracker.loadFailed || current.access.level === "teaser") return;
+    seedBaselineFor.current = null;
+    if (tracker.state.baseline.revenue !== 0 || tracker.state.baseline.expenses !== 0) return;
+    updateTracker((s) => ({ ...s, businessType: a.businessType, baseline: { revenue: a.monthlyRevenue, expenses: splitTotals(a.itemizedExpenses).recurring } }));
+  }, [current, ws, tracker.status, tracker.loadFailed, tracker.state.baseline, updateTracker]);
 
   /** Exchanges a sealed teaser for the full analysis. `retries` covers a webhook that lands a moment after the redirect. */
   const unlockSealed = useCallback(
@@ -335,7 +491,7 @@ export default function DashboardPage() {
   const rawAnalysis = current?.analysis ?? null;
   // Full reports re-project client-side so line-item edits and the chosen horizon/start month apply immediately.
   // Teasers stay redacted (no projection) exactly as the server sent them.
-  const analysis = useMemo(() => (rawAnalysis && !teaser ? withProjection(rawAnalysis, forecast) : rawAnalysis), [rawAnalysis, teaser, forecast]);
+  const analysis = useMemo(() => (rawAnalysis && !teaser ? withProjection(rawAnalysis, forecast, inflationRate) : rawAnalysis), [rawAnalysis, teaser, forecast, inflationRate]);
   const updateLineItems = useCallback(
     (revenue: RevenueLine[], expenses: ExpenseLine[]) =>
       setResults((r) => {
@@ -348,8 +504,6 @@ export default function DashboardPage() {
     [wsKey],
   );
   const copy = MODE_COPY[mode];
-  const ws = app.activeWorkspace;
-  const formDefaultType: BusinessType = mode === "PERSONAL" ? "PERSONAL_FAMILY" : ws && ws.mode === "BUSINESS" ? ws.businessType : "REAL_ESTATE";
 
   if (!app.ready || !app.user) {
     return (
@@ -379,17 +533,41 @@ export default function DashboardPage() {
                 ? "Enter your household income and spending or upload a bank statement. We'll audit your budget and project the next 12–60 months."
                 : "Enter your numbers or upload a bank statement / P&L. We'll audit it and project the next 12–60 months — flat by default, with optional seasonality and inflation."}
             </p>
-            <p className="mt-3 inline-flex items-center gap-2 text-sm text-slate-300">
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-slate-300">
               {ws ? (
                 <>
                   {ws.mode === "PERSONAL" ? <Home className="h-4 w-4 text-slate-400" /> : <Briefcase className="h-4 w-4 text-slate-400" />}
                   Workspace: <span className="font-medium text-slate-100">{ws.name}</span>
                   <span className="text-slate-500">· {BUSINESS_TYPE_LABELS[ws.businessType]}</span>
+                  <WorkspaceMenu
+                    workspace={ws}
+                    onRename={async (name) => {
+                      await updateWorkspace(ws.id, { name });
+                      await app.refreshWorkspaces();
+                    }}
+                    onDelete={async () => {
+                      const id = ws.id;
+                      await app.removeWorkspace(id);
+                      // Drop everything this device kept for the deleted workspace.
+                      clearUnsyncedTracker(app.user!.id, id);
+                      setResults((r) => {
+                        const { [id]: _gone, ...rest } = r;
+                        void _gone;
+                        return rest;
+                      });
+                      try {
+                        window.localStorage.removeItem(`lp:forecast:${app.user!.id}:${id}`);
+                        window.localStorage.removeItem(`lp:reportCallout:${app.user!.id}:${id}`);
+                      } catch {
+                        /* ignore */
+                      }
+                    }}
+                  />
                 </>
               ) : (
-                <span className="text-slate-500">No saved workspace selected — create one from the profile menu.</span>
+                <span className="text-slate-500">No saved workspace selected — you&apos;ll be asked to name one when you run an analysis.</span>
               )}
-            </p>
+            </div>
           </div>
           <div className="flex items-center gap-3 self-end sm:self-start">
             <ModeToggle mode={mode} onChange={setMode} />
@@ -439,6 +617,13 @@ export default function DashboardPage() {
           </div>
         )}
 
+        {/* Goal Tracker first: the year-end delta is the first thing an owner sees. */}
+        <div className="mb-8">
+          <PanelBoundary title="Goal Tracker">
+            <GoalTracker tracker={tracker} id="goal-tracker" />
+          </PanelBoundary>
+        </div>
+
         {/* Input selector: tabs on small screens, side-by-side on large */}
         <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden")}>
           {(
@@ -459,8 +644,9 @@ export default function DashboardPage() {
           ))}
         </div>
 
-        <section className="grid gap-6 lg:grid-cols-2">
-          <div className={cn(tab !== "form" && "hidden lg:block")}>
+        {/* items-start: a long parsed statement in one column must not stretch (and reflow) the other. */}
+        <section className="grid gap-6 lg:grid-cols-2 lg:items-start">
+          <div className={cn("min-w-0", tab !== "form" && "hidden lg:block")}>
             <PanelBoundary title="Guided form">
               <GuidedForm
                 key={`${wsKey}-${mode}`}
@@ -468,13 +654,14 @@ export default function DashboardPage() {
                 mode={mode}
                 defaultType={formDefaultType}
                 disabled={loading}
-                onSubmit={(payload) => runAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })}
+                onSubmit={(payload) => requestAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType)}
               />
             </PanelBoundary>
           </div>
-          <div className={cn(tab !== "upload" && "hidden lg:block")}>
+          <div className={cn("min-w-0", tab !== "upload" && "hidden lg:block")}>
             <PanelBoundary title="Statement upload">
-              <StatementUploader key={`${wsKey}-${mode}`} mode={mode} disabled={loading} onSubmit={runAnalysis} />
+              {/* Not keyed by workspace: picking a workspace for the report must not throw away the parsed lines under review. */}
+              <StatementUploader key={mode} mode={mode} disabled={loading} onSubmit={(init, bt) => requestAnalysis(init, bt ?? formDefaultType)} />
             </PanelBoundary>
           </div>
         </section>
@@ -498,30 +685,55 @@ export default function DashboardPage() {
         {analysis && paywall && (
           <div ref={resultsRef} className="mt-10 scroll-mt-6 space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <h2 className="text-xl font-semibold">Results</h2>
+              <h2 className="text-xl font-semibold">Results{ws ? <span className="text-base font-normal text-slate-400"> · {ws.name}</span> : null}</h2>
               {teaser ? (
                 <button onClick={() => paywall.checkout("report")} className={cn(secondaryBtn, "text-slate-300")} title="Unlock the full audit to download">
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               ) : (
-                <button onClick={() => printExecutiveReport(analysis, forecast, goalReport)} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
+                <button
+                  onClick={() => {
+                    printExecutiveReport(analysis, forecast, goalReport, inflationLabel);
+                    onReportDownloaded();
+                  }}
+                  className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}
+                >
                   <Download className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               )}
             </div>
 
+            {showCallout && (
+              <ReportCallout
+                hasGoal={!!tracker.pace}
+                loggedCount={tracker.summary.loggedCount}
+                onSetGoal={() => jumpTo("goal-tracker", "input")}
+                onLogActuals={() => jumpTo("fiscal-tracker", "tbody input")}
+                onDismiss={dismissCallout}
+              />
+            )}
+
+            {tracker.pace && (
+              <div className="flex flex-col gap-2">
+                <GoalPaceBanner pace={tracker.pace} fyLabel={tracker.fyLabel} compact />
+                <button type="button" onClick={() => jumpTo("goal-tracker")} className="self-end text-xs text-indigo-300 hover:text-indigo-200">
+                  Adjust goal ↑
+                </button>
+              </div>
+            )}
+
             {teaser && <TeaserBanner paywall={paywall} />}
 
             <PanelBoundary title="Summary">
-              <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} settings={forecast} />
+              <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} settings={forecast} inflationLabel={inflationLabel} />
             </PanelBoundary>
             <div className="grid gap-6 xl:grid-cols-3">
-              <div className="space-y-6 xl:col-span-2">
+              <div className="min-w-0 space-y-6 xl:col-span-2">
                 <PanelBoundary title="Projection chart">
                   {teaser ? (
                     <LockedSection title="Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
                   ) : (
-                    <ProjectionCharts analysis={analysis} settings={forecast} onSettingsChange={setForecast} />
+                    <ProjectionCharts analysis={analysis} settings={forecast} onSettingsChange={setForecast} cpi={cpi} inflationLabel={inflationLabel} />
                   )}
                 </PanelBoundary>
                 <PanelBoundary title="Scenario forecasting">
@@ -535,7 +747,7 @@ export default function DashboardPage() {
                   <LineItems analysis={analysis} onApply={updateLineItems} />
                 </PanelBoundary>
               </div>
-              <div className="space-y-6">
+              <div className="min-w-0 space-y-6">
                 <PanelBoundary title="Audit Mode">
                   <AuditPanel analysis={analysis} paywall={paywall} workspaceId={ws?.id ?? null} />
                 </PanelBoundary>
@@ -557,34 +769,23 @@ export default function DashboardPage() {
 
         <section className="mt-10" aria-label="Fiscal Year Tracker">
           <PanelBoundary title="Fiscal Year Tracker">
-            <FiscalYearTracker
-              key={`fy-${wsKey}`}
-              userId={app.user.id}
-              workspaceId={ws?.id ?? null}
-              businessType={formDefaultType}
-              analysis={teaser ? null : rawAnalysis}
-              onGoalReport={setGoalReport}
-            />
+            <FiscalYearTracker tracker={tracker} analysis={teaser ? null : rawAnalysis} id="fiscal-tracker" />
           </PanelBoundary>
         </section>
       </main>
 
-      {savePrompt && !ws && current && (
-        <SaveWorkspaceDialog
+      {picker && (
+        <AnalysisTargetDialog
           userId={app.user.id}
-          analysis={current.analysis}
-          defaultName={suggestWorkspaceName(current.analysis)}
-          onClose={() => setSavePrompt(false)}
-          onSaved={async (created) => {
-            // Move this tab's results from the temporary guest slot to the new workspace, then switch to it.
-            setResults((r) => {
-              const { guest, ...rest } = r;
-              return guest ? { ...rest, [created.id]: guest } : r;
-            });
-            await app.refreshWorkspaces();
-            app.setActiveWorkspaceId(created.id);
-            setSavePrompt(false);
+          workspaces={app.workspaces}
+          activeId={ws?.id ?? null}
+          businessType={picker.businessType}
+          hasReport={(id) => !!results[id]}
+          onCancel={() => {
+            picker.resolve(false);
+            setPicker(null);
           }}
+          onConfirm={confirmTarget}
         />
       )}
     </div>
@@ -592,107 +793,310 @@ export default function DashboardPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Save-workspace prompt (shown after an analysis when no workspace is saved)
+// "Which project / business is this for?" — asked before every new analysis
 // ---------------------------------------------------------------------------
 
-function suggestWorkspaceName(a: FinancialAnalysis) {
+function suggestWorkspaceName(bt: BusinessType, existing: WorkspaceProfile[]) {
   const year = new Date().getFullYear();
-  if (a.businessType === "PERSONAL_FAMILY") return `Household Budget ${year}`;
-  const top = a.itemizedRevenue.find((r) => !r.oneTime)?.label.trim();
-  return (top && top.length <= 40 ? `${top} ${year}` : `${BUSINESS_TYPE_LABELS[a.businessType].split(" (")[0].split(" /")[0]} ${year}`).slice(0, 80);
+  const base = bt === "PERSONAL_FAMILY" ? `Household Budget ${year}` : `${BUSINESS_TYPE_LABELS[bt].split(" (")[0].split(" /")[0]} ${year}`;
+  const taken = new Set(existing.map((w) => w.name.toLowerCase()));
+  if (!taken.has(base.toLowerCase())) return base.slice(0, 80);
+  for (let i = 2; i < 100; i++) if (!taken.has(`${base} (${i})`.toLowerCase())) return `${base} (${i})`.slice(0, 80);
+  return base.slice(0, 80);
 }
 
-function SaveWorkspaceDialog({
+type AnalysisTarget = { kind: "existing"; id: string } | { kind: "new"; workspace: WorkspaceProfile } | { kind: "temporary" };
+
+function AnalysisTargetDialog({
   userId,
-  analysis,
-  defaultName,
-  onClose,
-  onSaved,
+  workspaces,
+  activeId,
+  businessType,
+  hasReport,
+  onCancel,
+  onConfirm,
 }: {
   userId: string;
-  analysis: FinancialAnalysis;
-  defaultName: string;
-  onClose: () => void;
-  onSaved: (ws: { id: string }) => Promise<void>;
+  workspaces: WorkspaceProfile[];
+  activeId: string | null;
+  businessType: BusinessType;
+  hasReport: (id: string) => boolean;
+  onCancel: () => void;
+  onConfirm: (t: AnalysisTarget) => void | Promise<void>;
 }) {
-  const [name, setName] = useState(defaultName);
+  const [choice, setChoice] = useState<string>(activeId ?? "new");
+  const [name, setName] = useState(() => suggestWorkspaceName(businessType, workspaces));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const titleId = useId();
-  const inputRef = useRef<HTMLInputElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const analysisMode = modeOf(businessType);
 
   useEffect(() => {
-    inputRef.current?.select();
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !busy && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !busy && onCancel();
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [busy, onClose]);
+  }, [busy, onCancel]);
+  useEffect(() => {
+    if (choice === "new") nameRef.current?.select();
+  }, [choice]);
 
-  const save = async (e: { preventDefault(): void }) => {
+  const submit = async (e: { preventDefault(): void }) => {
     e.preventDefault();
-    if (!name.trim()) return setError("Give the workspace a name.");
-    setBusy(true);
     setError(null);
+    if (choice === "temporary") return void onConfirm({ kind: "temporary" });
+    if (choice !== "new") return void onConfirm({ kind: "existing", id: choice });
+    if (!name.trim()) return setError("Give the project or business a name.");
+    setBusy(true);
     try {
-      const ws = await createWorkspace({ name, businessType: analysis.businessType });
-      // Carry over anything already logged on this device, and seed the plan from this analysis if none was set.
+      const created = await createWorkspace({ name, businessType });
+      // Carry over anything logged on this device before a workspace existed.
       const local = readLocalTracker(userId);
-      const tracker = local ? normalizeTrackerState(local, analysis.businessType) : defaultTrackerState(analysis.businessType);
-      if (!local) tracker.fyStartYear = currentFiscalYearStart(tracker.fyStartMonth);
-      if (tracker.baseline.revenue === 0 && tracker.baseline.expenses === 0) {
-        tracker.baseline = { revenue: analysis.monthlyRevenue, expenses: splitTotals(analysis.itemizedExpenses).recurring };
-        tracker.businessType = analysis.businessType;
+      if (local) {
+        try {
+          await saveFiscalTracker(created.id, normalizeTrackerState(local, businessType));
+          clearLocalTracker(userId);
+        } catch (err) {
+          console.warn("[workspace] tracker copy failed", err);
+        }
       }
-      try {
-        await saveFiscalTracker(ws.id, tracker);
-        clearLocalTracker(userId);
-      } catch (err) {
-        // The workspace exists; the tracker will still load from this device and save on the next change.
-        console.warn("[workspace] tracker copy failed", err);
-      }
-      await onSaved(ws);
+      await onConfirm({ kind: "new", workspace: created });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't save the workspace.");
+      setError(err instanceof Error ? err.message : "Couldn't create the workspace.");
       setBusy(false);
     }
   };
 
+  const option = (value: string, children: ReactNode) => (
+    <label
+      key={value}
+      className={cn("flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition", choice === value ? "border-indigo-400/60 bg-indigo-500/10" : "border-white/10 hover:bg-white/5")}
+    >
+      <input type="radio" name="analysis-target" className="mt-1 accent-indigo-400" checked={choice === value} onChange={() => setChoice(value)} />
+      <span className="min-w-0 flex-1 text-sm">{children}</span>
+    </label>
+  );
+
   return (
-    <div className="fixed inset-0 z-[60] grid place-items-center bg-slate-950/70 p-4 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
-      <form onSubmit={save} role="dialog" aria-modal="true" aria-labelledby={titleId} className={cn(glass, "w-full max-w-md bg-slate-900/95 p-6")}>
+    <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-slate-950/70 p-4 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && !busy && onCancel()}>
+      <form onSubmit={submit} role="dialog" aria-modal="true" aria-labelledby={titleId} className={cn(glass, "w-full max-w-lg bg-slate-900/95 p-6")}>
         <div className="flex items-start justify-between gap-3">
           <h2 id={titleId} className="flex items-center gap-2 text-lg font-semibold">
-            <Bookmark className="h-5 w-5 text-indigo-300" /> Save this as a workspace
+            <FolderPlus className="h-5 w-5 text-indigo-300" /> Which project or business is this for?
           </h2>
-          <button type="button" onClick={onClose} disabled={busy} aria-label="Close" className="text-slate-400 hover:text-white">
+          <button type="button" onClick={onCancel} disabled={busy} aria-label="Close" className="text-slate-400 hover:text-white">
             <X className="h-4 w-4" />
           </button>
         </div>
-        <p className="mt-2 text-sm text-slate-300">
-          Your analysis is ready. Name a workspace so your Fiscal Year Tracker — the baseline from this analysis, monthly actuals, year-end goals and savings — plus any
-          scenarios you save stay in your account across sessions, devices and app updates.
-        </p>
-        <label className="mt-4 block text-sm">
-          <span className="text-slate-400">Workspace name</span>
-          <input ref={inputRef} value={name} onChange={(e) => setName(e.target.value)} maxLength={80} placeholder="e.g. 123 Main St Duplex" className={cn(inputCls, "mt-1")} autoFocus />
-        </label>
-        <p className="mt-2 text-xs text-slate-500">
-          Type: {BUSINESS_TYPE_LABELS[analysis.businessType]}. Uploaded statement files are still never stored — only the monthly totals you track.
-        </p>
+        <p className="mt-2 text-sm text-slate-300">Each workspace keeps its own report, goals, monthly actuals and scenarios, so different businesses or jobs never get mixed together.</p>
+
+        <div className="mt-4 max-h-[50vh] space-y-2 overflow-y-auto overscroll-contain pr-1">
+          {workspaces.map((w) =>
+            option(
+              w.id,
+              <>
+                <span className="flex flex-wrap items-center gap-2 font-medium text-slate-100">
+                  {w.name}
+                  {w.id === activeId && <span className="rounded-full bg-indigo-500/20 px-2 py-0.5 text-[11px] font-normal text-indigo-200">Current</span>}
+                </span>
+                <span className="block text-xs text-slate-500">{BUSINESS_TYPE_LABELS[w.businessType]}</span>
+                {choice === w.id && hasReport(w.id) && <span className="mt-1 block text-xs text-amber-200">Replaces this workspace&apos;s current report. Its goals and logged actuals are kept.</span>}
+                {choice === w.id && w.mode !== analysisMode && (
+                  <span className="mt-1 block text-xs text-amber-200">This is a {w.mode === "PERSONAL" ? "personal" : "business"} workspace — consider a new one for this {analysisMode === "PERSONAL" ? "household" : "business"} analysis.</span>
+                )}
+              </>,
+            ),
+          )}
+          {option(
+            "new",
+            <>
+              <span className="font-medium text-slate-100">New project / business</span>
+              {choice === "new" && (
+                <>
+                  <input
+                    ref={nameRef}
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    maxLength={80}
+                    aria-label="New workspace name"
+                    placeholder="e.g. 123 Main St Duplex"
+                    className={cn(inputCls, "mt-2")}
+                    autoFocus
+                  />
+                  <span className="mt-1 block text-xs text-slate-500">Type: {BUSINESS_TYPE_LABELS[businessType]}. Change it any time in workspace settings.</span>
+                </>
+              )}
+            </>,
+          )}
+          {option(
+            "temporary",
+            <>
+              <span className="text-slate-300">Don&apos;t save — use a temporary workspace</span>
+              <span className="block text-xs text-slate-500">The report stays in this tab only; goals and actuals stay on this device.</span>
+            </>,
+          )}
+        </div>
+
         {error && (
           <p role="alert" className="mt-3 text-sm text-rose-200">
             {error}
           </p>
         )}
         <div className="mt-5 flex flex-wrap items-center justify-end gap-2">
-          <button type="button" onClick={onClose} disabled={busy} className={cn(secondaryBtn, "text-slate-300")}>
-            Not now
+          <button type="button" onClick={onCancel} disabled={busy} className={cn(secondaryBtn, "text-slate-300")}>
+            Cancel
           </button>
-          <button type="submit" disabled={busy || !name.trim()} className={primaryBtn}>
-            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />} Save workspace
+          <button type="submit" disabled={busy || (choice === "new" && !name.trim())} className={primaryBtn}>
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+            {choice === "new" ? "Create & analyze" : "Analyze"}
           </button>
         </div>
+        <p className="mt-3 text-xs text-slate-500">Uploaded statement files are never stored — only the monthly totals and goals you track.</p>
       </form>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Workspace settings (rename / delete) next to the workspace name
+// ---------------------------------------------------------------------------
+
+function WorkspaceMenu({ workspace, onRename, onDelete }: { workspace: WorkspaceProfile; onRename: (name: string) => Promise<void>; onDelete: () => Promise<void> }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState(workspace.name);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState<"rename" | "delete" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+
+  const reset = () => {
+    setOpen(false);
+    setConfirming(false);
+    setError(null);
+    setName(workspace.name);
+  };
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && !busy && reset();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !busy && reset();
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  });
+
+  const run = async (kind: "rename" | "delete", fn: () => Promise<void>) => {
+    setBusy(kind);
+    setError(null);
+    try {
+      await fn();
+      setBusy(null);
+      if (kind === "delete") return; // this menu unmounts with the workspace
+      reset();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.");
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => (open ? reset() : setOpen(true))}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-xs text-slate-300 hover:bg-white/5 hover:text-white"
+      >
+        <Settings2 className="h-3.5 w-3.5" /> Workspace settings
+      </button>
+      {open && (
+        <div role="dialog" aria-labelledby={titleId} className={cn(glass, "absolute left-0 z-50 mt-2 w-80 max-w-[calc(100vw-2rem)] bg-slate-900/95 p-4 text-sm")}>
+          <p id={titleId} className="text-xs uppercase tracking-wide text-slate-500">
+            Workspace settings
+          </p>
+          <form
+            className="mt-2 flex gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (name.trim() && name.trim() !== workspace.name) void run("rename", () => onRename(name));
+            }}
+          >
+            <input value={name} onChange={(e) => setName(e.target.value)} maxLength={80} aria-label="Workspace name" className={cn(inputCls, "py-1.5")} />
+            <button type="submit" disabled={!!busy || !name.trim() || name.trim() === workspace.name} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+              {busy === "rename" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Rename"}
+            </button>
+          </form>
+
+          <div className="mt-4 border-t border-white/10 pt-3">
+            {confirming ? (
+              <div className="rounded-lg border border-rose-300/30 bg-rose-500/10 p-3">
+                <p className="text-sm text-rose-100">
+                  Permanently delete <strong>{workspace.name}</strong>?
+                </p>
+                <p className="mt-1 text-xs text-rose-200/80">Its Fiscal Year Tracker (monthly actuals, goals, savings) and saved scenarios are deleted too. This can&apos;t be undone.</p>
+                <div className="mt-3 flex justify-end gap-2">
+                  <button type="button" onClick={() => setConfirming(false)} disabled={!!busy} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void run("delete", onDelete)}
+                    disabled={!!busy}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-400 disabled:opacity-50"
+                  >
+                    {busy === "delete" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} Delete workspace
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button type="button" onClick={() => setConfirming(true)} className="inline-flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200">
+                <Trash2 className="h-3.5 w-3.5" /> Delete workspace…
+              </button>
+            )}
+          </div>
+          {error && (
+            <p role="alert" className="mt-2 text-xs text-rose-300">
+              {error}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Post-report follow-up
+// ---------------------------------------------------------------------------
+
+function ReportCallout({ hasGoal, loggedCount, onSetGoal, onLogActuals, onDismiss }: { hasGoal: boolean; loggedCount: number; onSetGoal: () => void; onLogActuals: () => void; onDismiss: () => void }) {
+  return (
+    <div role="status" className="flex flex-col gap-3 rounded-2xl border border-indigo-300/30 bg-gradient-to-r from-indigo-500/15 via-indigo-500/[0.06] to-emerald-500/10 p-5 sm:flex-row sm:items-center">
+      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-indigo-500/25">
+        <Flag className="h-5 w-5 text-indigo-200" />
+      </span>
+      <div className="flex-1">
+        <p className="font-medium text-slate-50">Your report is ready — now set your goals and log actuals to track your pace.</p>
+        <p className="mt-0.5 text-sm text-slate-300">
+          {hasGoal ? "Your goal is set." : "Pick a net income, revenue or expense goal for the year."}{" "}
+          {loggedCount > 0 ? `${loggedCount} month${loggedCount === 1 ? "" : "s"} logged so far.` : "Then log each month as it closes to see exactly how far ahead or behind you are."}
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <button type="button" onClick={onSetGoal} className={primaryBtn}>
+          <Flag className="h-4 w-4" /> {hasGoal ? "Review goal" : "Set a goal"}
+        </button>
+        <button type="button" onClick={onLogActuals} className={secondaryBtn}>
+          Log actuals
+        </button>
+        <button type="button" onClick={onDismiss} aria-label="Dismiss" className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-white">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
     </div>
   );
 }
@@ -1400,13 +1804,15 @@ function RowEditor<T extends { id: number }>(props: {
   const scrollToNew = useRef(false);
   const count = props.rows.length;
 
-  // After "Add line": bring the new (last) row into view inside the scrolling list and the page, then focus its first field.
+  // After "Add line": scroll only the list (not the whole page) to the new last row, then focus its first field.
+  // scrollIntoView on the row would also scroll every ancestor, making the page jump on long parsed statements.
   useEffect(() => {
     if (!scrollToNew.current) return;
     scrollToNew.current = false;
-    const row = listRef.current?.lastElementChild as HTMLElement | null;
-    if (!row) return;
-    row.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "nearest" });
+    const list = listRef.current;
+    const row = list?.lastElementChild as HTMLElement | null;
+    if (!list || !row) return;
+    list.scrollTo({ top: list.scrollHeight, behavior: prefersReducedMotion() ? "auto" : "smooth" });
     row.querySelector<HTMLElement>("input, select")?.focus({ preventScroll: true });
   }, [count]);
 
@@ -1423,8 +1829,12 @@ function RowEditor<T extends { id: number }>(props: {
   return (
     <div>
       <p className="mb-3 text-sm text-slate-400">{props.hint}</p>
-      <p className="px-1 pb-1 text-xs uppercase tracking-wide text-slate-500">{props.columns.join(" → ")}</p>
-      <div ref={listRef} className="max-h-80 space-y-3 overflow-y-auto scroll-py-2 pr-1">
+      <p className="flex items-center justify-between gap-2 px-1 pb-1 text-xs uppercase tracking-wide text-slate-500">
+        <span>{props.columns.join(" → ")}</span>
+        {count > 3 && <span className="shrink-0 normal-case tracking-normal text-slate-600">{count} lines · scroll</span>}
+      </p>
+      {/* Fixed-height, self-contained scroll area: stable gutter (no width jump when the scrollbar appears) and no scroll chaining into the page. */}
+      <div ref={listRef} className="max-h-[26rem] space-y-3 overflow-y-auto overscroll-contain scroll-py-2 rounded-xl pr-1 [scrollbar-gutter:stable]">
         {props.rows.map((row) => (
           <div key={row.id} className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
             {props.render(row, remove(row.id))}
@@ -1498,7 +1908,7 @@ function toReviewState(items: { businessType: BusinessType; revenue: RevenueLine
   };
 }
 
-function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; disabled: boolean; onSubmit: (init: RequestInit) => Promise<boolean> }) {
+function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; disabled: boolean; onSubmit: (init: RequestInit, businessType?: BusinessType) => Promise<boolean> }) {
   const personal = mode === "PERSONAL";
   const [file, setFile] = useState<File | null>(null);
   const [pasted, setPasted] = useState("");
@@ -1553,7 +1963,7 @@ function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; 
         setReview={setReview}
         disabled={disabled}
         onBack={() => setReview(null)}
-        onGenerate={(payload) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })}
+        onGenerate={(payload) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType)}
       />
     );
   }
@@ -1651,7 +2061,7 @@ function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; 
       <button onClick={extract} disabled={busy || !ready} className={cn(primaryBtn, "mt-4 py-2.5")}>
         {extracting && <Loader2 className="h-4 w-4 animate-spin" />} {extracting ? "Reading line items…" : "Extract & review line items"}
       </button>
-      <button type="button" onClick={() => void onSubmit(documentInit(false))} disabled={busy || !ready} className="mt-2 self-center text-xs text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline disabled:opacity-40">
+      <button type="button" onClick={() => void onSubmit(documentInit(false), businessType || undefined)} disabled={busy || !ready} className="mt-2 self-center text-xs text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline disabled:opacity-40">
         Skip review and analyze directly
       </button>
     </div>
@@ -1875,14 +2285,35 @@ function toBaseline(a: FinancialAnalysis) {
   return { businessType: a.businessType, itemizedRevenue: a.itemizedRevenue, itemizedExpenses: a.itemizedExpenses, inflationRateAssumed: a.inflationRateAssumed };
 }
 
-function withProjection(a: FinancialAnalysis, s: ForecastSettings): FinancialAnalysis {
-  return { ...a, macroProjections: projectBaseline(toBaseline(a), projectionOptions(s)) };
+/** Re-projects with the chosen settings. `inflationRate` (live CPI or the owner's custom rate) replaces the server's assumption. */
+function withProjection(a: FinancialAnalysis, s: ForecastSettings, inflationRate: number): FinancialAnalysis {
+  const withRate = { ...a, inflationRateAssumed: inflationRate };
+  return { ...withRate, macroProjections: projectBaseline(toBaseline(withRate), projectionOptions(s)) };
 }
 
-/** "Flat baseline", "Seasonality on", "3.7% inflation", or both. */
-function macroSummary(s: Pick<ForecastSettings, "seasonality" | "inflation">, inflationRate: number) {
+/** "Flat baseline", "Seasonality on", "3.0% annual inflation on costs (live CPI, Sep 2026)", or both. */
+function macroSummary(s: Pick<ForecastSettings, "seasonality" | "inflation">, inflationRate: number, inflationLabel?: string) {
   if (!s.seasonality && !s.inflation) return "Flat baseline — no seasonality or inflation";
-  return [s.seasonality && "seasonality", s.inflation && `${pct(inflationRate)} annual inflation on costs`].filter(Boolean).join(" · ").replace(/^./, (c) => c.toUpperCase());
+  return [s.seasonality && "seasonality", s.inflation && `${pct(inflationRate)} annual inflation on costs${inflationLabel ? ` (${inflationLabel})` : ""}`]
+    .filter(Boolean)
+    .join(" · ")
+    .replace(/^./, (c) => c.toUpperCase());
+}
+
+/** Read-only ON / OFF chip so the projection's macro state is obvious even when the controls are scrolled away. */
+function MacroChip({ label, on, detail }: { label: string; on: boolean; detail?: string }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
+        on ? "border-emerald-300/40 bg-emerald-500/15 text-emerald-100" : "border-white/10 bg-white/[0.03] text-slate-400",
+      )}
+    >
+      <span aria-hidden className={cn("h-1.5 w-1.5 rounded-full", on ? "bg-emerald-300" : "bg-slate-600")} />
+      {label} <b className="font-semibold">{on ? "ON" : "OFF"}</b>
+      {on && detail && <span className="text-emerald-200/80">· {detail}</span>}
+    </span>
+  );
 }
 
 function useDerived(a: FinancialAnalysis) {
@@ -1899,7 +2330,7 @@ function useDerived(a: FinancialAnalysis) {
   }, [a]);
 }
 
-function KpiRow({ analysis, mode, locked, settings }: { analysis: FinancialAnalysis; mode: WorkspaceMode; locked: boolean; settings: ForecastSettings }) {
+function KpiRow({ analysis, mode, locked, settings, inflationLabel }: { analysis: FinancialAnalysis; mode: WorkspaceMode; locked: boolean; settings: ForecastSettings; inflationLabel: string }) {
   const d = useDerived(analysis);
   const months = settings.months;
   const copy = MODE_COPY[mode];
@@ -1921,7 +2352,7 @@ function KpiRow({ analysis, mode, locked, settings }: { analysis: FinancialAnaly
           sub: d.firstNegative
             ? `Cash turns negative in ${d.firstNegative}`
             : settings.inflation
-              ? `After ${pct(analysis.inflationRateAssumed)} inflation`
+              ? `After ${pct(analysis.inflationRateAssumed)} inflation (${inflationLabel})`
               : settings.seasonality
                 ? "With seasonality"
                 : "Flat baseline (no inflation)",
@@ -1952,7 +2383,19 @@ function KpiRow({ analysis, mode, locked, settings }: { analysis: FinancialAnaly
   );
 }
 
-function ProjectionCharts({ analysis, settings, onSettingsChange }: { analysis: FinancialAnalysis; settings: ForecastSettings; onSettingsChange: (s: ForecastSettings) => void }) {
+function ProjectionCharts({
+  analysis,
+  settings,
+  onSettingsChange,
+  cpi,
+  inflationLabel,
+}: {
+  analysis: FinancialAnalysis;
+  settings: ForecastSettings;
+  onSettingsChange: (s: ForecastSettings) => void;
+  cpi: CpiReading | null;
+  inflationLabel: string;
+}) {
   const { rows } = useDerived(analysis);
   const [showTable, setShowTable] = useState(false);
   const copy = MODE_COPY[modeOf(analysis.businessType)];
@@ -1971,15 +2414,19 @@ function ProjectionCharts({ analysis, settings, onSettingsChange }: { analysis: 
             </InfoTip>
           </h2>
           <p className="text-sm text-slate-400">
-            {macroSummary(settings, analysis.inflationRateAssumed)}
+            {macroSummary(settings, analysis.inflationRateAssumed, inflationLabel)}
             {settings.seasonality && ` · ${BUSINESS_TYPE_LABELS[analysis.businessType].toLowerCase()} curve`}
+          </p>
+          <p className="mt-1.5 flex flex-wrap gap-1.5">
+            <MacroChip label="Seasonality" on={settings.seasonality} />
+            <MacroChip label="Inflation" on={settings.inflation} detail={`${pct(analysis.inflationRateAssumed)} ${settings.inflationSource === "CUSTOM" ? "custom" : "CPI"}`} />
           </p>
         </div>
         <button onClick={() => setShowTable((s) => !s)} className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5">
           {showTable ? "Show chart" : "Show table"}
         </button>
       </div>
-      <ForecastControls settings={settings} onChange={onSettingsChange} inflationRate={analysis.inflationRateAssumed} className="mt-4" />
+      <ForecastControls settings={settings} onChange={onSettingsChange} cpi={cpi} className="mt-4" />
 
       {showTable ? (
         <div className="relative mt-4 max-h-[32rem] overflow-auto">
@@ -2305,7 +2752,7 @@ function LineItems({ analysis, onApply }: { analysis: FinancialAnalysis; onApply
           <div className="grid gap-6 md:grid-cols-2">
             <div>
               <h3 className="text-sm font-medium text-slate-300">{copy.revenue}</h3>
-              <ul className="mt-3 divide-y divide-white/5 text-sm">
+              <ul className="mt-3 max-h-[28rem] divide-y divide-white/5 overflow-y-auto overscroll-contain pr-1 text-sm [scrollbar-gutter:stable]">
                 {analysis.itemizedRevenue.map((r, i) => {
                   const share = r.oneTime ? undefined : validShare(r.firstMonthShare);
                   return (
@@ -2328,7 +2775,7 @@ function LineItems({ analysis, onApply }: { analysis: FinancialAnalysis; onApply
             </div>
             <div>
               <h3 className="text-sm font-medium text-slate-300">{copy.expenses}</h3>
-              <ul className="mt-3 divide-y divide-white/5 text-sm">
+              <ul className="mt-3 max-h-[28rem] divide-y divide-white/5 overflow-y-auto overscroll-contain pr-1 text-sm [scrollbar-gutter:stable]">
                 {analysis.itemizedExpenses.map((e, i) => {
                   const share = e.oneTime ? undefined : validShare(e.firstMonthShare);
                   return (
@@ -2377,9 +2824,9 @@ function LineItems({ analysis, onApply }: { analysis: FinancialAnalysis; onApply
 // Executive report → browser print dialog ("Save as PDF"). Rendered client-side only.
 // ---------------------------------------------------------------------------
 
-function reportHtml(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null) {
+function reportHtml(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string) {
   const months = settings.months;
-  const macro = macroSummary(settings, a.inflationRateAssumed);
+  const macro = macroSummary(settings, a.inflationRateAssumed, inflationLabel);
   const copy = MODE_COPY[modeOf(a.businessType)];
   const monthlyExpenses = splitTotals(a.itemizedExpenses).recurring;
   const net = a.monthlyRevenue - monthlyExpenses;
@@ -2405,6 +2852,8 @@ h1{font-size:24px;margin:0}h2{font-size:16px;margin:28px 0 8px;border-bottom:1px
 .kpi{border:1px solid #ddd;border-radius:8px;padding:12px}.kpi b{display:block;font-size:18px;font-variant-numeric:tabular-nums}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}td,th{padding:6px 8px;border-bottom:1px solid #eee;text-align:right}
 td:first-child,th:first-child{text-align:left}.neg{color:#b42318}.pos{color:#047857}li{margin-bottom:6px}.kpi .muted{font-size:11px}
+.pace-banner{margin-top:20px;border:2px solid;border-radius:10px;padding:14px 16px;break-inside:avoid}.pace-good{border-color:#047857;background:#ecfdf5}.pace-bad{border-color:#b42318;background:#fef3f2}
+.pace-head{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}.pace-good .pace-head{color:#047857}.pace-bad .pace-head{color:#b42318}
 @page{margin:16mm}@media print{body{margin:0;max-width:none}}
 </style></head><body>
 <h1>LedgerPulse Executive Report</h1>
@@ -2415,6 +2864,7 @@ td:first-child,th:first-child{text-align:left}.neg{color:#b42318}.pos{color:#047
 <div class="kpi">${esc(copy.net)}<b class="${net < 0 ? "neg" : ""}">${usd.format(net)}</b></div>
 <div class="kpi">${months}-mo projected net<b class="${cumulative < 0 ? "neg" : ""}">${usd.format(cumulative)}</b></div>
 </div>
+${goal ? goalPaceBannerHtml(goal.pace, goal.fyLabel, esc) : ""}
 <h2>${a.businessType === "PERSONAL_FAMILY" ? "Biggest budget lever" : "Top performer"}: ${esc(a.winnerInsight.topService)}</h2><p>${esc(a.winnerInsight.message)}</p>
 <h2>Priority actions</h2>${flags ? `<ol>${flags}</ol>` : "<p>No issues found.</p>"}
 ${a.missingCategories.length ? `<h2>Missing categories</h2><p>${a.missingCategories.map(esc).join(", ")}</p>` : ""}
@@ -2426,6 +2876,6 @@ ${goal ? goalPaceReportHtml(goal.pace, goal.fyLabel, esc) : ""}
 }
 
 /** Opens the browser's print dialog with the executive report so the user can save a PDF. */
-function printExecutiveReport(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null) {
-  printHtml(reportHtml(a, settings, goal));
+function printExecutiveReport(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string) {
+  printHtml(reportHtml(a, settings, goal, inflationLabel));
 }

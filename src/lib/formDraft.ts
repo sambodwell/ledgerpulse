@@ -72,18 +72,31 @@ export function clearDraft(key: string): void {
   }
 }
 
-/** Removes every guided-form draft on this device (used on sign-out). */
+/**
+ * Every device-only key that can hold financial numbers: guided-form drafts, tracker copies (guest tracker and
+ * not-yet-synced edits), per-workspace forecast preferences and this tab's analysis results.
+ */
+export const DEVICE_DATA_PREFIXES = [PREFIX, "lp:fiscalTracker:", "lp:forecast:", "lp:results:", "lp:reportCallout:"] as const;
+
+/** Removes every guided-form draft and other device-only financial data (used on sign-out). */
 export function clearAllDrafts(): void {
-  const s = storage();
-  if (!s) return;
+  const stores: (Storage | null)[] = [storage()];
   try {
-    const keys: string[] = [];
-    for (let i = 0; i < s.length; i++) {
-      const k = s.key(i);
-      if (k?.startsWith(PREFIX)) keys.push(k);
-    }
-    keys.forEach((k) => s.removeItem(k));
+    stores.push(typeof window === "undefined" ? null : window.sessionStorage);
   } catch {
-    /* ignore */
+    /* blocked */
+  }
+  for (const s of stores) {
+    if (!s) continue;
+    try {
+      const keys: string[] = [];
+      for (let i = 0; i < s.length; i++) {
+        const k = s.key(i);
+        if (k && DEVICE_DATA_PREFIXES.some((p) => k.startsWith(p))) keys.push(k);
+      }
+      keys.forEach((k) => s.removeItem(k));
+    } catch {
+      /* ignore */
+    }
   }
 }

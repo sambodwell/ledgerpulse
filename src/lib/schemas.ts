@@ -515,11 +515,70 @@ export interface ForecastSettings {
   months: number;
   /** Apply the business type's monthly seasonality curve. Off by default: flat inputs project flat. */
   seasonality: boolean;
-  /** Compound the assumed annual inflation rate. Off by default. */
+  /** Compound an annual inflation rate. Off by default. */
   inflation: boolean;
+  /** Where the rate comes from when inflation is on: the latest live CPI reading, or the owner's own rate. */
+  inflationSource: InflationSource;
+  /** Owner's custom annual rate (e.g. 0.05 = 5%) used when inflationSource is CUSTOM. */
+  customInflationRate: number;
 }
 
-export const DEFAULT_FORECAST: ForecastSettings = { startMode: "NEXT", customMonth: "", fiscalStartMonth: 0, months: PROJECTION_MONTHS, seasonality: false, inflation: false };
+export type InflationSource = "CPI" | "CUSTOM";
+
+/** Latest year-over-year CPI reading served by /api/cpi. */
+export interface CpiReading {
+  rate: number;
+  /** e.g. "Sep 2026"; null when the fallback assumption is used. */
+  period: string | null;
+  source: string;
+  /** false = BLS was unreachable and DEFAULT_INFLATION_RATE is used. */
+  live: boolean;
+}
+
+export function isCpiReading(v: unknown): v is CpiReading {
+  if (!v || typeof v !== "object") return false;
+  const r = v as Record<string, unknown>;
+  return typeof r.rate === "number" && Number.isFinite(r.rate) && (r.period === null || typeof r.period === "string") && typeof r.source === "string" && typeof r.live === "boolean";
+}
+
+export const DEFAULT_FORECAST: ForecastSettings = {
+  startMode: "NEXT",
+  customMonth: "",
+  fiscalStartMonth: 0,
+  months: PROJECTION_MONTHS,
+  seasonality: false,
+  inflation: false,
+  inflationSource: "CPI",
+  customInflationRate: DEFAULT_INFLATION_RATE,
+};
+
+/** The annual inflation rate projections use for these settings (live CPI unless the owner overrides it). */
+export function effectiveInflationRate(s: Pick<ForecastSettings, "inflationSource" | "customInflationRate">, cpi: CpiReading | null): number {
+  if (s.inflationSource === "CUSTOM") return clampRate(s.customInflationRate);
+  return cpi ? clampRate(cpi.rate) : DEFAULT_INFLATION_RATE;
+}
+
+const clampRate = (r: number) => (Number.isFinite(r) ? Math.min(0.5, Math.max(-0.1, r)) : DEFAULT_INFLATION_RATE);
+
+/** Validates stored forecast settings field by field (anything malformed falls back to the defaults). */
+export function normalizeForecastSettings(raw: unknown): ForecastSettings {
+  const d = DEFAULT_FORECAST;
+  if (!raw || typeof raw !== "object") return d;
+  const r = raw as Record<string, unknown>;
+  const months = Number(r.months);
+  const fm = Number(r.fiscalStartMonth);
+  const rate = Number(r.customInflationRate);
+  return {
+    startMode: (FORECAST_START_MODES as readonly unknown[]).includes(r.startMode) ? (r.startMode as ForecastStartMode) : d.startMode,
+    customMonth: typeof r.customMonth === "string" && /^\d{4}-\d{2}$/.test(r.customMonth) ? r.customMonth : "",
+    fiscalStartMonth: Number.isInteger(fm) && fm >= 0 && fm <= 11 ? fm : d.fiscalStartMonth,
+    months: (HORIZON_OPTIONS as readonly number[]).includes(months) ? months : d.months,
+    seasonality: r.seasonality === true,
+    inflation: r.inflation === true,
+    inflationSource: r.inflationSource === "CUSTOM" ? "CUSTOM" : "CPI",
+    customInflationRate: Number.isFinite(rate) ? clampRate(rate) : d.customInflationRate,
+  };
+}
 
 /** Projection options for forecast settings (start month, horizon, macro toggles). */
 export function projectionOptions(s: ForecastSettings, now = new Date()): ProjectionOptions {
