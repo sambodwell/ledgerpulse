@@ -5,7 +5,7 @@
  * The tracker stores only monthly totals the owner logs (never statements).
  */
 
-import { MONTH_NAMES, SEASONALITY, isBusinessType, monthKey, round2, type BusinessType } from "@/lib/schemas";
+import { DEFAULT_SEASONALITY_STRENGTH, MONTH_NAMES, clampStrength, effectiveSeasonalCurve, isBusinessType, monthKey, normalizeSeasonalCurve, round2, type BusinessType, type SeasonalCurve } from "@/lib/schemas";
 
 export type TrackerForecastMode = "TRAILING" | "BASELINE";
 export type GoalMetric = "NET" | "REVENUE" | "EXPENSE";
@@ -58,6 +58,10 @@ export interface FiscalTrackerState {
   forecastMode: TrackerForecastMode;
   /** Apply the business type's seasonality curve to the baseline plan. Off by default so flat plans stay flat. */
   seasonality: boolean;
+  /** Seasonal weighting: 0 = flat, 1 = historical curve, up to 2. */
+  seasonalityStrength: number;
+  /** Owner's own month-by-month curve (null = business type default). */
+  seasonalCustom: SeasonalCurve | null;
   /** Which year-end goal the Goal Tracker paces against. */
   goalMetric: GoalMetric;
   /** How many of the most recent logged months feed the trailing average. */
@@ -78,6 +82,8 @@ export function defaultTrackerState(businessType: BusinessType, now = new Date()
     baseline: { revenue: 0, expenses: 0 },
     forecastMode: "TRAILING",
     seasonality: false,
+    seasonalityStrength: DEFAULT_SEASONALITY_STRENGTH,
+    seasonalCustom: null,
     goalMetric: "NET",
     trailingWindow: 3,
     targets: { revenue: null, expenseCap: null, net: null },
@@ -137,6 +143,8 @@ export function normalizeTrackerState(raw: unknown, fallbackType: BusinessType, 
     forecastMode: r.forecastMode === "BASELINE" ? "BASELINE" : "TRAILING",
     // Older saved trackers always applied seasonality; the new default is off (flat plans stay flat).
     seasonality: r.seasonality === true,
+    seasonalityStrength: r.seasonalityStrength === undefined ? DEFAULT_SEASONALITY_STRENGTH : clampStrength(r.seasonalityStrength),
+    seasonalCustom: normalizeSeasonalCurve(r.seasonalCustom),
     goalMetric,
     trailingWindow: Number.isInteger(tw) && tw >= 1 && tw <= 12 ? tw : d.trailingWindow,
     targets,
@@ -218,7 +226,7 @@ const LABEL = new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric"
  */
 export function summarizeFiscalYear(s: FiscalTrackerState, now = new Date()): FiscalSummary {
   const currentKey = monthKey(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)));
-  const season = SEASONALITY[s.businessType];
+  const season = effectiveSeasonalCurve(s.businessType, s.seasonalityStrength, s.seasonalCustom);
   const dates = Array.from({ length: 12 }, (_, i) => new Date(Date.UTC(s.fyStartYear, s.fyStartMonth + i, 1)));
   const keys = dates.map(monthKey);
 
@@ -350,13 +358,36 @@ export function paceWords(variance: number, metric: GoalMetric = "NET"): string 
   return `${signedMoney(variance)} ${variance > 0 ? "ahead" : "behind"}`;
 }
 
-/** The headline delta for the summary banner and PDF, e.g. "$1,200.00 ahead of annual target". */
+/** Variance as a share of its target (null when the target is 0, where a percentage means nothing). */
+export function variancePct(variance: number, target: number): number | null {
+  if (!Number.isFinite(variance) || !Number.isFinite(target) || Math.abs(target) < 0.005) return null;
+  return variance / Math.abs(target);
+}
+
+/** "+4.2%" / "−3.1%" / "0.0%" for a variance against its target; "" when there is no meaningful base. */
+export function signedPct(variance: number, target: number): string {
+  const p = variancePct(variance, target);
+  if (p == null) return "";
+  const v = Math.round(p * 1000) / 10;
+  if (Math.abs(v) < 0.05) return "0.0%";
+  return `${v > 0 ? "+" : "−"}${Math.abs(v).toFixed(1)}%`;
+}
+
+/** paceWords plus the percentage, e.g. "+$500.00 ahead (+4.2%)". */
+export function paceWordsPct(variance: number, target: number, metric: GoalMetric = "NET"): string {
+  const p = signedPct(variance, target);
+  return p && Math.abs(variance) >= 0.005 ? `${paceWords(variance, metric)} (${p})` : paceWords(variance, metric);
+}
+
+/** The headline delta for the summary banner and PDF, e.g. "+$1,200.00 (+4.2%) ahead of annual target". */
 export function annualDeltaWords(p: Pick<GoalPace, "metric" | "annual">): string {
   const v = p.annual.variance;
   if (Math.abs(v) < 0.005) return p.metric === "EXPENSE" ? "Right on the annual budget" : "Right on the annual target";
-  const amt = money2.format(Math.abs(v));
-  if (p.metric === "EXPENSE") return `${amt} ${v > 0 ? "under" : "over"} annual budget`;
-  return `${amt} ${v > 0 ? "ahead of" : "behind"} annual target`;
+  const amt = signedMoney(v);
+  const pctText = signedPct(v, p.annual.goal);
+  const withPct = pctText ? `${amt} (${pctText})` : amt;
+  if (p.metric === "EXPENSE") return `${withPct} ${v > 0 ? "under" : "over"} annual budget`;
+  return `${withPct} ${v > 0 ? "ahead of" : "behind"} annual target`;
 }
 
 /** Splits a goal across 12 months in whole cents so the months add up exactly to the goal. */
@@ -440,4 +471,32 @@ export function goalPace(summary: FiscalSummary, metric: GoalMetric, goal: numbe
     requiredMonthly: remaining > 0 ? round2(remainingToGoal / remaining) : null,
     headline: [...quarterBits, overall].join(", "),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Logging a parsed statement into a month
+// ---------------------------------------------------------------------------
+
+/** A single month's statement lines → that month's actual (every line totalled to the cent; one-time expenses split out). */
+export function statementTotals(items: { revenue: { amount: number }[]; expenses: { amount: number; oneTime?: boolean }[] }): MonthActual {
+  const revenue = sumMoney(items.revenue, (r) => r.amount);
+  const expenses = sumMoney(items.expenses, (e) => e.amount);
+  const oneTimeExpenses = sumMoney(items.expenses.filter((e) => e.oneTime), (e) => e.amount);
+  return { revenue, expenses, ...(oneTimeExpenses > 0 ? { oneTimeExpenses } : {}) };
+}
+
+/** "YYYY-MM" keys of the tracked fiscal year. */
+export function fiscalYearKeys(s: Pick<FiscalTrackerState, "fyStartMonth" | "fyStartYear">): string[] {
+  return Array.from({ length: 12 }, (_, i) => monthKey(new Date(Date.UTC(s.fyStartYear, s.fyStartMonth + i, 1))));
+}
+
+/**
+ * Logs `actual` for month `key`. If that month is outside the fiscal year on screen, the tracker moves to the fiscal
+ * year containing it so the new numbers are visible straight away.
+ */
+export function withLoggedActual(s: FiscalTrackerState, key: string, actual: MonthActual): FiscalTrackerState {
+  const next = { ...s, actuals: { ...s.actuals, [key]: actual } };
+  if (fiscalYearKeys(s).includes(key)) return next;
+  const [y, m] = key.split("-").map(Number);
+  return { ...next, fyStartYear: m - 1 >= s.fyStartMonth ? y : y - 1 };
 }

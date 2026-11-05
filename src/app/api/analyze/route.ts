@@ -31,6 +31,7 @@ import {
   type WinnerInsight,
 } from "@/lib/schemas";
 import { isSupabaseConfigured } from "@/lib/supabase";
+import { detectStatementPeriod, periodFromModel } from "@/lib/statementPeriod";
 import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, resolveViewer, seal, unseal, type Viewer } from "@/lib/server/entitlements";
 
 /**
@@ -40,7 +41,7 @@ import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, reso
  *   - multipart/form-data: `file` (PDF or .txt/.csv) + optional `businessType`
  *   - application/json:    { mode: "text", rawText, businessType? }
  *   - multipart `mode=extract` or JSON { mode: "extract", rawText, businessType? }
- *                          → { items: ExtractedLineItems } only (no audit), so the owner can review
+ *                          → { items: ExtractedLineItems, period: StatementPeriod | null } only (no audit), so the owner can review
  *                            and edit the parsed lines, then submit them back as mode "form"
  *   - application/json:    { mode: "form", businessType, revenue: RevenueLine[], expenses: ExpenseLine[], origin? }
  *   - application/json:    { mode: "unlock", sealed }                 (signed-in; Pro or 1 report unlock)
@@ -534,9 +535,13 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
 const LINE_ITEMS_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["businessType", "itemizedRevenue", "itemizedExpenses"],
+  required: ["businessType", "statementMonth", "itemizedRevenue", "itemizedExpenses"],
   properties: {
     businessType: EXTRACTION_SCHEMA.properties.businessType,
+    statementMonth: {
+      type: "string",
+      description: "The calendar month this statement covers as YYYY-MM (e.g. 2026-03 for a March 2026 statement or a statement period ending March 31, 2026). Empty string if it spans several months or cannot be determined.",
+    },
     itemizedRevenue: {
       type: "array",
       items: {
@@ -570,7 +575,7 @@ const EXTRACT_INSTRUCTIONS = `Extract only the line items; the owner will review
 Mark a line "oneTime": true only when it is clearly non-recurring (a single late fee, a one-off purchase, a tax refund); give its full amount rather than a monthly average. Everything else is recurring ("oneTime": false) with an average MONTHLY amount.`;
 
 async function handleExtract(document: DocumentInput) {
-  const raw = await callStructured<{ businessType?: unknown; itemizedRevenue?: unknown; itemizedExpenses?: unknown }>({
+  const raw = await callStructured<{ businessType?: unknown; statementMonth?: unknown; itemizedRevenue?: unknown; itemizedExpenses?: unknown }>({
     system: buildSystemPrompt(),
     content: [...buildUserContent(document), { type: "text", text: EXTRACT_INSTRUCTIONS }],
     schema: LINE_ITEMS_SCHEMA,
@@ -586,7 +591,9 @@ async function handleExtract(document: DocumentInput) {
   if (items.revenue.length === 0 && items.expenses.length === 0) {
     throw new HttpError(422, "No transactions could be read from this document. Check that it's a readable statement.");
   }
-  return json({ items });
+  // Deterministic text detection first (exact statement-period headers); the model's reading covers scanned PDFs.
+  const period = (document.kind === "text" ? detectStatementPeriod(document.text) : null) ?? periodFromModel(raw.statementMonth);
+  return json({ items, period });
 }
 
 function respondWithAnalysis(full: FinancialAnalysis, viewer: Viewer) {

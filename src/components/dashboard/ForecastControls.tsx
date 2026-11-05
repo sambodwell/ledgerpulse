@@ -2,7 +2,9 @@
 
 import { useState } from "react";
 import { CalendarRange } from "lucide-react";
-import { HORIZON_OPTIONS, MONTH_NAMES, effectiveInflationRate, monthKey, resolveForecastStart, type CpiReading, type ForecastSettings, type ForecastStartMode } from "@/lib/schemas";
+import { HORIZON_OPTIONS, MONTH_NAMES, effectiveInflationRate, monthKey, resolveForecastStart, type BusinessType, type CpiReading, type ForecastSettings, type ForecastStartMode } from "@/lib/schemas";
+import type { MonthActual } from "@/lib/fiscal";
+import { SeasonalityControls } from "@/components/dashboard/SeasonalityControls";
 import { InfoTip } from "@/components/InfoTip";
 import { cn, inputCls, pct } from "@/components/ui";
 
@@ -21,12 +23,18 @@ export function ForecastControls({
   onChange,
   className,
   cpi,
+  businessType,
+  actuals,
 }: {
   settings: ForecastSettings;
   onChange: (s: ForecastSettings) => void;
   className?: string;
   /** Latest live CPI reading (null while loading). */
   cpi: CpiReading | null;
+  /** Enables the seasonal weighting controls when seasonality is on. */
+  businessType?: BusinessType;
+  /** Logged monthly actuals, for fitting the seasonal curve. */
+  actuals?: Record<string, MonthActual>;
 }) {
   const rate = effectiveInflationRate(settings, cpi);
   const start = resolveForecastStart(settings);
@@ -89,7 +97,7 @@ export function ForecastControls({
         {RANGE_FMT.format(start)} – {RANGE_FMT.format(end)}
       </span>
       <div className="flex w-full flex-wrap items-center gap-2 border-t border-white/5 pt-2">
-        <StatusSwitch label="Seasonality" on={settings.seasonality} onChange={(seasonality) => set({ seasonality })} title="Reshape months with your business type's typical seasonal curve (annual total unchanged)" />
+        <StatusSwitch label="Seasonality" on={settings.seasonality} onChange={(seasonality) => set({ seasonality })} title="Reshape months with your business type's typical seasonal curve (annual total unchanged)" detail={settings.seasonality && (settings.seasonalityStrength !== 1 || settings.seasonalCustom) ? `${Math.round(settings.seasonalityStrength * 100)}%${settings.seasonalCustom ? " custom" : ""}` : undefined} />
         <StatusSwitch
           label="Inflation"
           detail={settings.inflation ? `${pct(rate)}/yr` : undefined}
@@ -129,6 +137,16 @@ export function ForecastControls({
           defaults to the latest live CPI reading; choose Custom rate for real estate or niche projections (e.g. 5% rent growth).
         </InfoTip>
       </div>
+      {settings.seasonality && businessType && (
+        <SeasonalityControls
+          businessType={businessType}
+          strength={settings.seasonalityStrength}
+          custom={settings.seasonalCustom}
+          actuals={actuals}
+          onChange={(patch) => set(patch)}
+          className="w-full"
+        />
+      )}
     </div>
   );
 }

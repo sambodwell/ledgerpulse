@@ -2,9 +2,25 @@
 
 import { useRef, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Loader2, PiggyBank, Plus, Repeat1, RotateCw, Trash2, Upload } from "lucide-react";
+import { CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, FileSearch, Loader2, PiggyBank, Plus, Repeat1, RotateCw, Trash2, Upload, X } from "lucide-react";
 import { MONTH_NAMES, isExtractedLineItems, monthKey, splitTotals, type FinancialAnalysis } from "@/lib/schemas";
-import { currentFiscalYearStart, exactMoney, fiscalYearLabel, oneTimeOf, subMoney, sumMoney, summarizeFiscalYear, type FiscalTrackerState, type GoalPace, type MonthActual } from "@/lib/fiscal";
+import {
+  currentFiscalYearStart,
+  exactMoney,
+  fiscalYearLabel,
+  oneTimeOf,
+  statementTotals,
+  subMoney,
+  sumMoney,
+  summarizeFiscalYear,
+  withLoggedActual,
+  type FiscalTrackerState,
+  type GoalPace,
+  type MonthActual,
+} from "@/lib/fiscal";
+import { isStatementPeriod, periodLabel, type StatementPeriod } from "@/lib/statementPeriod";
+import { StatementMonthPicker } from "@/components/dashboard/StatementMonth";
+import { SeasonalityControls } from "@/components/dashboard/SeasonalityControls";
 import { authHeaders } from "@/lib/supabase";
 import { InfoTip } from "@/components/InfoTip";
 import { ChartTooltip, COLOR, axisProps, signedUsd } from "@/components/dashboard/chartKit";
@@ -17,6 +33,8 @@ import { cn, errorMessage, glass, inputCls, secondaryBtn, usdCompact } from "@/c
 export { clearLocalTracker, readLocalTracker } from "@/components/dashboard/useFiscalTracker";
 
 const FORECAST_FILL = "rgba(25,158,112,0.35)";
+/** importFor marker for the "auto-detect month" import (row imports use the row's month key). */
+const AUTO_IMPORT = "auto";
 
 /** Goal pace + label, reported up so the executive PDF can include it. */
 export interface GoalReport {
@@ -51,19 +69,31 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
       return { ...s, actuals };
     });
 
-  // Statement import for one month: reuse the extract endpoint and total every line to the cent. One-time
-  // expenses are recorded separately so they don't skew the trailing average.
+  // Statement import: reuse the extract endpoint and total every line to the cent. One-time expenses are recorded
+  // separately so they don't skew the trailing average. The statement month is detected from the document: a row's
+  // import button logs into that row (offering to move it if the statement looks like another month); the
+  // "auto-detect" import asks the owner to confirm the detected month first.
   const fileRef = useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
-  const [importNote, setImportNote] = useState<string | null>(null);
+  const [importNote, setImportNote] = useState<{ text: string; moveTo?: { from: string; to: string } } | null>(null);
+  const [pending, setPending] = useState<{ period: StatementPeriod | null; month: string; actual: MonthActual } | null>(null);
   const importFor = useRef<string | null>(null);
+
+  const logMonth = (key: string, actual: MonthActual, extra?: string) => {
+    const replaced = !!state.actuals[key];
+    update((s) => withLoggedActual(s, key, actual));
+    const oneTime = actual.oneTimeExpenses ? ` ${exactMoney(actual.oneTimeExpenses)} of one-time expenses kept out of the trailing average.` : "";
+    return `${replaced ? "Replaced" : "Logged"} ${periodLabel(key)}: ${exactMoney(actual.revenue)} revenue / ${exactMoney(actual.expenses)} expenses.${oneTime}${extra ?? ""}`;
+  };
+
   const importStatement = async (file: File) => {
     const key = importFor.current;
     if (!key) return;
     setImporting(key);
     setImportError(null);
     setImportNote(null);
+    setPending(null);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -71,19 +101,34 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
       fd.append("mode", "extract");
       const res = await fetch("/api/analyze", { method: "POST", body: fd, headers: await authHeaders() });
       if (!res.ok) throw new Error(await errorMessage(res));
-      const data = (await res.json()) as { items?: unknown };
+      const data = (await res.json()) as { items?: unknown; period?: unknown };
       if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response.");
-      const revenue = sumMoney(data.items.revenue, (r) => r.amount);
-      const expenses = sumMoney(data.items.expenses, (e) => e.amount);
-      const oneTimeExpenses = sumMoney(data.items.expenses.filter((e) => e.oneTime), (e) => e.amount);
-      update((s) => ({ ...s, actuals: { ...s.actuals, [key]: { revenue, expenses, ...(oneTimeExpenses > 0 ? { oneTimeExpenses } : {}) } } }));
-      if (oneTimeExpenses > 0) setImportNote(`${exactMoney(oneTimeExpenses)} of one-time expenses found — logged, but left out of the trailing average.`);
+      const actual = statementTotals(data.items);
+      const period = isStatementPeriod(data.period) ? data.period : null;
+      if (key === AUTO_IMPORT) {
+        setPending({ period, month: period?.key ?? "", actual });
+      } else if (period && period.key !== key) {
+        setImportNote({ text: logMonth(key, actual, ` This statement looks like ${period.label}.`), moveTo: { from: key, to: period.key } });
+      } else {
+        setImportNote({ text: logMonth(key, actual) });
+      }
     } catch (e) {
       setImportError(e instanceof Error ? e.message : "Couldn't read that statement.");
     } finally {
       setImporting(null);
       importFor.current = null;
     }
+  };
+
+  const moveActual = (from: string, to: string) => {
+    const a = state.actuals[from];
+    if (!a) return;
+    update((s) => {
+      const actuals = { ...s.actuals };
+      delete actuals[from];
+      return withLoggedActual({ ...s, actuals }, to, a);
+    });
+    setImportNote({ text: `Moved to ${periodLabel(to)}.` });
   };
 
   const analysisBaseline = analysis ? { revenue: analysis.monthlyRevenue, expenses: splitTotals(analysis.itemizedExpenses).recurring } : null;
@@ -191,8 +236,18 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
                   onChange={(seasonality) => update((s) => ({ ...s, seasonality }))}
                   title="Apply your business type's seasonal curve to the baseline plan"
                 />
-                <span className="text-[11px] text-slate-500">{state.seasonality ? "Baseline follows your business type's seasonal curve." : "Every month uses the same baseline."}</span>
+                <span className="text-[11px] text-slate-500">{state.seasonality ? "Baseline follows the seasonal curve below." : "Every month uses the same baseline."}</span>
               </div>
+              {state.seasonality && (
+                <SeasonalityControls
+                  businessType={state.businessType}
+                  strength={state.seasonalityStrength}
+                  custom={state.seasonalCustom}
+                  actuals={state.actuals}
+                  onChange={(patch) => update((s) => ({ ...s, ...patch }))}
+                  compact
+                />
+              )}
             </fieldset>
 
             <fieldset className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-4 text-sm">
@@ -267,11 +322,61 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
           {/* Monthly actuals */}
           <div className="mt-6 grid gap-6 xl:grid-cols-5">
             <div className="min-w-0 xl:col-span-3">
-              <h3 className="text-sm font-medium text-slate-300">
-                Monthly actuals <span className="text-xs font-normal text-slate-500">· {summary.loggedCount} of 12 logged · exact to the cent</span>
-              </h3>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-medium text-slate-300">
+                  Monthly actuals <span className="text-xs font-normal text-slate-500">· {summary.loggedCount} of 12 logged · exact to the cent</span>
+                </h3>
+                <button
+                  type="button"
+                  disabled={!!importing}
+                  onClick={() => {
+                    importFor.current = AUTO_IMPORT;
+                    fileRef.current?.click();
+                  }}
+                  className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}
+                  title="Upload a statement or P&L — we detect which month it covers and ask you to confirm"
+                >
+                  {importing === AUTO_IMPORT ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileSearch className="h-3.5 w-3.5" />}
+                  {importing === AUTO_IMPORT ? "Reading statement…" : "Import statement · auto-detect month"}
+                </button>
+              </div>
               {importError && <p className="mt-2 text-xs text-rose-300">{importError}</p>}
-              {importNote && <p className="mt-2 text-xs text-amber-200">{importNote}</p>}
+              {importNote && (
+                <p role="status" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-emerald-200">
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" /> {importNote.text}
+                  {importNote.moveTo && (
+                    <button type="button" onClick={() => moveActual(importNote.moveTo!.from, importNote.moveTo!.to)} className="rounded-md border border-amber-300/30 px-2 py-0.5 text-amber-100 hover:bg-amber-400/10">
+                      Move to {periodLabel(importNote.moveTo.to)}
+                    </button>
+                  )}
+                </p>
+              )}
+              {pending && (
+                <div role="group" aria-label="Confirm statement month" className="mt-3 rounded-xl border border-indigo-300/30 bg-indigo-500/[0.08] p-3">
+                  <StatementMonthPicker detected={pending.period} value={pending.month} onChange={(month) => setPending((p) => p && { ...p, month })} />
+                  <p className="mt-2 text-xs tabular-nums text-slate-400">
+                    {exactMoney(pending.actual.revenue)} revenue · {exactMoney(pending.actual.expenses)} expenses
+                    {pending.actual.oneTimeExpenses ? ` (${exactMoney(pending.actual.oneTimeExpenses)} one-time)` : ""}
+                    {pending.month && state.actuals[pending.month] ? ` · replaces what's logged for ${periodLabel(pending.month)}` : ""}
+                  </p>
+                  <div className="mt-2 flex flex-wrap justify-end gap-2">
+                    <button type="button" onClick={() => setPending(null)} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+                      <X className="h-3.5 w-3.5" /> Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!pending.month}
+                      onClick={() => {
+                        setImportNote({ text: logMonth(pending.month, pending.actual) });
+                        setPending(null);
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-400 disabled:opacity-40"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" /> Confirm &amp; log {pending.month ? periodLabel(pending.month) : ""}
+                    </button>
+                  </div>
+                </div>
+              )}
               {/*
                 Sticky header: the inputs below are positioned (relative wrappers for the $ prefix), so without its own
                 stacking layer and an opaque fill the header would be painted under the scrolling rows.

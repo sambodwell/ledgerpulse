@@ -2,7 +2,7 @@
 
 import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { CheckCircle2, Cloud, Flag, Loader2, RotateCw, TrendingDown, TrendingUp } from "lucide-react";
-import { GOAL_METRICS, GOAL_METRIC_LABEL, annualDeltaWords, exactMoney, paceWords, signedMoney, targetKeyFor, type GoalMetric, type GoalPace } from "@/lib/fiscal";
+import { GOAL_METRICS, GOAL_METRIC_LABEL, annualDeltaWords, exactMoney, paceWordsPct, signedMoney, signedPct, targetKeyFor, type GoalMetric, type GoalPace } from "@/lib/fiscal";
 import { round2 } from "@/lib/schemas";
 import { InfoTip } from "@/components/InfoTip";
 import { ChartTooltip, COLOR, axisProps } from "@/components/dashboard/chartKit";
@@ -153,7 +153,7 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
         {pace.ytd.months > 0 ? (
           <>
             Actuals so far: <span className="font-medium tabular-nums text-slate-100">{exactMoney(pace.ytd.value)}</span> over {pace.ytd.months} logged month
-            {pace.ytd.months === 1 ? "" : "s"} vs {exactMoney(pace.ytd.target)} goal pace (<span className={toneCls(pace.ytd.variance)}>{paceWords(pace.ytd.variance, pace.metric)}</span>).{" "}
+            {pace.ytd.months === 1 ? "" : "s"} vs {exactMoney(pace.ytd.target)} goal pace (<span className={toneCls(pace.ytd.variance)}>{paceWordsPct(pace.ytd.variance, pace.ytd.target, pace.metric)}</span>).{" "}
           </>
         ) : (
           <>No months logged yet — this is based on your forecast. Log actuals in the Fiscal Year Tracker to track real pace. </>
@@ -210,7 +210,7 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
                   <span className="font-medium text-slate-200">{q.label}</span>
                   <span className="text-[10px] uppercase">{q.basis === "ACTUAL" ? "Actual" : q.basis === "MIXED" ? "Partly actual" : "Forecast"}</span>
                 </p>
-                <p className={cn("mt-0.5 font-semibold tabular-nums", toneCls(q.variance))}>{paceWords(q.variance, pace.metric)}</p>
+                <p className={cn("mt-0.5 font-semibold tabular-nums", toneCls(q.variance))}>{paceWordsPct(q.variance, q.target, pace.metric)}</p>
                 <p className="text-[10px] tabular-nums text-slate-500">
                   {exactMoney(q.value)} vs {exactMoney(q.target)}
                 </p>
@@ -224,13 +224,14 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
       <details className="group mt-3 text-xs">
         <summary className="cursor-pointer select-none text-indigo-300 hover:text-indigo-200">Monthly pace</summary>
         <div className="mt-2 overflow-x-auto overscroll-x-contain">
-          <table className="w-full min-w-[30rem] tabular-nums">
+          <table className="w-full min-w-[34rem] tabular-nums">
             <thead className="text-left text-[11px] uppercase text-slate-500">
               <tr>
                 <th className="py-1.5 font-medium">Month</th>
                 <th className="py-1.5 text-right font-medium">{label}</th>
                 <th className="py-1.5 text-right font-medium">{pace.metric === "EXPENSE" ? "Budget" : "Goal pace"}</th>
                 <th className="py-1.5 text-right font-medium">{pace.metric === "EXPENSE" ? "Under / over" : "Ahead / behind"}</th>
+                <th className="py-1.5 text-right font-medium">% of target</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-white/5">
@@ -242,6 +243,7 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
                   <td className="py-1.5 text-right text-slate-200">{exactMoney(m.value)}</td>
                   <td className="py-1.5 text-right text-slate-400">{exactMoney(m.target)}</td>
                   <td className={cn("py-1.5 text-right font-medium", toneCls(m.variance))}>{signedMoney(m.variance)}</td>
+                  <td className={cn("py-1.5 text-right", toneCls(m.variance))}>{signedPct(m.variance, m.target) || "—"}</td>
                 </tr>
               ))}
             </tbody>
@@ -251,6 +253,7 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
                 <td className="py-1.5 text-right">{exactMoney(pace.annual.projected)}</td>
                 <td className="py-1.5 text-right text-slate-400">{exactMoney(pace.goal)}</td>
                 <td className={cn("py-1.5 text-right", toneCls(pace.annual.variance))}>{signedMoney(pace.annual.variance)}</td>
+                <td className={cn("py-1.5 text-right", toneCls(pace.annual.variance))}>{signedPct(pace.annual.variance, pace.goal) || "—"}</td>
               </tr>
             </tfoot>
           </table>
@@ -306,7 +309,7 @@ export function goalPaceBannerHtml(pace: GoalPace, fyLabel: string, esc: (s: str
   const expense = pace.metric === "EXPENSE";
   const ytd =
     pace.ytd.months > 0
-      ? `Actuals so far: <b>${exactMoney(pace.ytd.value)}</b> over ${pace.ytd.months} logged month${pace.ytd.months === 1 ? "" : "s"} vs ${exactMoney(pace.ytd.target)} goal pace (${esc(paceWords(pace.ytd.variance, pace.metric))}).`
+      ? `Actuals so far: <b>${exactMoney(pace.ytd.value)}</b> over ${pace.ytd.months} logged month${pace.ytd.months === 1 ? "" : "s"} vs ${exactMoney(pace.ytd.target)} goal pace (${esc(paceWordsPct(pace.ytd.variance, pace.ytd.target, pace.metric))}).`
       : "No months logged yet — based on the tracker forecast.";
   const need =
     pace.requiredMonthly == null
@@ -325,17 +328,17 @@ export function goalPaceBannerHtml(pace: GoalPace, fyLabel: string, esc: (s: str
 export function goalPaceReportHtml(pace: GoalPace, fyLabel: string, esc: (s: string) => string): string {
   const cls = (v: number) => (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg");
   const metric = GOAL_METRIC_LABEL[pace.metric];
-  const words = (v: number) => esc(paceWords(v, pace.metric));
+  const words = (v: number, t: number) => esc(paceWordsPct(v, t, pace.metric));
   const q = pace.quarters
-    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">(${esc(x.months)} · ${x.basis === "ACTUAL" ? "actual" : x.basis === "MIXED" ? "partly actual" : "forecast"})</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${words(x.variance)}</td></tr>`)
+    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">(${esc(x.months)} · ${x.basis === "ACTUAL" ? "actual" : x.basis === "MIXED" ? "partly actual" : "forecast"})</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${words(x.variance, x.target)}</td></tr>`)
     .join("");
   const m = pace.months
-    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">${x.status === "ACTUAL" ? "actual" : "forecast"}</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${esc(signedMoney(x.variance))}</td></tr>`)
+    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">${x.status === "ACTUAL" ? "actual" : "forecast"}</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${esc(signedMoney(x.variance))}</td><td class="${cls(x.variance)}">${esc(signedPct(x.variance, x.target) || "—")}</td></tr>`)
     .join("");
   return `<h2>Goal pace detail · ${esc(fyLabel)}</h2>
 <p><strong>${esc(metric)} ${pace.metric === "EXPENSE" ? "budget" : "goal"}: ${exactMoney(pace.goal)}</strong> (${exactMoney(pace.monthlyTarget)}/mo straight-line). ${esc(pace.headline.charAt(0).toUpperCase() + pace.headline.slice(1))}.</p>
 <h3 style="font-size:14px;margin:16px 0 6px">Quarterly pace</h3>
 <table><thead><tr><th>Quarter</th><th>${esc(metric)}</th><th>${pace.metric === "EXPENSE" ? "Budget" : "Goal"}</th><th>${pace.metric === "EXPENSE" ? "Under / over" : "Ahead / behind"}</th></tr></thead><tbody>${q}</tbody></table>
 <h3 style="font-size:14px;margin:16px 0 6px">Monthly pace</h3>
-<table><thead><tr><th>Month</th><th>${esc(metric)}</th><th>${pace.metric === "EXPENSE" ? "Budget" : "Goal pace"}</th><th>${pace.metric === "EXPENSE" ? "Under / over" : "Ahead / behind"}</th></tr></thead><tbody>${m}</tbody></table>`;
+<table><thead><tr><th>Month</th><th>${esc(metric)}</th><th>${pace.metric === "EXPENSE" ? "Budget" : "Goal pace"}</th><th>${pace.metric === "EXPENSE" ? "Under / over" : "Ahead / behind"}</th><th>% of target</th></tr></thead><tbody>${m}</tbody></table>`;
 }

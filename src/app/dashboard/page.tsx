@@ -10,6 +10,7 @@ import {
   Bookmark,
   Briefcase,
   CheckCircle2,
+  ChevronUp,
   ClipboardList,
   Download,
   FileText,
@@ -23,6 +24,9 @@ import {
   Repeat1,
   FolderPlus,
   Flag,
+  LayoutDashboard,
+  CalendarDays,
+  LineChart as LineChartIcon,
   Settings2,
   ShieldAlert,
   ShieldCheck,
@@ -69,7 +73,9 @@ import {
   type WorkspaceProfile,
 } from "@/lib/schemas";
 import { authHeaders, createWorkspace, saveFiscalTracker, updateWorkspace } from "@/lib/supabase";
-import { normalizeTrackerState } from "@/lib/fiscal";
+import { exactMoney, normalizeTrackerState, statementTotals, withLoggedActual, type MonthActual } from "@/lib/fiscal";
+import { isStatementPeriod, periodLabel, type StatementPeriod } from "@/lib/statementPeriod";
+import { StatementMonthPicker } from "@/components/dashboard/StatementMonth";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
@@ -86,6 +92,7 @@ import { clearLocalTracker, clearUnsyncedTracker, readLocalTracker, useFiscalTra
 import { InfoTip } from "@/components/InfoTip";
 import { FeedbackWidget } from "@/components/dashboard/FeedbackWidget";
 import { MoneyInput } from "@/components/dashboard/MoneyInput";
+import { ExpenseShareCard } from "@/components/dashboard/ExpenseShare";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
 
 const PRIVACY_BADGE = "🔒 256-Bit Encrypted | Zero File Retention — Your financial data is parsed in memory and never stored.";
@@ -147,6 +154,7 @@ function safeSession<T>(fn: (s: Storage) => T): T | null {
 // ---------------------------------------------------------------------------
 
 type InputTab = "form" | "upload";
+type ResultsTab = "overview" | "forecast" | "fiscal" | "report";
 
 export default function DashboardPage() {
   const app = useApp();
@@ -187,6 +195,11 @@ export default function DashboardPage() {
   const current = results[wsKey] ?? null;
 
   const [tab, setTab] = useState<InputTab>("form");
+  /** Results command-center tab. */
+  const [resultsTab, setResultsTab] = useState<ResultsTab>("overview");
+  /** null = automatic: inputs open until a report exists, then collapsed. */
+  const [inputsOverride, setInputsOverride] = useState<boolean | null>(null);
+  const inputsOpen = inputsOverride ?? !current;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [paywallBusy, setPaywallBusy] = useState<Paywall["busy"]>(null);
@@ -291,6 +304,11 @@ export default function DashboardPage() {
     el?.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
     if (focusSelector) setTimeout(() => el?.querySelector<HTMLElement>(focusSelector)?.focus({ preventScroll: true }), 350);
   };
+  /** Switches results tab, then scrolls to an element inside it once it is visible. */
+  const openTab = (t: ResultsTab, id: string, focusSelector?: string) => {
+    setResultsTab(t);
+    requestAnimationFrame(() => jumpTo(id, focusSelector));
+  };
 
   const post = useCallback(async (init: RequestInit) => {
     const auth = await authHeaders();
@@ -309,6 +327,9 @@ export default function DashboardPage() {
         const data: unknown = await res.json();
         if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
         setResults((r) => ({ ...r, [targetKey]: data }));
+        // A fresh report opens on the Overview tab, with the inputs tucked away.
+        setResultsTab("overview");
+        setInputsOverride(null);
         requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
         return true;
       } catch (e) {
@@ -360,6 +381,13 @@ export default function DashboardPage() {
     if (tracker.state.baseline.revenue !== 0 || tracker.state.baseline.expenses !== 0) return;
     updateTracker((s) => ({ ...s, businessType: a.businessType, baseline: { revenue: a.monthlyRevenue, expenses: splitTotals(a.itemizedExpenses).recurring } }));
   }, [current, ws, tracker.status, tracker.loadFailed, tracker.state.baseline, updateTracker]);
+
+  /** Logs a reviewed statement's totals into the Fiscal Year Tracker month; returns a confirmation line. */
+  const logStatementMonth = (key: string, actual: MonthActual) => {
+    const replaced = !!tracker.state.actuals[key];
+    updateTracker((s) => withLoggedActual(s, key, actual));
+    return `${replaced ? "Replaced" : "Logged"} ${periodLabel(key)} actuals: ${exactMoney(actual.revenue)} revenue / ${exactMoney(actual.expenses)} expenses. Goal pace and projections updated.`;
+  };
 
   /** Exchanges a sealed teaser for the full analysis. `retries` covers a webhook that lands a moment after the redirect. */
   const unlockSealed = useCallback(
@@ -504,6 +532,11 @@ export default function DashboardPage() {
     [wsKey],
   );
   const copy = MODE_COPY[mode];
+  const downloadReport = () => {
+    if (!analysis || teaser) return;
+    printExecutiveReport(analysis, forecast, goalReport, inflationLabel);
+    onReportDownloaded();
+  };
 
   if (!app.ready || !app.user) {
     return (
@@ -516,7 +549,7 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="relative min-h-screen overflow-x-hidden bg-slate-950 text-slate-100">
+    <div className="relative min-h-screen overflow-x-clip bg-slate-950 text-slate-100">
       {/* Ambient glow */}
       <div aria-hidden className="pointer-events-none fixed inset-0">
         <div className="absolute -top-40 left-1/4 h-[28rem] w-[28rem] rounded-full bg-indigo-600/20 blur-[120px]" />
@@ -624,47 +657,68 @@ export default function DashboardPage() {
           </PanelBoundary>
         </div>
 
-        {/* Input selector: tabs on small screens, side-by-side on large */}
-        <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden")}>
-          {(
-            [
-              ["form", "Guided Input Form", ClipboardList],
-              ["upload", "Upload Statement", Upload],
-            ] as const
-          ).map(([key, label, Icon]) => (
-            <button
-              key={key}
-              role="tab"
-              aria-selected={tab === key}
-              onClick={() => setTab(key)}
-              className={cn("inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm transition", tab === key ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200")}
-            >
-              <Icon className="h-4 w-4" /> {label}
+        {/* Inputs collapse once a report exists, so the results tabs are one click away instead of a long scroll. */}
+        {current && (
+          <div className={cn(glass, "mb-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3")}>
+            <p className="text-sm text-slate-300">
+              {inputsOpen ? "Enter new numbers or upload another statement to refresh this report." : "Report ready. Run a new analysis any time — your goals and logged actuals are kept."}
+            </p>
+            <button type="button" onClick={() => setInputsOverride(!inputsOpen)} aria-expanded={inputsOpen} aria-controls="analysis-inputs" className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+              {inputsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />} {inputsOpen ? "Hide inputs" : "New analysis / edit inputs"}
             </button>
-          ))}
-        </div>
+          </div>
+        )}
 
-        {/* items-start: a long parsed statement in one column must not stretch (and reflow) the other. */}
-        <section className="grid gap-6 lg:grid-cols-2 lg:items-start">
-          <div className={cn("min-w-0", tab !== "form" && "hidden lg:block")}>
-            <PanelBoundary title="Guided form">
-              <GuidedForm
-                key={`${wsKey}-${mode}`}
-                draftKey={draftKey(app.user.id, wsKey, mode)}
-                mode={mode}
-                defaultType={formDefaultType}
-                disabled={loading}
-                onSubmit={(payload) => requestAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType)}
-              />
-            </PanelBoundary>
+        <div id="analysis-inputs" className={cn(!inputsOpen && "hidden")}>
+          {/* Input selector: tabs on small screens, side-by-side on large */}
+          <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden")}>
+            {(
+              [
+                ["form", "Guided Input Form", ClipboardList],
+                ["upload", "Upload Statement", Upload],
+              ] as const
+            ).map(([key, label, Icon]) => (
+              <button
+                key={key}
+                role="tab"
+                aria-selected={tab === key}
+                onClick={() => setTab(key)}
+                className={cn("inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm transition", tab === key ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200")}
+              >
+                <Icon className="h-4 w-4" /> {label}
+              </button>
+            ))}
           </div>
-          <div className={cn("min-w-0", tab !== "upload" && "hidden lg:block")}>
-            <PanelBoundary title="Statement upload">
-              {/* Not keyed by workspace: picking a workspace for the report must not throw away the parsed lines under review. */}
-              <StatementUploader key={mode} mode={mode} disabled={loading} onSubmit={(init, bt) => requestAnalysis(init, bt ?? formDefaultType)} />
-            </PanelBoundary>
-          </div>
-        </section>
+
+          {/* items-start: a long parsed statement in one column must not stretch (and reflow) the other. */}
+          <section className="grid gap-6 lg:grid-cols-2 lg:items-start">
+            <div className={cn("min-w-0", tab !== "form" && "hidden lg:block")}>
+              <PanelBoundary title="Guided form">
+                <GuidedForm
+                  key={`${wsKey}-${mode}`}
+                  draftKey={draftKey(app.user.id, wsKey, mode)}
+                  mode={mode}
+                  defaultType={formDefaultType}
+                  disabled={loading}
+                  onSubmit={(payload) => requestAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType)}
+                />
+              </PanelBoundary>
+            </div>
+            <div className={cn("min-w-0", tab !== "upload" && "hidden lg:block")}>
+              <PanelBoundary title="Statement upload">
+                {/* Not keyed by workspace: picking a workspace for the report must not throw away the parsed lines under review. */}
+                <StatementUploader
+                  key={mode}
+                  mode={mode}
+                  disabled={loading}
+                  onSubmit={(init, bt) => requestAnalysis(init, bt ?? formDefaultType)}
+                  trackerReady={tracker.status !== "loading" && !tracker.loadFailed}
+                  onLogActuals={logStatementMonth}
+                />
+              </PanelBoundary>
+            </div>
+          </section>
+        </div>
 
         {loading && (
           <div className={cn(glass, "mt-6 flex items-center gap-3 p-5 text-slate-300")} role="status">
@@ -682,8 +736,8 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {analysis && paywall && (
-          <div ref={resultsRef} className="mt-10 scroll-mt-6 space-y-6">
+        {analysis && paywall ? (
+          <div ref={resultsRef} className={cn("scroll-mt-6 space-y-6", inputsOpen ? "mt-10" : "mt-2")}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-xl font-semibold">Results{ws ? <span className="text-base font-normal text-slate-400"> · {ws.name}</span> : null}</h2>
               {teaser ? (
@@ -691,13 +745,7 @@ export default function DashboardPage() {
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               ) : (
-                <button
-                  onClick={() => {
-                    printExecutiveReport(analysis, forecast, goalReport, inflationLabel);
-                    onReportDownloaded();
-                  }}
-                  className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}
-                >
+                <button onClick={downloadReport} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
                   <Download className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               )}
@@ -708,54 +756,81 @@ export default function DashboardPage() {
                 hasGoal={!!tracker.pace}
                 loggedCount={tracker.summary.loggedCount}
                 onSetGoal={() => jumpTo("goal-tracker", "input")}
-                onLogActuals={() => jumpTo("fiscal-tracker", "tbody input")}
+                onLogActuals={() => openTab("fiscal", "fiscal-tracker", "tbody input")}
                 onDismiss={dismissCallout}
               />
             )}
 
-            {tracker.pace && (
-              <div className="flex flex-col gap-2">
-                <GoalPaceBanner pace={tracker.pace} fyLabel={tracker.fyLabel} compact />
-                <button type="button" onClick={() => jumpTo("goal-tracker")} className="self-end text-xs text-indigo-300 hover:text-indigo-200">
-                  Adjust goal ↑
-                </button>
-              </div>
-            )}
-
             {teaser && <TeaserBanner paywall={paywall} />}
 
-            <PanelBoundary title="Summary">
-              <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} settings={forecast} inflationLabel={inflationLabel} />
-            </PanelBoundary>
-            <div className="grid gap-6 xl:grid-cols-3">
-              <div className="min-w-0 space-y-6 xl:col-span-2">
-                <PanelBoundary title="Projection chart">
-                  {teaser ? (
-                    <LockedSection title="Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
-                  ) : (
-                    <ProjectionCharts analysis={analysis} settings={forecast} onSettingsChange={setForecast} cpi={cpi} inflationLabel={inflationLabel} />
-                  )}
-                </PanelBoundary>
-                <PanelBoundary title="Scenario forecasting">
-                  {isPro && !teaser ? (
-                    <ScenarioPanel analysis={analysis} workspaceId={ws?.id ?? null} settings={forecast} onSettingsChange={setForecast} />
-                  ) : (
-                    <LockedSection title="Interactive Scenario Forecasting" paywall={paywall} proOnly placeholder={<FakeScenarioChat mode={mode} />} />
-                  )}
-                </PanelBoundary>
-                <PanelBoundary title="Line items">
-                  <LineItems analysis={analysis} onApply={updateLineItems} />
-                </PanelBoundary>
-              </div>
-              <div className="min-w-0 space-y-6">
-                <PanelBoundary title="Audit Mode">
-                  <AuditPanel analysis={analysis} paywall={paywall} workspaceId={ws?.id ?? null} />
-                </PanelBoundary>
-                <PanelBoundary title="Winner insight">
-                  <WinnerCard analysis={analysis} label={copy.revenue} />
-                </PanelBoundary>
+            <ResultsTabs value={resultsTab} onChange={setResultsTab} />
+
+            <div role="tabpanel" id="results-panel-overview" aria-labelledby="results-tab-overview" hidden={resultsTab !== "overview"} className="space-y-6">
+              {tracker.pace && (
+                <div className="flex flex-col gap-2">
+                  <GoalPaceBanner pace={tracker.pace} fyLabel={tracker.fyLabel} compact />
+                  <button type="button" onClick={() => jumpTo("goal-tracker")} className="self-end text-xs text-indigo-300 hover:text-indigo-200">
+                    Adjust goal ↑
+                  </button>
+                </div>
+              )}
+              <PanelBoundary title="Summary">
+                <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} settings={forecast} inflationLabel={inflationLabel} />
+              </PanelBoundary>
+              {/* Left: visual analytics. Right: the revenue and expense line items. */}
+              <div className="grid gap-6 lg:grid-cols-5 lg:items-start">
+                <div className="min-w-0 space-y-6 lg:col-span-2">
+                  <PanelBoundary title="Expense share">
+                    <ExpenseShareCard analysis={analysis} />
+                  </PanelBoundary>
+                  <PanelBoundary title="Winner insight">
+                    <WinnerCard analysis={analysis} label={copy.revenue} />
+                  </PanelBoundary>
+                </div>
+                <div className="min-w-0 space-y-6 lg:col-span-3">
+                  <PanelBoundary title="Line items">
+                    <LineItems analysis={analysis} onApply={updateLineItems} />
+                  </PanelBoundary>
+                  <PanelBoundary title="Audit Mode">
+                    <AuditPanel analysis={analysis} paywall={paywall} workspaceId={ws?.id ?? null} />
+                  </PanelBoundary>
+                </div>
               </div>
             </div>
+
+            <div role="tabpanel" id="results-panel-forecast" aria-labelledby="results-tab-forecast" hidden={resultsTab !== "forecast"} className="space-y-6">
+              <PanelBoundary title="Projection chart">
+                {teaser ? (
+                  <LockedSection title="Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
+                ) : (
+                  <ProjectionCharts analysis={analysis} settings={forecast} onSettingsChange={setForecast} cpi={cpi} inflationLabel={inflationLabel} actuals={tracker.state.actuals} />
+                )}
+              </PanelBoundary>
+              <PanelBoundary title="Scenario forecasting">
+                {isPro && !teaser ? (
+                  <ScenarioPanel analysis={analysis} workspaceId={ws?.id ?? null} settings={forecast} onSettingsChange={setForecast} />
+                ) : (
+                  <LockedSection title="Interactive Scenario Forecasting" paywall={paywall} proOnly placeholder={<FakeScenarioChat mode={mode} />} />
+                )}
+              </PanelBoundary>
+            </div>
+
+            <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"}>
+              <PanelBoundary title="Fiscal Year Tracker">
+                <FiscalYearTracker tracker={tracker} analysis={teaser ? null : rawAnalysis} id="fiscal-tracker" />
+              </PanelBoundary>
+            </div>
+
+            <div role="tabpanel" id="results-panel-report" aria-labelledby="results-tab-report" hidden={resultsTab !== "report"} className="space-y-6">
+              <PanelBoundary title="Executive report">
+                {teaser ? (
+                  <LockedSection title="Executive PDF Report" paywall={paywall} placeholder={<FakeChart />} />
+                ) : (
+                  <ReportPreview html={resultsTab === "report" ? reportHtml(analysis, forecast, goalReport, inflationLabel) : ""} onDownload={downloadReport} hasGoal={!!goalReport} onSetGoal={() => jumpTo("goal-tracker", "input")} />
+                )}
+              </PanelBoundary>
+            </div>
+
             <FeedbackWidget
               key={`report-${wsKey}`}
               context="report"
@@ -765,13 +840,13 @@ export default function DashboardPage() {
               className={cn(glass, "border-amber-300/20 bg-gradient-to-r from-amber-400/[0.06] via-transparent to-indigo-500/[0.06] px-6 py-6")}
             />
           </div>
+        ) : (
+          <section className="mt-10" aria-label="Fiscal Year Tracker">
+            <PanelBoundary title="Fiscal Year Tracker">
+              <FiscalYearTracker tracker={tracker} analysis={null} id="fiscal-tracker" />
+            </PanelBoundary>
+          </section>
         )}
-
-        <section className="mt-10" aria-label="Fiscal Year Tracker">
-          <PanelBoundary title="Fiscal Year Tracker">
-            <FiscalYearTracker tracker={tracker} analysis={teaser ? null : rawAnalysis} id="fiscal-tracker" />
-          </PanelBoundary>
-        </section>
       </main>
 
       {picker && (
@@ -1096,6 +1171,101 @@ function ReportCallout({ hasGoal, loggedCount, onSetGoal, onLogActuals, onDismis
         <button type="button" onClick={onDismiss} aria-label="Dismiss" className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-white">
           <X className="h-4 w-4" />
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Results command center: tabs + report preview
+// ---------------------------------------------------------------------------
+
+const RESULTS_TABS: { key: ResultsTab; label: string; short: string; Icon: typeof Home }[] = [
+  { key: "overview", label: "Overview", short: "Overview", Icon: LayoutDashboard },
+  { key: "forecast", label: "Forecast & Scenarios", short: "Forecast", Icon: LineChartIcon },
+  { key: "fiscal", label: "Fiscal Year & Actuals", short: "Fiscal Year", Icon: CalendarDays },
+  { key: "report", label: "Executive Report", short: "Report", Icon: FileText },
+];
+
+/** Accessible tab bar (arrow keys / Home / End move between tabs). Scrolls horizontally on narrow screens. */
+function ResultsTabs({ value, onChange }: { value: ResultsTab; onChange: (t: ResultsTab) => void }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const move = (i: number) => {
+    const n = (i + RESULTS_TABS.length) % RESULTS_TABS.length;
+    onChange(RESULTS_TABS[n].key);
+    refs.current[n]?.focus();
+  };
+  const idx = RESULTS_TABS.findIndex((t) => t.key === value);
+  return (
+    <div className="sticky top-0 z-30 -mx-4 bg-slate-950/85 px-4 py-2 backdrop-blur-md sm:mx-0 sm:rounded-2xl sm:px-0 sm:py-0 sm:bg-transparent sm:backdrop-blur-none">
+      <div
+        role="tablist"
+        aria-label="Report sections"
+        className={cn(glass, "flex gap-1 overflow-x-auto overscroll-x-contain p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden")}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowRight") move(idx + 1);
+          else if (e.key === "ArrowLeft") move(idx - 1);
+          else if (e.key === "Home") move(0);
+          else if (e.key === "End") move(RESULTS_TABS.length - 1);
+          else return;
+          e.preventDefault();
+        }}
+      >
+        {RESULTS_TABS.map((t, i) => {
+          const on = t.key === value;
+          return (
+            <button
+              key={t.key}
+              ref={(el) => {
+                refs.current[i] = el;
+              }}
+              id={`results-tab-${t.key}`}
+              role="tab"
+              type="button"
+              aria-selected={on}
+              aria-controls={`results-panel-${t.key}`}
+              tabIndex={on ? 0 : -1}
+              onClick={() => onChange(t.key)}
+              className={cn(
+                "inline-flex shrink-0 flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-xl px-3 py-2 text-sm font-medium transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300 sm:px-4",
+                on ? "bg-indigo-500/90 text-white shadow" : "text-slate-400 hover:bg-white/5 hover:text-slate-200",
+              )}
+            >
+              <t.Icon className="h-4 w-4 shrink-0" aria-hidden />
+              <span className="sm:hidden">{t.short}</span>
+              <span className="hidden sm:inline">{t.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Live preview of the executive PDF (same HTML that prints), in a sandboxed frame. */
+function ReportPreview({ html, onDownload, hasGoal, onSetGoal }: { html: string; onDownload: () => void; hasGoal: boolean; onSetGoal: () => void }) {
+  return (
+    <div className={cn(glass, "p-4 sm:p-6")}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-semibold">
+            <FileText className="h-5 w-5 text-indigo-300" /> Executive report preview
+          </h2>
+          <p className="mt-0.5 text-sm text-slate-400">
+            Exactly what the PDF contains: KPIs, goal pace with % ahead / behind, priority actions and the projection. It updates as you change line items, goals or forecast settings.
+          </p>
+          {!hasGoal && (
+            <button type="button" onClick={onSetGoal} className="mt-1 text-xs text-indigo-300 hover:text-indigo-200">
+              Set a goal to add the pace section ↑
+            </button>
+          )}
+        </div>
+        <button type="button" onClick={onDownload} className={primaryBtn}>
+          <Download className="h-4 w-4" /> Download PDF
+        </button>
+      </div>
+      <div className="mt-4 overflow-hidden rounded-xl border border-white/10 bg-white">
+        <iframe title="Executive report preview" srcDoc={html} sandbox="" className="h-[70vh] min-h-[28rem] w-full" />
       </div>
     </div>
   );
@@ -1889,10 +2059,18 @@ interface UploadReviewState {
   businessType: BusinessType;
   revenue: FormRevenue[];
   expenses: FormExpense[];
+  /** Month detected from the statement (null = not found). */
+  period: StatementPeriod | null;
+  /** Month the totals will be logged against ("" = not chosen yet). */
+  month: string;
+  /** Log the reviewed totals into the Fiscal Year Tracker when the report is generated. */
+  logToTracker: boolean;
+  /** Month already logged from this review (prevents double logging). */
+  loggedMonth: string | null;
 }
 
 /** Parsed statement lines → editable form rows. Amounts are shown with cents; margins as percents. */
-function toReviewState(items: { businessType: BusinessType; revenue: RevenueLine[]; expenses: ExpenseLine[] }, mode: WorkspaceMode): UploadReviewState {
+function toReviewState(items: { businessType: BusinessType; revenue: RevenueLine[]; expenses: ExpenseLine[] }, mode: WorkspaceMode, period: StatementPeriod | null): UploadReviewState {
   const personal = mode === "PERSONAL";
   // A business workspace always gets a business analysis, even if the statement looked personal.
   const businessType: BusinessType = personal ? "PERSONAL_FAMILY" : items.businessType === "PERSONAL_FAMILY" ? "OTHER_CUSTOM" : items.businessType;
@@ -1905,10 +2083,34 @@ function toReviewState(items: { businessType: BusinessType; revenue: RevenueLine
       oneTime: r.oneTime === true,
     })),
     expenses: items.expenses.map((e) => ({ ...blankExpense(e.category), label: e.label, amount: e.amount.toFixed(2), oneTime: e.oneTime === true })),
+    period,
+    month: period?.key ?? "",
+    logToTracker: !!period,
+    loggedMonth: null,
   };
 }
 
-function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; disabled: boolean; onSubmit: (init: RequestInit, businessType?: BusinessType) => Promise<boolean> }) {
+/** The reviewed rows → that month's actual totals (exact to the cent). */
+function reviewTotals(review: UploadReviewState): MonthActual {
+  return statementTotals({
+    revenue: validRevenueRows(review.revenue).map((r) => ({ amount: Number(r.amount) })),
+    expenses: validExpenseRows(effectiveExpenses(review.expenses, review.revenue)).map((e) => ({ amount: Number(e.amount), oneTime: e.oneTime })),
+  });
+}
+
+function StatementUploader({
+  mode,
+  disabled,
+  onSubmit,
+  trackerReady,
+  onLogActuals,
+}: {
+  mode: WorkspaceMode;
+  disabled: boolean;
+  onSubmit: (init: RequestInit, businessType?: BusinessType) => Promise<boolean>;
+  trackerReady: boolean;
+  onLogActuals: (key: string, actual: MonthActual) => string;
+}) {
   const personal = mode === "PERSONAL";
   const [file, setFile] = useState<File | null>(null);
   const [pasted, setPasted] = useState("");
@@ -1945,9 +2147,9 @@ function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; 
       const init = documentInit(true);
       const res = await fetch("/api/analyze", { method: "POST", ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...(await authHeaders()) } });
       if (!res.ok) throw new Error(await errorMessage(res));
-      const data = (await res.json()) as { items?: unknown };
+      const data = (await res.json()) as { items?: unknown; period?: unknown };
       if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response from the analysis service.");
-      setReview(toReviewState(data.items, mode));
+      setReview(toReviewState(data.items, mode, isStatementPeriod(data.period) ? data.period : null));
     } catch (e) {
       setExtractError(e instanceof Error ? e.message : "Couldn't read the statement.");
     } finally {
@@ -1963,6 +2165,8 @@ function StatementUploader({ mode, disabled, onSubmit }: { mode: WorkspaceMode; 
         setReview={setReview}
         disabled={disabled}
         onBack={() => setReview(null)}
+        trackerReady={trackerReady}
+        onLogActuals={onLogActuals}
         onGenerate={(payload) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType)}
       />
     );
@@ -2076,6 +2280,8 @@ function UploadReview({
   disabled,
   onBack,
   onGenerate,
+  trackerReady,
+  onLogActuals,
 }: {
   mode: WorkspaceMode;
   review: UploadReviewState;
@@ -2083,6 +2289,8 @@ function UploadReview({
   disabled: boolean;
   onBack: () => void;
   onGenerate: (payload: FormPayload) => Promise<boolean>;
+  trackerReady: boolean;
+  onLogActuals: (key: string, actual: MonthActual) => string;
 }) {
   const personal = mode === "PERSONAL";
   const copy = MODE_COPY[mode];
@@ -2091,6 +2299,19 @@ function UploadReview({
   const validExpenses = validExpenseRows(effectiveExpenses(expenses, revenue));
   const setRevenue = (fn: (rows: FormRevenue[]) => FormRevenue[]) => setReview((r) => r && { ...r, revenue: fn(r.revenue) });
   const setExpenses = (fn: (rows: FormExpense[]) => FormExpense[]) => setReview((r) => r && { ...r, expenses: fn(r.expenses) });
+  const [logNote, setLogNote] = useState<string | null>(null);
+  const totals = reviewTotals(review);
+  const canLog = trackerReady && !!review.month && (totals.revenue > 0 || totals.expenses > 0);
+  const logNow = () => {
+    if (!canLog) return;
+    setLogNote(onLogActuals(review.month, totals));
+    setReview((r) => r && { ...r, loggedMonth: r.month });
+  };
+  const generate = async () => {
+    // Log first so the tracker (and goal pace) already reflect this month when the report opens.
+    if (review.logToTracker && canLog && review.loggedMonth !== review.month) logNow();
+    await onGenerate({ mode: "form", businessType, origin: "statement", ...toPayloadLines(revenue, expenses, personal) });
+  };
 
   return (
     <div className={cn(glass, "flex h-full flex-col p-6")}>
@@ -2128,6 +2349,47 @@ function UploadReview({
         <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
           <ReviewSummary mode={mode} businessType={businessType} revenue={validRevenue} expenses={validExpenses} />
         </div>
+
+        <section aria-label="Statement month" className="rounded-xl border border-indigo-300/25 bg-indigo-500/[0.06] p-4">
+          <StatementMonthPicker
+            detected={review.period}
+            value={review.month}
+            onChange={(month) => {
+              setLogNote(null);
+              setReview((r) => r && { ...r, month, logToTracker: true });
+            }}
+          />
+          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/10 pt-3 text-xs">
+            <label className="inline-flex cursor-pointer items-center gap-2 text-slate-300">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-indigo-400"
+                checked={review.logToTracker}
+                disabled={!review.month}
+                onChange={(e) => setReview((r) => r && { ...r, logToTracker: e.target.checked })}
+              />
+              Log these totals as {review.month ? periodLabel(review.month) : "this month's"} actuals in the Fiscal Year Tracker
+            </label>
+            <span className="tabular-nums text-slate-500">
+              {exactMoney(totals.revenue)} in · {exactMoney(totals.expenses)} out{totals.oneTimeExpenses ? ` (${exactMoney(totals.oneTimeExpenses)} one-time)` : ""}
+            </span>
+            <button
+              type="button"
+              onClick={logNow}
+              disabled={!canLog || review.loggedMonth === review.month}
+              className="ml-auto rounded-lg border border-indigo-300/30 px-2.5 py-1 text-indigo-100 hover:bg-indigo-400/10 disabled:opacity-40"
+              title={trackerReady ? "Log now without generating a report" : "The tracker is still loading"}
+            >
+              {review.loggedMonth === review.month && review.month ? "Logged ✓" : "Log now"}
+            </button>
+          </div>
+          {logNote && (
+            <p role="status" className="mt-2 flex items-start gap-1.5 text-xs text-emerald-200">
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {logNote}
+            </p>
+          )}
+          <p className="mt-2 text-[11px] text-slate-500">Uses the reviewed lines above for a single month; only the monthly totals are saved, never the statement.</p>
+        </section>
       </div>
 
       {validRevenue.length === 0 && (
@@ -2140,7 +2402,7 @@ function UploadReview({
         </button>
         <button
           type="button"
-          onClick={() => void onGenerate({ mode: "form", businessType, origin: "statement", ...toPayloadLines(revenue, expenses, personal) })}
+          onClick={() => void generate()}
           disabled={disabled || validRevenue.length === 0}
           className={primaryBtn}
         >
@@ -2389,12 +2651,15 @@ function ProjectionCharts({
   onSettingsChange,
   cpi,
   inflationLabel,
+  actuals,
 }: {
   analysis: FinancialAnalysis;
   settings: ForecastSettings;
   onSettingsChange: (s: ForecastSettings) => void;
   cpi: CpiReading | null;
   inflationLabel: string;
+  /** Logged monthly actuals, for fitting the seasonal curve. */
+  actuals?: Record<string, MonthActual>;
 }) {
   const { rows } = useDerived(analysis);
   const [showTable, setShowTable] = useState(false);
@@ -2426,7 +2691,7 @@ function ProjectionCharts({
           {showTable ? "Show chart" : "Show table"}
         </button>
       </div>
-      <ForecastControls settings={settings} onChange={onSettingsChange} cpi={cpi} className="mt-4" />
+      <ForecastControls settings={settings} onChange={onSettingsChange} cpi={cpi} className="mt-4" businessType={analysis.businessType} actuals={actuals} />
 
       {showTable ? (
         <div className="relative mt-4 max-h-[32rem] overflow-auto">

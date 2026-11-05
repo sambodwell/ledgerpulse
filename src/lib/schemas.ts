@@ -463,6 +463,64 @@ export const SEASONALITY: Record<BusinessType, { revenue: number[]; expenses: nu
   },
 };
 
+/** A 12-month (January → December) multiplier curve for revenue and expenses. */
+export interface SeasonalCurve {
+  revenue: number[];
+  expenses: number[];
+}
+
+/** Default seasonality strength: 1 = the full historical curve, 0 = flat, 2 = twice as pronounced. */
+export const DEFAULT_SEASONALITY_STRENGTH = 1;
+export const MAX_SEASONALITY_STRENGTH = 2;
+
+export const clampStrength = (v: unknown) =>
+  typeof v === "number" && Number.isFinite(v) ? Math.min(MAX_SEASONALITY_STRENGTH, Math.max(0, Math.round(v * 100) / 100)) : DEFAULT_SEASONALITY_STRENGTH;
+
+/** Validates a stored custom curve: two arrays of 12 positive multipliers (0.2–3), or null. */
+export function normalizeSeasonalCurve(v: unknown): SeasonalCurve | null {
+  if (!v || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  const row = (x: unknown) =>
+    Array.isArray(x) && x.length === 12 && x.every((n) => typeof n === "number" && Number.isFinite(n)) ? (x as number[]).map((n) => Math.min(3, Math.max(0.2, Math.round(n * 1000) / 1000))) : null;
+  const revenue = row(r.revenue);
+  const expenses = row(r.expenses);
+  return revenue && expenses ? { revenue, expenses } : null;
+}
+
+/** Rescales a row so it averages exactly 1.0 (reshapes months without changing the annual total). */
+const normalizeRow = (xs: number[]) => {
+  const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+  return mean > 0 ? xs.map((x) => x / mean) : xs.map(() => 1);
+};
+
+/**
+ * The seasonal multipliers actually applied: the owner's custom curve (if any) or the business type's historical
+ * curve, re-normalized to average 1.0, then scaled by `strength`: multiplier = 1 + strength × (curve − 1).
+ */
+export function effectiveSeasonalCurve(businessType: BusinessType, strength: number = DEFAULT_SEASONALITY_STRENGTH, custom?: SeasonalCurve | null): SeasonalCurve {
+  const src = custom ?? SEASONALITY[businessType];
+  const k = clampStrength(strength);
+  const scale = (xs: number[]) => normalizeRow(xs).map((x) => Math.max(0.05, 1 + k * (x - 1)));
+  return { revenue: scale(src.revenue), expenses: scale(src.expenses) };
+}
+
+/**
+ * Builds a revenue/expense curve from logged monthly actuals (calendar-month index → value): each logged month's
+ * value ÷ the average of the logged months; months without data stay at 1.0. Needs at least 3 logged months.
+ */
+export function curveFromActuals(byMonth: { month: number; revenue: number; expenses: number }[]): SeasonalCurve | null {
+  const valid = byMonth.filter((m) => m.month >= 0 && m.month <= 11);
+  if (valid.length < 3) return null;
+  const build = (pick: (m: { revenue: number; expenses: number }) => number) => {
+    const avg = valid.reduce((a, m) => a + pick(m), 0) / valid.length;
+    const out = Array(12).fill(1) as number[];
+    if (avg <= 0) return out;
+    for (const m of valid) out[m.month] = Math.min(3, Math.max(0.2, Math.round((pick(m) / avg) * 1000) / 1000));
+    return out;
+  };
+  return { revenue: build((m) => m.revenue), expenses: build((m) => m.expenses) };
+}
+
 /**
  * Share of inflation a business can pass through to customers via pricing.
  * Expenses always absorb 100% of inflation.
@@ -521,6 +579,10 @@ export interface ForecastSettings {
   inflationSource: InflationSource;
   /** Owner's custom annual rate (e.g. 0.05 = 5%) used when inflationSource is CUSTOM. */
   customInflationRate: number;
+  /** How pronounced the seasonal curve is: 0 = flat, 1 = historical curve, up to 2. */
+  seasonalityStrength: number;
+  /** Owner's own month-by-month curve, replacing the business type's historical one (null = use the default). */
+  seasonalCustom: SeasonalCurve | null;
 }
 
 export type InflationSource = "CPI" | "CUSTOM";
@@ -550,6 +612,8 @@ export const DEFAULT_FORECAST: ForecastSettings = {
   inflation: false,
   inflationSource: "CPI",
   customInflationRate: DEFAULT_INFLATION_RATE,
+  seasonalityStrength: DEFAULT_SEASONALITY_STRENGTH,
+  seasonalCustom: null,
 };
 
 /** The annual inflation rate projections use for these settings (live CPI unless the owner overrides it). */
@@ -577,12 +641,21 @@ export function normalizeForecastSettings(raw: unknown): ForecastSettings {
     inflation: r.inflation === true,
     inflationSource: r.inflationSource === "CUSTOM" ? "CUSTOM" : "CPI",
     customInflationRate: Number.isFinite(rate) ? clampRate(rate) : d.customInflationRate,
+    seasonalityStrength: r.seasonalityStrength === undefined ? d.seasonalityStrength : clampStrength(r.seasonalityStrength),
+    seasonalCustom: normalizeSeasonalCurve(r.seasonalCustom),
   };
 }
 
-/** Projection options for forecast settings (start month, horizon, macro toggles). */
+/** Projection options for forecast settings (start month, horizon, macro toggles, seasonal weighting). */
 export function projectionOptions(s: ForecastSettings, now = new Date()): ProjectionOptions {
-  return { start: resolveForecastStart(s, now), months: s.months, seasonality: s.seasonality, inflation: s.inflation };
+  return {
+    start: resolveForecastStart(s, now),
+    months: s.months,
+    seasonality: s.seasonality,
+    inflation: s.inflation,
+    seasonalityStrength: s.seasonalityStrength,
+    seasonalCustom: s.seasonalCustom,
+  };
 }
 
 export const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"] as const;
@@ -620,12 +693,14 @@ export function projectionFactors(params: {
   flat?: boolean;
   seasonality?: boolean;
   inflation?: boolean;
+  seasonalityStrength?: number;
+  seasonalCustom?: SeasonalCurve | null;
 }): { month: string; revenue: number; expenses: number }[] {
   const { businessType, inflationRate = DEFAULT_INFLATION_RATE, start = defaultProjectionStart(), flat = false } = params;
   const useSeason = !flat && params.seasonality === true;
   const useInflation = !flat && params.inflation === true;
   const months = clampHorizon(params.months ?? PROJECTION_MONTHS);
-  const season = SEASONALITY[businessType];
+  const season = effectiveSeasonalCurve(businessType, params.seasonalityStrength, params.seasonalCustom);
   const passThrough = INFLATION_PASS_THROUGH[businessType];
   const out: { month: string; revenue: number; expenses: number }[] = [];
   for (let i = 1; i <= months; i++) {
@@ -651,6 +726,10 @@ export interface ProjectionOptions {
   seasonality?: boolean;
   /** Apply inflation (default off). */
   inflation?: boolean;
+  /** Seasonal weighting (0 = flat … 2); default 1. */
+  seasonalityStrength?: number;
+  /** Owner's custom seasonal curve (replaces the business type's). */
+  seasonalCustom?: SeasonalCurve | null;
 }
 
 /**
@@ -742,6 +821,8 @@ export function applyScenario(base: ScenarioBaseline, adjustments: ScenarioAdjus
     flat: opts.flat,
     seasonality: opts.seasonality,
     inflation: opts.inflation,
+    seasonalityStrength: opts.seasonalityStrength,
+    seasonalCustom: opts.seasonalCustom,
   });
   const months = factors.length;
   const revTotals = splitTotals(base.itemizedRevenue);
@@ -899,8 +980,8 @@ export function explainScenario(base: ScenarioBaseline, adjustments: ScenarioAdj
   const linearTotal = round2(sum(items, (i) => i.netEffect));
   const compounding = round2(flat.delta - linearTotal);
   const seasonalityInflation = round2(full.delta - linearTotal - compounding);
-  const season = SEASONALITY[base.businessType];
-  const range = (xs: number[]): [number, number] => [Math.min(...xs), Math.max(...xs)];
+  const season = effectiveSeasonalCurve(base.businessType, opts.seasonalityStrength, opts.seasonalCustom);
+  const range =(xs: number[]): [number, number] => [Math.min(...xs), Math.max(...xs)];
   return {
     months,
     baseProjected: full.baselineAnnualNet,

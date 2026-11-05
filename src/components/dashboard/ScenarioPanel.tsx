@@ -92,11 +92,18 @@ export function ScenarioPanel({
     const out = new Map<number, Computed>();
     for (const e of entries) {
       if (!e.plan) continue;
-      const opts = { start, months, seasonality: settings.seasonality, inflation: settings.inflation };
+      const opts = {
+        start,
+        months,
+        seasonality: settings.seasonality,
+        inflation: settings.inflation,
+        seasonalityStrength: settings.seasonalityStrength,
+        seasonalCustom: settings.seasonalCustom,
+      };
       out.set(e.id, { result: applyScenario(baseline, e.plan.adjustments, opts), breakdown: explainScenario(baseline, e.plan.adjustments, opts) });
     }
     return out;
-  }, [entries, baseline, start, months, settings.seasonality, settings.inflation]);
+  }, [entries, baseline, start, months, settings.seasonality, settings.inflation, settings.seasonalityStrength, settings.seasonalCustom]);
 
   useEffect(() => {
     if (!workspaceId) return;
