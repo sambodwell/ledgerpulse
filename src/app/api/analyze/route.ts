@@ -32,6 +32,7 @@ import {
 } from "@/lib/schemas";
 import { isSupabaseConfigured } from "@/lib/supabase";
 import { detectStatementPeriod, periodFromModel, type StatementPeriod } from "@/lib/statementPeriod";
+import { DOCUMENT_KINDS, REVIEW_FLAG_KINDS, type ReviewFlag } from "@/lib/batchStatements";
 import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, resolveViewer, seal, unseal, type Viewer } from "@/lib/server/entitlements";
 
 /**
@@ -43,7 +44,9 @@ import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, reso
  *   - multipart `mode=extract` or JSON { mode: "extract", rawText, businessType? }
  *                          → { items: ExtractedLineItems, period: StatementPeriod | null, months: { period, items }[] } only (no audit;
  *                            `months` splits a multi-month report — H1, quarterly, annual — into its calendar months), so the owner can review
- *                            and edit the parsed lines, then submit them back as mode "form"
+ *                            and edit the parsed lines, then submit them back as mode "form". Also returns documentKind,
+ *                            endingBalance (bank statements only) and reviewFlags (unrecognized merchants, duplicate transaction IDs,
+ *                            unusual charges) for the review screen
  *   - application/json:    { mode: "form", businessType, revenue: RevenueLine[], expenses: ExpenseLine[], origin? }
  *   - application/json:    { mode: "unlock", sealed }                 (signed-in; Pro or 1 report unlock)
  *   - application/json:    { mode: "scenario", prompt, baseline, horizon?, start? }  (Pro; start = "YYYY-MM" first projected month)
@@ -558,12 +561,40 @@ const EXPENSE_ITEM_SCHEMA = {
 /** Same line shapes, but amounts are that one calendar month's actual total (never an average). */
 const monthAmount = { type: "number", description: "The exact USD total for THIS calendar month only (not an average)" } as const;
 
+const MAX_REVIEW_FLAGS = 40;
+
 const LINE_ITEMS_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["businessType", "statementMonth", "itemizedRevenue", "itemizedExpenses", "months"],
+  required: ["businessType", "documentKind", "statementMonth", "endingBalance", "itemizedRevenue", "itemizedExpenses", "months", "reviewFlags"],
   properties: {
     businessType: EXTRACTION_SCHEMA.properties.businessType,
+    documentKind: {
+      type: "string",
+      enum: [...DOCUMENT_KINDS],
+      description: "BANK_STATEMENT = checking / savings transaction log; CREDIT_CARD_STATEMENT = card transaction log (e.g. Chase, Amex); PROFIT_AND_LOSS = a summarized P&L / income statement; OTHER otherwise.",
+    },
+    endingBalance: {
+      anyOf: [{ type: "number" }, { type: "null" }],
+      description: "BANK_STATEMENT only: the account's ending / closing balance in USD for the latest period shown, exactly to the cent. null for credit cards, P&Ls, or when no balance is printed.",
+    },
+    reviewFlags: {
+      type: "array",
+      description: "Raw transactions the owner should double-check. Empty when nothing stands out.",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "merchant", "amount", "date", "transactionId", "note"],
+        properties: {
+          kind: { type: "string", enum: [...REVIEW_FLAG_KINDS] },
+          merchant: { type: "string", description: "Merchant / payee exactly as printed" },
+          amount: { type: "number", description: "Transaction amount in USD (positive)" },
+          date: { type: "string", description: "YYYY-MM-DD, or empty string if not shown" },
+          transactionId: { type: "string", description: "Reference / transaction ID as printed (for duplicates, list both IDs separated by a comma), or empty string" },
+          note: { type: "string", description: "One short sentence on why it was flagged" },
+        },
+      },
+    },
     statementMonth: {
       type: "string",
       description: "The calendar month this statement covers as YYYY-MM (e.g. 2026-03 for a March 2026 statement or a statement period ending March 31, 2026). Empty string if it spans several months or cannot be determined.",
@@ -597,7 +628,19 @@ Multi-month documents: one file can cover many months (an H1 or H2 report, a qua
 - Assign every transaction / row value to the calendar month it is dated or labeled in, and total it within that month. Each month's amounts are that month's ACTUAL totals, not averages. Use the same label and category for the same line across months.
 - Skip "Total", "YTD", "Year to date", "H1"/"H2", quarter and average columns or rows: they are sums of the months, and including them would double count.
 - In that case set statementMonth to "" and leave itemizedRevenue and itemizedExpenses empty (they are derived from the months).
-When the document covers a single month, return "months" as an empty array and fill the top-level lists as usual.`;
+When the document covers a single month, return "months" as an empty array and fill the top-level lists as usual.
+
+Raw bank and credit card statements (checking / savings transaction logs, Chase / Amex / Capital One style card activity) list individual transactions rather than a summarized P&L. Set "documentKind" accordingly, then:
+- Group transactions by merchant (and by calendar month for multi-month logs) into one line per merchant, with a clean merchant name as the label (e.g. "ADOBE *CREATIVE CLD 800-833-6687 CA" → "Adobe Creative Cloud"). Use the SAME label for the same merchant in every month so price changes can be compared across statements. Net refunds and reversals against the merchant they came from.
+- Auto-categorize every line into one of four groups, using the category template for the business type:
+  1. Revenue — customer deposits, card-processor and marketplace payouts (Stripe, Square, Shopify, PayPal, Amazon, Etsy), invoice payments received. Never count transfers in from the owner's own accounts, loan proceeds or refunds as revenue.
+  2. Recurring Software — subscriptions and SaaS billed on a schedule: use the template's software category ("Software & SaaS", "Software & Dispatch", or "Subscriptions" for households).
+  3. COGS — inventory, wholesale, materials, parts and other direct job / product costs: use "Cost of Goods Sold" or the template's materials category ("Supplies & Materials").
+  4. One-Time Expenses — a charge that clearly won't repeat (a single equipment purchase, a late fee, a one-off repair): mark "oneTime": true with its full amount.
+  Every other recurring operating cost goes in the closest template category. Bank fees, interest and finance charges are their own lines.
+- Payments to the card itself ("Payment Thank You", "AUTOPAY PAYMENT"), transfers between the owner's accounts and balance lines are never expenses.
+- reviewFlags: flag (a) UNRECOGNIZED_MERCHANT — a descriptor you can't identify as a known business or that looks like a possible unauthorized charge; (b) DUPLICATE_TRANSACTION — two or more charges with the same merchant and amount on the same or adjacent days, or a repeated transaction / reference ID; (c) UNUSUAL_CHARGE — a charge far larger than that merchant's normal amount. Include the transaction ID(s) when printed. Flagged charges are still included in the line items; flags are for the owner to check, not exclusions.
+- endingBalance: for a BANK_STATEMENT, the closing balance for the latest period; otherwise null.`;
 
 /** Upper bound on months read from one document (five years of monthly columns). */
 const MAX_DOCUMENT_MONTHS = 60;
@@ -632,8 +675,38 @@ function extractedMonths(raw: unknown, businessType: BusinessType): { period: St
   return [...byKey.values()].sort((a, b) => a.period.key.localeCompare(b.period.key)).slice(-MAX_DOCUMENT_MONTHS);
 }
 
+function reviewFlags(raw: unknown): ReviewFlag[] {
+  const seen = new Set<string>();
+  return arr<Record<string, unknown>>(raw)
+    .filter((f) => f && typeof f === "object" && (REVIEW_FLAG_KINDS as readonly unknown[]).includes(f.kind))
+    .map((f) => ({
+      kind: f.kind as ReviewFlag["kind"],
+      merchant: str(f.merchant).trim().slice(0, 120),
+      amount: round2(Math.abs(num(f.amount))),
+      date: /^d{4}-d{2}-d{2}$/.test(str(f.date)) ? str(f.date) : "",
+      transactionId: str(f.transactionId).trim().slice(0, 120),
+      note: str(f.note).trim().slice(0, 240),
+    }))
+    .filter((f) => {
+      const k = `${f.kind}|${f.merchant.toLowerCase()}|${f.amount}|${f.date}|${f.transactionId}`;
+      if (!f.merchant || seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .slice(0, MAX_REVIEW_FLAGS);
+}
+
 async function handleExtract(document: DocumentInput) {
-  const raw = await callStructured<{ businessType?: unknown; statementMonth?: unknown; itemizedRevenue?: unknown; itemizedExpenses?: unknown; months?: unknown }>({
+  const raw = await callStructured<{
+    businessType?: unknown;
+    documentKind?: unknown;
+    statementMonth?: unknown;
+    endingBalance?: unknown;
+    itemizedRevenue?: unknown;
+    itemizedExpenses?: unknown;
+    months?: unknown;
+    reviewFlags?: unknown;
+  }>({
     system: buildSystemPrompt(),
     content: [...buildUserContent(document), { type: "text", text: EXTRACT_INSTRUCTIONS }],
     schema: LINE_ITEMS_SCHEMA,
@@ -643,12 +716,16 @@ async function handleExtract(document: DocumentInput) {
   const businessType: BusinessType = document.businessType ?? (isBusinessType(raw.businessType) ? raw.businessType : "OTHER_CUSTOM");
   const months = extractedMonths(raw.months, businessType);
   let items = extractedLines(raw, businessType);
+  const documentKind = (DOCUMENT_KINDS as readonly unknown[]).includes(raw.documentKind) ? (raw.documentKind as (typeof DOCUMENT_KINDS)[number]) : "OTHER";
+  // A closing balance only means "cash on hand" for a bank account (a card balance is money owed).
+  const endingBalance = documentKind === "BANK_STATEMENT" && typeof raw.endingBalance === "number" && Number.isFinite(raw.endingBalance) ? round2(raw.endingBalance) : null;
+  const meta = { documentKind, endingBalance, reviewFlags: reviewFlags(raw.reviewFlags) };
 
   if (months.length >= 2) {
     // Multi-month document: the months are authoritative. The top-level lists (if the model filled them anyway) are
     // ignored and replaced by every month's lines, so the response always carries the full document.
     items = { businessType, revenue: months.flatMap((m) => m.items.revenue), expenses: months.flatMap((m) => m.items.expenses) };
-    return json({ items, period: null, months });
+    return json({ items, period: null, months, ...meta });
   }
 
   // A single entry in "months" is just the statement's month.
@@ -658,7 +735,7 @@ async function handleExtract(document: DocumentInput) {
   }
   // Deterministic text detection first (exact statement-period headers); the model's reading covers scanned PDFs.
   const period = (document.kind === "text" ? detectStatementPeriod(document.text) : null) ?? periodFromModel(raw.statementMonth) ?? months[0]?.period ?? null;
-  return json({ items, period, months: [] });
+  return json({ items, period, months: [], ...meta });
 }
 
 function respondWithAnalysis(full: FinancialAnalysis, viewer: Viewer) {

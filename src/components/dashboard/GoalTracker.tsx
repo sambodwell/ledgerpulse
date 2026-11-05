@@ -170,7 +170,7 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
         </p>
         <p className="text-[11px] leading-relaxed text-slate-400 sm:text-xs">
           {label} {expense ? "budget" : "goal"} {exactMoney(pace.goal)}
-          {fyLabel ? ` · ${fyLabel}` : ""} · projected {exactMoney(pace.annual.projected)}
+          {fyLabel ? ` · ${fyLabel}` : ""} · on pace for {exactMoney(pace.annual.projected)} at year-end
         </p>
       </div>
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/10" aria-hidden>
@@ -287,29 +287,46 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
                 <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: CHART.legend }} />
                 <Line name={pace.metric === "EXPENSE" ? "Budget path" : "Goal path"} type="linear" dataKey="target" stroke={COLOR.baseline} strokeWidth={2} strokeDasharray="6 4" dot={false} isAnimationActive={false} />
                 <Line name="Actual" type="linear" dataKey="actual" stroke={COLOR.cash} strokeWidth={2.5} dot={{ r: 3, strokeWidth: 0, fill: COLOR.cash }} connectNulls={false} isAnimationActive={false} />
-                <Line name="Projected" type="linear" dataKey="projected" stroke={COLOR.cash} strokeOpacity={0.7} strokeWidth={2} strokeDasharray="3 3" dot={false} connectNulls={false} isAnimationActive={false} />
+                <Line name="On pace (projected)" type="linear" dataKey="projected" stroke={COLOR.cash} strokeOpacity={0.7} strokeWidth={2} strokeDasharray="3 3" dot={false} connectNulls={false} isAnimationActive={false} />
               </LineChart>
             </ResponsiveContainer>
           </div>
-          <p className="mt-1 text-[11px] text-slate-500">Cumulative {label.toLowerCase()} for the fiscal year. Solid = logged actuals, dotted = forecast for the remaining months.</p>
+          <p className="mt-1 text-[11px] text-slate-500">Cumulative {label.toLowerCase()} for the fiscal year. Solid = closed, logged actuals · dotted = where you&apos;re on pace to land in the remaining months (a projection, not results).</p>
         </div>
 
         <div className="lg:col-span-2">
           <p className="text-[11px] uppercase tracking-wide text-slate-500">By quarter</p>
           <ul className="mt-1 grid grid-cols-2 gap-2 text-xs">
-            {pace.quarters.map((q) => (
-              <li key={q.label} className="rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-2">
-                <p className="flex items-center justify-between text-slate-400">
-                  <span className="font-medium text-slate-200">{q.label}</span>
-                  <span className="text-[10px] uppercase">{q.basis === "ACTUAL" ? "Actual" : q.basis === "MIXED" ? "Partly actual" : "Forecast"}</span>
-                </p>
-                <p className={cn("mt-0.5 font-semibold tabular-nums", toneCls(q.variance))}>{paceWordsPct(q.variance, q.target, pace.metric)}</p>
-                <p className="text-[10px] tabular-nums text-slate-500">
-                  {exactMoney(q.value)} vs {exactMoney(q.target)}
-                </p>
-                <p className="text-[10px] text-slate-500">{q.months}</p>
-              </li>
-            ))}
+            {pace.quarters.map((q) => {
+              const closed = q.basis === "ACTUAL";
+              return (
+                <li
+                  key={q.label}
+                  className={cn("rounded-lg border px-2.5 py-2", closed ? "border-white/10 bg-white/[0.02]" : "border-dashed border-sky-300/30 bg-sky-500/[0.04]")}
+                >
+                  <p className="flex items-center justify-between gap-1 text-slate-400">
+                    <span className="font-medium text-slate-200">{q.label}</span>
+                    <span
+                      className={cn(
+                        "rounded px-1 py-px text-[10px] font-semibold uppercase tracking-wide",
+                        closed ? "bg-emerald-400/15 text-emerald-200" : q.basis === "MIXED" ? "bg-sky-400/15 text-sky-200" : "bg-white/5 text-slate-400",
+                      )}
+                    >
+                      {closed ? "Closed · actual" : q.basis === "MIXED" ? "In progress" : "Upcoming"}
+                    </span>
+                  </p>
+                  {!closed && <p className="mt-1 text-[10px] font-semibold uppercase tracking-wide text-sky-300">On pace for</p>}
+                  <p className={cn("font-semibold tabular-nums", closed && "mt-0.5", toneCls(q.variance))}>{paceWordsPct(q.variance, q.target, pace.metric)}</p>
+                  <p className="text-[10px] tabular-nums text-slate-500">
+                    {exactMoney(q.value)} {closed ? "actual" : "projected"} vs {exactMoney(q.target)}
+                  </p>
+                  <p className="text-[10px] text-slate-500">
+                    {q.months}
+                    {q.basis === "MIXED" ? " · partly logged" : ""}
+                  </p>
+                </li>
+              );
+            })}
           </ul>
         </div>
       </div>
@@ -331,7 +348,7 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
               {pace.months.map((m) => (
                 <tr key={m.key}>
                   <td className="py-1.5 text-slate-300">
-                    {m.label} <span className="text-[10px] uppercase text-slate-500">{m.status === "ACTUAL" ? "actual" : "forecast"}</span>
+                    {m.label} <span className={cn("text-[10px] uppercase", m.status === "ACTUAL" ? "text-slate-500" : "text-sky-300/80")}>{m.status === "ACTUAL" ? "actual" : "on pace"}</span>
                   </td>
                   <td className="py-1.5 text-right text-slate-200">{exactMoney(m.value)}</td>
                   <td className="py-1.5 text-right text-slate-400">{exactMoney(m.target)}</td>
@@ -342,7 +359,9 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
             </tbody>
             <tfoot className="border-t border-white/10 font-medium">
               <tr>
-                <td className="py-1.5 text-slate-300">Full year</td>
+                <td className="py-1.5 text-slate-300">
+                  Full year <span className="text-[10px] font-normal uppercase text-sky-300/80">on pace for</span>
+                </td>
                 <td className="py-1.5 text-right">{exactMoney(pace.annual.projected)}</td>
                 <td className="py-1.5 text-right text-slate-400">{exactMoney(pace.goal)}</td>
                 <td className={cn("py-1.5 text-right", toneCls(pace.annual.variance))}>{signedMoney(pace.annual.variance)}</td>
@@ -414,7 +433,7 @@ export function goalPaceBannerHtml(pace: GoalPace, fyLabel: string, esc: (s: str
         : ` ${exactMoney(pace.remainingToGoal)} to go (${exactMoney(pace.requiredMonthly)}/mo needed).`;
   return `<div class="pace-banner ${good ? "pace-good" : "pace-bad"}">
 <div class="pace-head">${reached ? `Goal Reached! ${esc(signedMoney(pace.ytd.value - pace.goal))} past the goal in logged actuals` : esc(annualDeltaWords(pace))}</div>
-<div class="muted">${esc(label)} ${expense ? "budget" : "goal"} ${exactMoney(pace.goal)} · ${esc(fyLabel)} · projected year-end ${exactMoney(pace.annual.projected)}</div>
+<div class="muted">${esc(label)} ${expense ? "budget" : "goal"} ${exactMoney(pace.goal)} · ${esc(fyLabel)} · on pace for ${exactMoney(pace.annual.projected)} at year-end</div>
 <div style="margin-top:4px">${ytd}${need}</div>
 </div>`;
 }
@@ -425,10 +444,10 @@ export function goalPaceReportHtml(pace: GoalPace, fyLabel: string, esc: (s: str
   const metric = GOAL_METRIC_LABEL[pace.metric];
   const words = (v: number, t: number) => esc(paceWordsPct(v, t, pace.metric));
   const q = pace.quarters
-    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">(${esc(x.months)} · ${x.basis === "ACTUAL" ? "actual" : x.basis === "MIXED" ? "partly actual" : "forecast"})</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${words(x.variance, x.target)}</td></tr>`)
+    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">(${esc(x.months)} · ${x.basis === "ACTUAL" ? "closed · actual" : x.basis === "MIXED" ? "in progress · on pace for" : "upcoming · on pace for"})</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${words(x.variance, x.target)}</td></tr>`)
     .join("");
   const m = pace.months
-    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">${x.status === "ACTUAL" ? "actual" : "forecast"}</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${esc(signedMoney(x.variance))}</td><td class="${cls(x.variance)}">${esc(signedPct(x.variance, x.target) || "—")}</td></tr>`)
+    .map((x) => `<tr><td>${esc(x.label)} <span class="muted">${x.status === "ACTUAL" ? "actual" : "on pace"}</span></td><td>${exactMoney(x.value)}</td><td>${exactMoney(x.target)}</td><td class="${cls(x.variance)}">${esc(signedMoney(x.variance))}</td><td class="${cls(x.variance)}">${esc(signedPct(x.variance, x.target) || "—")}</td></tr>`)
     .join("");
   return `<h2>Goal pace detail · ${esc(fyLabel)}</h2>
 <p><strong>${esc(metric)} ${pace.metric === "EXPENSE" ? "budget" : "goal"}: ${exactMoney(pace.goal)}</strong> (${exactMoney(pace.monthlyTarget)}/mo straight-line). ${esc(pace.headline.charAt(0).toUpperCase() + pace.headline.slice(1))}.</p>

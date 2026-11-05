@@ -125,7 +125,8 @@ export interface MacroProjection {
   projectedExpenses: number;
 }
 
-export const AUDIT_FLAG_SOURCES = ["MODEL", "MISSING_CATEGORY", "BUDGET_RULE"] as const;
+/** PRICE_CREEP = detected client-side from the workspace's multi-month statement history (lib/vendorCreep). */
+export const AUDIT_FLAG_SOURCES = ["MODEL", "MISSING_CATEGORY", "BUDGET_RULE", "PRICE_CREEP"] as const;
 export type AuditFlagSource = (typeof AUDIT_FLAG_SOURCES)[number];
 
 export interface AuditFlag {

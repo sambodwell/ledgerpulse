@@ -24,7 +24,7 @@ export interface SeasonalityPatch {
 }
 
 /** Logged actuals → one entry per calendar month (several years of the same month are averaged). */
-function actualsByCalendarMonth(actuals: Record<string, MonthActual>) {
+export function actualsByCalendarMonth(actuals: Record<string, MonthActual>) {
   const acc = new Map<number, { revenue: number; expenses: number; n: number }>();
   for (const [key, a] of Object.entries(actuals)) {
     const month = Number(key.slice(5, 7)) - 1;

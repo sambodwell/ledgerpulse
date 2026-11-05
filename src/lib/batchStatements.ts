@@ -37,6 +37,38 @@ export interface ParsedStatement {
    * shared by every month read from that one file, and the file's display name. One file → one saved document.
    */
   source?: { id: string; name: string };
+  /** Raw transactions the parser asked the owner to double-check (unrecognized merchants, duplicates, unusual charges). */
+  reviewFlags?: ReviewFlag[];
+}
+
+/** What the parser recognized the document as. */
+export const DOCUMENT_KINDS = ["BANK_STATEMENT", "CREDIT_CARD_STATEMENT", "PROFIT_AND_LOSS", "OTHER"] as const;
+export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
+
+export const REVIEW_FLAG_KINDS = ["UNRECOGNIZED_MERCHANT", "DUPLICATE_TRANSACTION", "UNUSUAL_CHARGE"] as const;
+export type ReviewFlagKind = (typeof REVIEW_FLAG_KINDS)[number];
+
+export const REVIEW_FLAG_LABELS: Record<ReviewFlagKind, string> = {
+  UNRECOGNIZED_MERCHANT: "Unrecognized merchant",
+  DUPLICATE_TRANSACTION: "Possible duplicate",
+  UNUSUAL_CHARGE: "Unusual charge",
+};
+
+export const DOCUMENT_KIND_LABELS: Record<DocumentKind, string> = {
+  BANK_STATEMENT: "Bank statement",
+  CREDIT_CARD_STATEMENT: "Credit card statement",
+  PROFIT_AND_LOSS: "P&L",
+  OTHER: "Document",
+};
+
+export interface ReviewFlag {
+  kind: ReviewFlagKind;
+  merchant: string;
+  amount: number;
+  /** "YYYY-MM-DD" or "". */
+  date: string;
+  transactionId: string;
+  note: string;
 }
 
 /** What `/api/analyze` mode "extract" returns, validated. */
@@ -45,16 +77,33 @@ export interface ExtractResult {
   period: StatementPeriod | null;
   /** Two or more calendar months when the document spans several (oldest first); otherwise empty. */
   months: { period: StatementPeriod; items: ExtractedLineItems }[];
+  documentKind: DocumentKind;
+  /** Closing balance of a bank (checking / savings) statement; null otherwise. */
+  endingBalance: number | null;
+  reviewFlags: ReviewFlag[];
+}
+
+function isReviewFlag(v: unknown): v is ReviewFlag {
+  if (!v || typeof v !== "object") return false;
+  const f = v as Record<string, unknown>;
+  return (REVIEW_FLAG_KINDS as readonly unknown[]).includes(f.kind) && typeof f.merchant === "string" && typeof f.amount === "number" && typeof f.note === "string";
 }
 
 export function parseExtractResponse(data: unknown): ExtractResult | null {
   if (!data || typeof data !== "object") return null;
-  const d = data as { items?: unknown; period?: unknown; months?: unknown };
+  const d = data as { items?: unknown; period?: unknown; months?: unknown; documentKind?: unknown; endingBalance?: unknown; reviewFlags?: unknown };
   if (!isExtractedLineItems(d.items)) return null;
   const months = Array.isArray(d.months)
     ? d.months.filter((m): m is ExtractResult["months"][number] => !!m && typeof m === "object" && isStatementPeriod((m as { period?: unknown }).period) && isExtractedLineItems((m as { items?: unknown }).items))
     : [];
-  return { items: d.items, period: isStatementPeriod(d.period) ? d.period : null, months: months.length >= 2 ? months : [] };
+  return {
+    items: d.items,
+    period: isStatementPeriod(d.period) ? d.period : null,
+    months: months.length >= 2 ? months : [],
+    documentKind: (DOCUMENT_KINDS as readonly unknown[]).includes(d.documentKind) ? (d.documentKind as DocumentKind) : "OTHER",
+    endingBalance: typeof d.endingBalance === "number" && Number.isFinite(d.endingBalance) ? d.endingBalance : null,
+    reviewFlags: Array.isArray(d.reviewFlags) ? d.reviewFlags.filter(isReviewFlag).map((f) => ({ ...f, date: typeof f.date === "string" ? f.date : "", transactionId: typeof f.transactionId === "string" ? f.transactionId : "" })) : [],
+  };
 }
 
 export interface BatchMonth {

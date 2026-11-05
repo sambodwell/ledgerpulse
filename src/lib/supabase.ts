@@ -537,6 +537,18 @@ export async function updateDocument(id: string, patch: { name?: string; period?
   if (error) throw new Error(error.message);
 }
 
+/**
+ * Replaces a document's line items (e.g. after removing a line from the monthly breakdown). A multi-month document
+ * keeps its lines in `items.months`; the top-level lists stay empty, as when it was first saved.
+ */
+export async function updateDocumentItems(doc: WorkspaceDocument, next: { items: ExtractedLineItems | null; months: DocumentMonthSlice[]; totals: WorkspaceDocumentTotals }): Promise<WorkspaceDocument> {
+  const base: ExtractedLineItems = next.items ?? { businessType: doc.items?.businessType ?? "OTHER_CUSTOM", revenue: [], expenses: [] };
+  const items = next.months.length ? { businessType: base.businessType, revenue: [], expenses: [], months: next.months } : base;
+  const { data, error } = await requireClient().from("workspace_documents").update({ items, totals: next.totals }).eq("id", doc.id).select(DOCUMENT_COLUMNS).single<DocumentRow>();
+  if (error) throw new Error(error.message);
+  return toDocument(data);
+}
+
 export async function deleteDocument(id: string) {
   const { error } = await requireClient().from("workspace_documents").delete().eq("id", id);
   if (error) throw new Error(error.message);
@@ -558,4 +570,75 @@ export async function saveWorkspaceReport(workspaceId: string, report: AnalysisR
   if (!u.user) throw new Error("Sign in to save reports.");
   const { error } = await c.from("workspace_reports").upsert({ workspace_id: workspaceId, user_id: u.user.id, report }, { onConflict: "workspace_id" });
   if (error) throw new Error(error.message);
+}
+
+// ---------------------------------------------------------------------------
+// Report versions (an immutable snapshot per analysis run, so new runs never erase earlier insights)
+// ---------------------------------------------------------------------------
+
+export type ReportVersionSource = "analysis" | "rebuild" | "unlock";
+
+export interface ReportVersionSummary {
+  source: ReportVersionSource;
+  monthlyRevenue?: number;
+  monthlyExpenses?: number;
+  /** Months of data the analysis covered ("YYYY-MM", oldest first), when known. */
+  months?: string[];
+  documents?: number;
+}
+
+export interface ReportVersionMeta {
+  id: string;
+  createdAt: string;
+  summary: ReportVersionSummary;
+}
+
+/** Versions kept per workspace (older ones are pruned after each save). */
+export const REPORT_VERSION_LIMIT = 25;
+
+function toVersionSummary(v: unknown): ReportVersionSummary {
+  const s = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+  const source: ReportVersionSource = s.source === "rebuild" || s.source === "unlock" ? s.source : "analysis";
+  const num = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? x : undefined);
+  const months = Array.isArray(s.months) ? s.months.filter((m): m is string => typeof m === "string" && PERIOD_RE.test(m)) : undefined;
+  return { source, monthlyRevenue: num(s.monthlyRevenue), monthlyExpenses: num(s.monthlyExpenses), months: months?.length ? months : undefined, documents: num(s.documents) };
+}
+
+export async function listReportVersions(workspaceId: string): Promise<ReportVersionMeta[]> {
+  const { data, error } = await requireClient()
+    .from("workspace_report_versions")
+    .select("id,summary,created_at")
+    .eq("workspace_id", workspaceId)
+    .order("created_at", { ascending: false })
+    .limit(REPORT_VERSION_LIMIT);
+  if (error) throw new Error(error.message);
+  return (data as { id: string; summary: unknown; created_at: string }[]).map((r) => ({ id: r.id, createdAt: r.created_at, summary: toVersionSummary(r.summary) }));
+}
+
+export async function loadReportVersion(id: string): Promise<AnalysisResponse | null> {
+  const { data, error } = await requireClient().from("workspace_report_versions").select("report").eq("id", id).maybeSingle<{ report: unknown }>();
+  if (error) throw new Error(error.message);
+  return data && isAnalysisResponse(data.report) ? data.report : null;
+}
+
+/** Appends a version and prunes the workspace's history to the newest REPORT_VERSION_LIMIT. */
+export async function saveReportVersion(workspaceId: string, report: AnalysisResponse, summary: ReportVersionSummary): Promise<ReportVersionMeta> {
+  const c = requireClient();
+  const { data: u } = await c.auth.getUser();
+  if (!u.user) throw new Error("Sign in to save reports.");
+  const { data, error } = await c
+    .from("workspace_report_versions")
+    .insert({ workspace_id: workspaceId, user_id: u.user.id, report, summary })
+    .select("id,summary,created_at")
+    .single<{ id: string; summary: unknown; created_at: string }>();
+  if (error) throw new Error(error.message);
+  const { data: old } = await c
+    .from("workspace_report_versions")
+    .select("id")
+    .eq("workspace_id", workspaceId)
+    .order("created_at", { ascending: false })
+    .range(REPORT_VERSION_LIMIT, REPORT_VERSION_LIMIT + 50);
+  const stale = (old as { id: string }[] | null)?.map((r) => r.id) ?? [];
+  if (stale.length) await c.from("workspace_report_versions").delete().in("id", stale);
+  return { id: data.id, createdAt: data.created_at, summary: toVersionSummary(data.summary) };
 }

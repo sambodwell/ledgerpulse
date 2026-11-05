@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Info, Lightbulb, Loader2, MessageCircle, Send, ShieldAlert, Sparkles, Target, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Info, Lightbulb, Loader2, MessageCircle, PiggyBank, Send, ShieldAlert, Sparkles, Target, TrendingUp, X } from "lucide-react";
 import type { AuditFlag, Severity } from "@/lib/schemas";
 import { exactMoney } from "@/lib/fiscal";
+import { periodLabel } from "@/lib/statementPeriod";
 import { authHeaders } from "@/lib/supabase";
 import { cn, errorMessage, glass, inputCls, primaryBtn } from "@/components/ui";
 
@@ -27,6 +28,20 @@ function playbookFor(flag: AuditFlag, f: Figures): Playbook {
   const three = exactMoney(f.monthlyExpenses * 3);
   const six = exactMoney(f.monthlyExpenses * 6);
   const tenPct = exactMoney(Math.max(0, f.monthlyRevenue * 0.1));
+
+  if (flag.source === "PRICE_CREEP") {
+    return {
+      why: "Vendors count on small, automatic price increases going unnoticed. Each one looks minor, but it compounds into a permanently higher cost base — and you pay the new rate every month until you push back.",
+      strategy: `Treat the original price as the target. Ask the vendor to restore it (or match a competitor), downgrade to the tier you actually use, or switch. Winning back the increase is worth ${exactMoney(flag.potentialSavings * 12)} a year.`,
+      steps: [
+        "Check the price history below against your contract or plan page — confirm it's a rate change, not added seats or usage.",
+        "Get one competing quote, then contact the vendor's retention / account team and ask for the original rate or a loyalty discount.",
+        "If they won't move, downgrade unused seats or features, or switch at the next renewal date (set a reminder a week before).",
+        "Mark this Implemented once the lower rate takes effect — it counts as realized savings from that month in the ROI & Savings Tracker.",
+      ],
+      questions: ["How do I negotiate a vendor price increase?", "Is it worth switching providers over this increase?", "How can I stop price creep from happening again?"],
+    };
+  }
 
   if (has("emergency", "cash reserve", "rainy", "reserve fund", "cushion")) {
     return {
@@ -126,9 +141,35 @@ interface Msg {
 }
 
 /** Detail view for one audit flag: why it matters, the strategy, concrete steps, and follow-up Q&A with the guide. */
-export function AuditDeepDive({ flag, figures, onClose, implemented, onToggleImplemented }: { flag: AuditFlag; figures: Figures; onClose: () => void; implemented?: boolean; onToggleImplemented?: () => void }) {
+/** Whole months from `since` ("YYYY-MM") through the current month, inclusive (the month it took effect counts). */
+function monthsSince(since: string | undefined, now = new Date()): number {
+  const m = /^(\d{4})-(\d{2})$/.exec(since ?? "");
+  if (!m) return 0;
+  return Math.max(0, (now.getFullYear() - Number(m[1])) * 12 + (now.getMonth() + 1 - Number(m[2])) + 1);
+}
+
+export function AuditDeepDive({
+  flag,
+  figures,
+  onClose,
+  implemented,
+  implementedSince,
+  onToggleImplemented,
+  priceHistory,
+}: {
+  flag: AuditFlag;
+  figures: Figures;
+  onClose: () => void;
+  implemented?: boolean;
+  /** "YYYY-MM" the saving took effect, for the realized-ROI figure. */
+  implementedSince?: string;
+  onToggleImplemented?: () => void;
+  /** Month-by-month bill for a price-creep alert, oldest first. */
+  priceHistory?: { period: string; amount: number }[];
+}) {
   const titleId = useId();
   const pb = playbookFor(flag, figures);
+  const realizedMonths = implemented ? monthsSince(implementedSince) : 0;
   const [messages, setMessages] = useState<Msg[]>([]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -198,6 +239,64 @@ export function AuditDeepDive({ flag, figures, onClose, implemented, onToggleImp
         </header>
 
         <div ref={listRef} className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain px-5 py-4 text-sm">
+          {priceHistory && priceHistory.length > 1 && (
+            <section>
+              <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                <TrendingUp className="h-3.5 w-3.5 text-rose-300" /> Price history
+              </h3>
+              <table className="mt-2 w-full text-xs tabular-nums">
+                <thead className="text-left text-[10px] uppercase tracking-wide text-slate-500">
+                  <tr>
+                    <th className="py-1 font-medium">Month</th>
+                    <th className="py-1 text-right font-medium">Bill</th>
+                    <th className="py-1 text-right font-medium">vs. first month</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {priceHistory.map((h) => {
+                    const diff = h.amount - priceHistory[0].amount;
+                    return (
+                      <tr key={h.period}>
+                        <td className="py-1.5 text-slate-300">{periodLabel(h.period)}</td>
+                        <td className="py-1.5 text-right text-slate-100">{exactMoney(h.amount)}</td>
+                        <td className={cn("py-1.5 text-right", diff > 0.004 ? "text-rose-300" : diff < -0.004 ? "text-emerald-300" : "text-slate-500")}>
+                          {Math.abs(diff) < 0.005 ? "—" : `${diff > 0 ? "+" : "−"}${exactMoney(Math.abs(diff))}`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </section>
+          )}
+          {flag.potentialSavings > 0 && (
+            <section className={cn("rounded-xl border p-3", implemented ? "border-emerald-400/30 bg-emerald-500/[0.07]" : "border-white/10 bg-white/[0.02]")}>
+              <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                <PiggyBank className="h-3.5 w-3.5 text-emerald-300" /> Return on acting
+              </h3>
+              <dl className="mt-2 grid grid-cols-3 gap-2 text-xs">
+                <div>
+                  <dt className="text-slate-500">Per month</dt>
+                  <dd className="mt-0.5 font-semibold tabular-nums text-slate-100">{exactMoney(flag.potentialSavings)}</dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Per year</dt>
+                  <dd className="mt-0.5 font-semibold tabular-nums text-slate-100">{exactMoney(flag.potentialSavings * 12)}</dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Realized so far</dt>
+                  <dd className={cn("mt-0.5 font-semibold tabular-nums", implemented ? "text-emerald-300" : "text-slate-500")}>
+                    {implemented ? exactMoney(flag.potentialSavings * realizedMonths) : "Not started"}
+                  </dd>
+                </div>
+              </dl>
+              <p className="mt-2 text-[11px] text-slate-500">
+                {implemented
+                  ? `Counted from ${implementedSince ? periodLabel(implementedSince) : "this month"} (${realizedMonths} month${realizedMonths === 1 ? "" : "s"}). Tracked in the ROI & Savings Tracker on the Fiscal Year tab.`
+                  : "Mark it implemented once the change takes effect to start counting realized savings."}
+              </p>
+            </section>
+          )}
           <section>
             <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400">
               <AlertTriangle className="h-3.5 w-3.5 text-amber-300" /> Why it matters

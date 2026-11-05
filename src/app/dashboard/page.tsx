@@ -10,11 +10,13 @@ import {
   Bookmark,
   Briefcase,
   CheckCircle2,
+  ChevronDown,
   ChevronUp,
   ClipboardList,
   Download,
   FileText,
   FolderOpen,
+  History,
   Home,
   Info,
   Loader2,
@@ -23,6 +25,7 @@ import {
   Plus,
   Repeat,
   Repeat1,
+  RotateCw,
   FolderPlus,
   Flag,
   LayoutDashboard,
@@ -81,18 +84,24 @@ import {
   deleteDocument,
   documentSlices,
   listDocuments,
+  listReportVersions,
+  loadReportVersion,
   loadWorkspaceReport,
   saveDocuments,
   saveFiscalTracker,
+  saveReportVersion,
   saveWorkspaceReport,
   updateDocument,
+  updateDocumentItems,
   updateWorkspace,
   type NewWorkspaceDocument,
+  type ReportVersionMeta,
+  type ReportVersionSummary,
   type WorkspaceDocument,
 } from "@/lib/supabase";
 import { exactMoney, normalizeTrackerState, statementTotals, withLoggedActual, type MonthActual } from "@/lib/fiscal";
 import { aggregateActuals, calibrateToActuals, resolveBasis, type ActualsAggregate, type ProjectionBasis } from "@/lib/projectionBasis";
-import { aggregateStatements, documentName, hashFile, parseExtractResponse, type ParsedStatement } from "@/lib/batchStatements";
+import { DOCUMENT_KIND_LABELS, REVIEW_FLAG_LABELS, aggregateStatements, documentName, hashFile, parseExtractResponse, type ParsedStatement } from "@/lib/batchStatements";
 import { periodLabel } from "@/lib/statementPeriod";
 import { StatementMonthPicker, statementMonthOptions } from "@/components/dashboard/StatementMonth";
 import { DocumentsHub } from "@/components/dashboard/DocumentsHub";
@@ -114,6 +123,15 @@ import { InfoTip } from "@/components/InfoTip";
 import { FeedbackWidget } from "@/components/dashboard/FeedbackWidget";
 import { MoneyInput } from "@/components/dashboard/MoneyInput";
 import { ExpenseShareCard } from "@/components/dashboard/ExpenseShare";
+import { CashFlowChart } from "@/components/dashboard/CashFlowChart";
+import { MonthlyBreakdown, type LineRef } from "@/components/dashboard/MonthlyBreakdown";
+import { WhatIfSimulator } from "@/components/dashboard/WhatIfSimulator";
+import { RunwayCard, breakEvenSentence, runwayFigures, runwaySentence } from "@/components/dashboard/RunwayCard";
+import { BenchmarkGauges, benchmarksReportHtml } from "@/components/dashboard/BenchmarkGauges";
+import { VendorCreepAlerts, useVendorCreep } from "@/components/dashboard/VendorCreepAlerts";
+import { useWorkspacePref } from "@/components/dashboard/useWorkspacePref";
+import { defaultBenchmarkProfile, evaluateBenchmarks, isBenchmarkProfile, type BenchmarkProfile } from "@/lib/benchmarks";
+import { creepHeadline, type VendorCreep } from "@/lib/vendorCreep";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
 
 const PRIVACY_BADGE = "🔒 256-Bit Encrypted | Zero File Retention — Statement files are parsed in memory and never stored; only the parsed results are saved to your private workspace.";
@@ -229,17 +247,72 @@ export default function DashboardPage() {
    */
   const [reportStatus, setReportStatus] = useState<Record<string, "ok" | "error">>({});
   const markReport = useCallback((id: string, s: "ok" | "error") => setReportStatus((cur) => (cur[id] === s ? cur : { ...cur, [id]: s })), []);
+
+  /*
+   * Report history: every new analysis appends an immutable version (workspace_report_versions), so re-running an
+   * analysis — e.g. after uploading more months — never silently replaces earlier insights. `activeVersion` is the
+   * version currently on screen (null = the latest report, or one not recorded as a version).
+   */
+  const [versionsByWs, setVersionsByWs] = useState<Record<string, ReportVersionMeta[]>>({});
+  const [activeVersion, setActiveVersion] = useState<Record<string, string | null>>({});
+  const versionsFetched = useRef<Set<string>>(new Set());
+  const loadVersions = useCallback(async (id: string) => {
+    versionsFetched.current.add(id);
+    try {
+      const list = await listReportVersions(id);
+      setVersionsByWs((cur) => ({ ...cur, [id]: list }));
+      return list;
+    } catch (e) {
+      // History is additive: a missing table (migration 0005 not applied yet) must never block the dashboard.
+      versionsFetched.current.delete(id);
+      console.warn("[report] versions unavailable", e);
+      return [];
+    }
+  }, []);
+  const recordVersion = useCallback((id: string, report: AnalysisResponse, summary: ReportVersionSummary) => {
+    if (id === "guest" || report.access.level !== "full") return;
+    saveReportVersion(id, report, summary)
+      .then((meta) => {
+        setVersionsByWs((cur) => ({ ...cur, [id]: [meta, ...(cur[id] ?? []).filter((v) => v.id !== meta.id)] }));
+        setActiveVersion((cur) => ({ ...cur, [id]: meta.id }));
+      })
+      .catch((e) => console.warn("[report] version save failed", e));
+  }, []);
+  /** Workspaces whose documents changed (line removed, document deleted / re-dated) since their report was generated. */
+  const [docsChangedFor, setDocsChangedFor] = useState<Set<string>>(new Set());
+  const markDocsChanged = (id: string, changed: boolean) =>
+    setDocsChangedFor((cur) => {
+      if (cur.has(id) === changed) return cur;
+      const next = new Set(cur);
+      if (changed) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+
+  const [reportReloadTick, setReportReloadTick] = useState(0);
   useEffect(() => {
     if (!userId || !activeWsId || reportFetched.current.has(activeWsId)) return;
     const id = activeWsId;
     reportFetched.current.add(id);
     setReportLoading(id);
+    void loadVersions(id);
     loadWorkspaceReport(id)
-      .then((r) => {
+      .then(async (r) => {
+        if (r) {
+          reportSynced.current[id] = r;
+          setResults((cur) => (cur[id] ? cur : { ...cur, [id]: r }));
+          markReport(id, "ok");
+          return;
+        }
+        // No latest report row (e.g. the tab closed before it saved): fall back to the newest saved version, so a
+        // workspace with history never lands on a dead "run analysis" state. It is re-saved as the latest below.
+        const versions = versionsFetched.current.has(id) ? await listReportVersions(id).catch(() => []) : [];
+        const newest = versions[0] ? await loadReportVersion(versions[0].id).catch(() => null) : null;
+        if (newest) {
+          setResults((cur) => (cur[id] ? cur : { ...cur, [id]: newest }));
+          setActiveVersion((cur) => ({ ...cur, [id]: versions[0].id }));
+        }
         markReport(id, "ok");
-        if (!r) return;
-        reportSynced.current[id] = r;
-        setResults((cur) => (cur[id] ? cur : { ...cur, [id]: r }));
       })
       .catch((e) => {
         reportFetched.current.delete(id);
@@ -247,7 +320,8 @@ export default function DashboardPage() {
         console.warn("[report] load failed", e);
       })
       .finally(() => setReportLoading((cur) => (cur === id ? null : cur)));
-  }, [userId, activeWsId, markReport]);
+  }, [userId, activeWsId, markReport, loadVersions, reportReloadTick]);
+  const retryReportLoad = () => setReportReloadTick((n) => n + 1);
   // Persist changed reports (new analysis, unlock, line-item edits), debounced.
   useEffect(() => {
     if (!userId) return;
@@ -442,7 +516,11 @@ export default function DashboardPage() {
 
   /** Runs the analysis and stores the result under `targetKey` (the workspace chosen in the picker). */
   const runAnalysis = useCallback(
-    async (init: RequestInit, targetKey: string, opts: { quiet?: boolean } = {}): Promise<AnalysisResponse | null> => {
+    async (
+      init: RequestInit,
+      targetKey: string,
+      opts: { quiet?: boolean; source?: ReportVersionSummary["source"]; months?: string[]; documents?: number } = {},
+    ): Promise<AnalysisResponse | null> => {
       setLoading(true);
       setError(null);
       setPaywallMsg(null);
@@ -452,6 +530,20 @@ export default function DashboardPage() {
         const data: unknown = await res.json();
         if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
         setResults((r) => ({ ...r, [targetKey]: data }));
+        // Every run is kept as its own version; the previous report stays restorable from Report history.
+        recordVersion(targetKey, data, {
+          source: opts.source ?? "analysis",
+          monthlyRevenue: data.analysis.monthlyRevenue,
+          monthlyExpenses: splitTotals(data.analysis.itemizedExpenses).recurring,
+          ...(opts.months?.length ? { months: [...new Set(opts.months)].sort() } : {}),
+          ...(opts.documents ? { documents: opts.documents } : {}),
+        });
+        setDocsChangedFor((cur) => {
+          if (!cur.has(targetKey)) return cur;
+          const next = new Set(cur);
+          next.delete(targetKey);
+          return next;
+        });
         setInputsOverride(null);
         // A fresh report opens on the Overview tab, with the inputs tucked away. A quiet (background) rebuild leaves
         // the owner where they are.
@@ -467,7 +559,7 @@ export default function DashboardPage() {
         setLoading(false);
       }
     },
-    [post],
+    [post, recordVersion],
   );
 
   /**
@@ -477,27 +569,69 @@ export default function DashboardPage() {
    */
   const rebuildTried = useRef<Set<string>>(new Set());
   const [rebuilding, setRebuilding] = useState<string | null>(null);
+  // Rebuild source: every saved document (all months, cumulatively) — or, for a workspace with only logged months,
+  // those actuals — so a workspace with valid data always has a way to a report.
+  const trackerActuals = tracker.status === "loading" || tracker.loadFailed ? null : tracker.state.actuals;
+  const rebuildPayload = useCallback(
+    (id: string) => {
+      const docs = docsByWs[id] ?? [];
+      const fromDocs = payloadFromDocuments(docs, formDefaultType);
+      if (fromDocs) return { payload: fromDocs, months: [...new Set(docs.flatMap((d) => documentSlices(d).map((s) => s.period)))], documents: docs.length };
+      const fromActuals = id === activeWsId && trackerActuals ? payloadFromActuals(trackerActuals, formDefaultType) : null;
+      return fromActuals ? { payload: fromActuals, months: Object.keys(trackerActuals!), documents: 0 } : null;
+    },
+    [docsByWs, formDefaultType, activeWsId, trackerActuals],
+  );
   const rebuildFromDocuments = useCallback(
-    async (id: string) => {
-      const payload = payloadFromDocuments(docsByWs[id] ?? [], formDefaultType);
-      if (!payload) return false;
+    async (id: string, opts: { quiet?: boolean } = { quiet: true }) => {
+      const src = rebuildPayload(id);
+      if (!src) return false;
       rebuildTried.current.add(id);
       setRebuilding(id);
       try {
-        return !!(await runAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, id, { quiet: true }));
+        return !!(await runAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(src.payload) }, id, { quiet: opts.quiet, source: "rebuild", months: src.months, documents: src.documents }));
       } finally {
         setRebuilding((cur) => (cur === id ? null : cur));
       }
     },
-    [docsByWs, formDefaultType, runAnalysis],
+    [rebuildPayload, runAnalysis],
   );
-  const canRebuild = !!activeWsId && !!payloadFromDocuments(workspaceDocs, formDefaultType);
+  const rebuildSource = activeWsId ? rebuildPayload(activeWsId) : null;
+  const canRebuild = !!rebuildSource;
   useEffect(() => {
     if (!activeWsId || current || loading || reportStatus[activeWsId] !== "ok" || !(activeWsId in docsByWs) || rebuildTried.current.has(activeWsId)) return;
+    // Automatic rebuilds only from documents; a report from logged actuals alone is the owner's call (button).
     if (!payloadFromDocuments(docsByWs[activeWsId], formDefaultType)) return;
     const t = setTimeout(() => void rebuildFromDocuments(activeWsId), 0);
     return () => clearTimeout(t);
   }, [activeWsId, current, loading, reportStatus, docsByWs, formDefaultType, rebuildFromDocuments]);
+
+  /** "Re-analyze all N months": one fresh report across every saved document, kept as a new version. */
+  const reanalyzeAll = async () => {
+    if (!activeWsId) return;
+    const months = rebuildSource?.months.length ?? 0;
+    if (await rebuildFromDocuments(activeWsId)) {
+      setLogNotice(`Re-analyzed ${months} month${months === 1 ? "" : "s"} of saved documents. The previous report is kept in Report history.`);
+    }
+  };
+
+  /** Removes one line from a saved document (monthly breakdown), recomputing that document's totals. */
+  const removeDocLine = async (ref: LineRef) => {
+    const { doc, period, side, index } = ref;
+    const wsId = doc.workspaceId;
+    let next: Parameters<typeof updateDocumentItems>[1];
+    if (doc.months.length) {
+      const months = doc.months.map((m) => (m.period === period ? { ...m, [side]: m[side].filter((_, i) => i !== index) } : m));
+      next = { items: doc.items, months, totals: statementTotals({ revenue: months.flatMap((m) => m.revenue), expenses: months.flatMap((m) => m.expenses) }) };
+    } else {
+      if (!doc.items) return;
+      const items = side === "revenue" ? { ...doc.items, revenue: doc.items.revenue.filter((_, i) => i !== index) } : { ...doc.items, expenses: doc.items.expenses.filter((_, i) => i !== index) };
+      next = { items, months: [], totals: statementTotals(items) };
+    }
+    const saved = await updateDocumentItems(doc, next);
+    setDocsByWs((cur) => ({ ...cur, [wsId]: (cur[wsId] ?? []).map((d) => (d.id === saved.id ? saved : d)) }));
+    markDocsChanged(wsId, true);
+  };
 
   /**
    * Every new analysis first asks which project / business it belongs to (current workspace preselected), so
@@ -540,29 +674,30 @@ export default function DashboardPage() {
       pickerSwitching.current = true;
       app.setActiveWorkspaceId(null);
     }
-    const report = await runAnalysis(init, key);
+    const report = await runAnalysis(init, key, { months: extras.months, documents: extras.docs?.length });
     const ok = !!report;
-    if (report) {
-      if (extras.log?.length) {
-        pendingLog.current = { ws: key === "guest" ? null : key, entries: extras.log };
-        setPendingLogTick((n) => n + 1);
-      }
-      const docs: NewWorkspaceDocument[] = extras.docs ?? [];
-      if (extras.docFromAnalysis) {
-        const items: ExtractedLineItems = { businessType: report.analysis.businessType, revenue: report.analysis.itemizedRevenue, expenses: report.analysis.itemizedExpenses };
-        docs.push({ ...extras.docFromAnalysis, period: null, items, totals: statementTotals({ revenue: items.revenue, expenses: items.expenses }) });
-      }
-      if (docs.length && key !== "guest") {
-        const wsId = key;
-        saveDocuments(wsId, docs)
-          .then((saved) =>
-            setDocsByWs((cur) => {
-              const ids = new Set(saved.map((d) => d.id));
-              return { ...cur, [wsId]: [...saved, ...(cur[wsId] ?? []).filter((d) => !ids.has(d.id))] };
-            }),
-          )
-          .catch((e) => setDocsState({ loading: null, error: e instanceof Error ? `Couldn't save documents: ${e.message}` : "Couldn't save documents." }));
-      }
+    if (report && extras.log?.length) {
+      pendingLog.current = { ws: key === "guest" ? null : key, entries: extras.log };
+      setPendingLogTick((n) => n + 1);
+    }
+    // Cumulative ingestion: uploaded documents are appended to the workspace (same file = updated, never duplicated;
+    // earlier months are never removed). Reviewed documents are kept even if the report call itself failed, so the
+    // months aren't lost and the report can be rebuilt from them.
+    const docs: NewWorkspaceDocument[] = [...(extras.docs ?? [])];
+    if (report && extras.docFromAnalysis) {
+      const items: ExtractedLineItems = { businessType: report.analysis.businessType, revenue: report.analysis.itemizedRevenue, expenses: report.analysis.itemizedExpenses };
+      docs.push({ ...extras.docFromAnalysis, period: null, items, totals: statementTotals({ revenue: items.revenue, expenses: items.expenses }) });
+    }
+    if (docs.length && key !== "guest") {
+      const wsId = key;
+      saveDocuments(wsId, docs)
+        .then((saved) =>
+          setDocsByWs((cur) => {
+            const ids = new Set(saved.map((d) => d.id));
+            return { ...cur, [wsId]: [...saved, ...(cur[wsId] ?? []).filter((d) => !ids.has(d.id))] };
+          }),
+        )
+        .catch((e) => setDocsState({ loading: null, error: e instanceof Error ? `Couldn't save documents: ${e.message}` : "Couldn't save documents." }));
     }
     resolve(ok);
   };
@@ -636,6 +771,7 @@ export default function DashboardPage() {
           const data: unknown = await res.json();
           if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response.");
           setResults((r) => ({ ...r, [targetWs]: data }));
+          recordVersion(targetWs, data, { source: "unlock", monthlyRevenue: data.analysis.monthlyRevenue, monthlyExpenses: splitTotals(data.analysis.itemizedExpenses).recurring });
           safeSession((s) => s.removeItem(PENDING_UNLOCK_KEY));
           setPendingUnlock(null);
           void refreshProfile();
@@ -647,7 +783,7 @@ export default function DashboardPage() {
         setPaywallBusy(null);
       }
     },
-    [post, refreshProfile],
+    [post, refreshProfile, recordVersion],
   );
 
   // Returning from Stripe Checkout (or the dev bypass): confirm the purchase server-side, refresh the
@@ -778,9 +914,46 @@ export default function DashboardPage() {
   const copy = MODE_COPY[mode];
   const downloadReport = () => {
     if (!analysis || teaser) return;
-    printExecutiveReport(analysis, forecast, goalReport, inflationLabel);
+    printExecutiveReport(analysis, forecast, goalReport, inflationLabel, reportExtras);
     onReportDownloaded();
   };
+
+  const versions = activeWsId ? versionsByWs[activeWsId] ?? [] : [];
+  const shownVersionId = activeWsId ? activeVersion[activeWsId] ?? versions[0]?.id ?? null : null;
+  /** Brings back an earlier version as the workspace's current report (the newer ones stay in history). */
+  const restoreVersion = async (id: string) => {
+    if (!activeWsId) return;
+    const wsId = activeWsId;
+    const r = await loadReportVersion(id);
+    if (!r) throw new Error("That version couldn't be loaded.");
+    setResults((cur) => ({ ...cur, [wsId]: r }));
+    setActiveVersion((cur) => ({ ...cur, [wsId]: id }));
+    setResultsTab("overview");
+  };
+  // The report predates the documents when one was edited / deleted in this session, or saved after the shown version
+  // (with a little slack, since a new upload's documents are saved just after its report).
+  const shownVersion = versions.find((v) => v.id === shownVersionId);
+  const docsNewerThanReport =
+    !!shownVersion && workspaceDocs.some((d) => new Date(d.updatedAt).getTime() - new Date(shownVersion.createdAt).getTime() > 120_000);
+  const reportStale = !!activeWsId && !!current && (docsChangedFor.has(activeWsId) || docsNewerThanReport);
+
+  /** Cash on hand for runway math, and the latest bank-statement closing balance offered as a one-click fill (per workspace, this device). */
+  const [cashOnHand, setCashOnHand] = useWorkspacePref<number | null>(userId ? `lp:cash:${userId}:${wsKey}` : null, null, (v) => (typeof v === "number" && Number.isFinite(v) ? v : null));
+  const [detectedCash, setDetectedCash] = useWorkspacePref<{ amount: number; period: string | null } | null>(userId ? `lp:cashDetected:${userId}:${wsKey}` : null, null, (v) => {
+    const o = v as { amount?: unknown; period?: unknown } | null;
+    return o && typeof o.amount === "number" && Number.isFinite(o.amount) ? { amount: o.amount, period: typeof o.period === "string" ? o.period : null } : null;
+  });
+  /** Benchmark peer group (defaults from the business type; households always use the 50/30/20 profile). */
+  const [storedBenchmark, setBenchmarkProfile] = useWorkspacePref<BenchmarkProfile | null>(userId ? `lp:benchmark:${userId}:${wsKey}` : null, null, (v) => (isBenchmarkProfile(v) && v !== "HOUSEHOLD" ? v : null));
+  const benchmarkProfile: BenchmarkProfile =
+    !analysis || analysis.businessType === "PERSONAL_FAMILY" ? "HOUSEHOLD" : storedBenchmark ?? defaultBenchmarkProfile(analysis.businessType);
+  /** Recurring vendors whose bill rose across the saved statement months. */
+  const vendorCreep = useVendorCreep(workspaceDocs);
+  const reportExtras: ReportExtras = { benchmarkProfile, cash: cashOnHand, creep: vendorCreep };
+  const toggleSaving =
+    teaser || tracker.status === "loading" || tracker.loadFailed
+      ? undefined
+      : (f: { title: string; potentialSavings: number }) => tracker.update((st) => toggleImplemented(st, { title: f.title, monthly: f.potentialSavings }, monthKey(new Date())));
 
   if (!app.ready || !app.user) {
     return (
@@ -837,6 +1010,12 @@ export default function DashboardPage() {
                       delete reportSynced.current[id];
                       reportFetched.current.delete(id);
                       docsFetched.current.delete(id);
+                      versionsFetched.current.delete(id);
+                      setVersionsByWs((v) => {
+                        const { [id]: _gone, ...rest } = v;
+                        void _gone;
+                        return rest;
+                      });
                       setDocsByWs((d) => {
                         const { [id]: _gone, ...rest } = d;
                         void _gone;
@@ -981,6 +1160,7 @@ export default function DashboardPage() {
                   trackerReady={tracker.status !== "loading" && !tracker.loadFailed}
                   onLogActuals={logStatementMonth}
                   existingDocs={workspaceDocs}
+                  onBalanceDetected={setDetectedCash}
                 />
               </PanelBoundary>
             </div>
@@ -1028,6 +1208,7 @@ export default function DashboardPage() {
                   {workspaceDocs.length > 0 && <span className="rounded-full bg-white/10 px-1.5 text-[11px] tabular-nums">{workspaceDocs.length}</span>}
                 </button>
               )}
+              {ws && versions.length > 0 && <ReportHistory versions={versions} activeId={shownVersionId} onRestore={restoreVersion} />}
               {teaser ? (
                 <button onClick={() => paywall.checkout("report")} className={cn(secondaryBtn, "text-slate-300")} title="Unlock the full audit to download">
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
@@ -1066,9 +1247,52 @@ export default function DashboardPage() {
               <PanelBoundary title="Summary">
                 <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} settings={forecast} inflationLabel={inflationLabel} />
               </PanelBoundary>
-              {/* Left: visual analytics. Right: the revenue and expense line items. */}
+              {reportStale && !teaser && (
+                <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-300/30 bg-amber-400/[0.07] px-4 py-3 text-sm text-amber-100" role="status">
+                  <Info className="h-4 w-4 shrink-0 text-amber-300" aria-hidden />
+                  <span className="flex-1">Your saved documents changed after this report was generated. Re-analyze to fold every month into the report — this version stays in Report history.</span>
+                  <button type="button" onClick={() => void reanalyzeAll()} disabled={loading || !canRebuild} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+                    {rebuilding === activeWsId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Repeat className="h-3.5 w-3.5" />} Re-analyze all months
+                  </button>
+                </div>
+              )}
+              {!teaser && vendorCreep.length > 0 && (
+                <PanelBoundary title="Vendor price creep">
+                  <VendorCreepAlerts
+                    creep={vendorCreep}
+                    figures={{ monthlyRevenue: analysis.monthlyRevenue, monthlyExpenses: splitTotals(analysis.itemizedExpenses).recurring, personal: analysis.businessType === "PERSONAL_FAMILY" }}
+                    implemented={tracker.state.savings}
+                    onToggleImplemented={toggleSaving}
+                  />
+                </PanelBoundary>
+              )}
+              {!teaser && (
+                <div className="grid gap-6 lg:grid-cols-2 lg:items-start">
+                  <PanelBoundary title="Cash runway">
+                    <RunwayCard analysis={analysis} cash={cashOnHand} onCashChange={setCashOnHand} detected={detectedCash} />
+                  </PanelBoundary>
+                  <PanelBoundary title="Benchmarks">
+                    <BenchmarkGauges analysis={analysis} profile={benchmarkProfile} onProfileChange={setBenchmarkProfile} />
+                  </PanelBoundary>
+                </div>
+              )}
+              {/* Left: visual analytics (cash flow + expense share). Right: the revenue and expense line items. */}
               <div className="grid gap-6 lg:grid-cols-5 lg:items-start">
                 <div className="min-w-0 space-y-6 lg:col-span-2">
+                  {!teaser && (
+                    <PanelBoundary title="Monthly cash flow">
+                      <CashFlowChart
+                        analysis={analysis}
+                        actuals={trackerActuals ?? {}}
+                        docs={workspaceDocs}
+                        settings={forecast}
+                        onSettingsChange={setForecast}
+                        revenueLabel={copy.revenue}
+                        expensesLabel={copy.expenses}
+                        onOpenForecast={() => openTab("forecast", "results-panel-forecast")}
+                      />
+                    </PanelBoundary>
+                  )}
                   <PanelBoundary title="Expense share">
                     <ExpenseShareCard analysis={analysis} />
                   </PanelBoundary>
@@ -1086,15 +1310,26 @@ export default function DashboardPage() {
                       paywall={paywall}
                       workspaceId={ws?.id ?? null}
                       implemented={tracker.state.savings}
-                      onToggleImplemented={
-                        teaser || tracker.status === "loading" || tracker.loadFailed
-                          ? undefined
-                          : (f) => tracker.update((s) => toggleImplemented(s, { title: f.title, monthly: f.potentialSavings }, monthKey(new Date())))
-                      }
+                      onToggleImplemented={toggleSaving}
                     />
                   </PanelBoundary>
                 </div>
               </div>
+              {ws && workspaceDocs.length > 0 && (
+                <PanelBoundary title="Monthly breakdown">
+                  <MonthlyBreakdown
+                    docs={workspaceDocs}
+                    revenueLabel={copy.revenue}
+                    expensesLabel={copy.expenses}
+                    loggedActuals={trackerActuals ?? undefined}
+                    onRemoveLine={removeDocLine}
+                    onSyncMonth={trackerActuals ? (period, actual) => setLogNotice(logStatementMonth(period, actual)) : undefined}
+                    onReanalyze={canRebuild && !teaser ? () => void reanalyzeAll() : undefined}
+                    reanalyzing={rebuilding === ws.id}
+                    stale={reportStale}
+                  />
+                </PanelBoundary>
+              )}
             </div>
 
             <div role="tabpanel" id="results-panel-forecast" aria-labelledby="results-tab-forecast" hidden={resultsTab !== "forecast"} className="space-y-6">
@@ -1114,6 +1349,13 @@ export default function DashboardPage() {
                     onBasisChange={setBasisChoice}
                     actualsAgg={actualsAgg}
                   />
+                )}
+              </PanelBoundary>
+              <PanelBoundary title="What-if simulator">
+                {isPro && !teaser && scenarioAnalysis ? (
+                  <WhatIfSimulator analysis={scenarioAnalysis} settings={forecast} cash={cashOnHand} />
+                ) : (
+                  <LockedSection title="What-If Simulator (instant sliders)" paywall={paywall} proOnly placeholder={<FakeChart />} />
                 )}
               </PanelBoundary>
               <PanelBoundary title="Scenario forecasting">
@@ -1136,7 +1378,7 @@ export default function DashboardPage() {
                 {teaser ? (
                   <LockedSection title="Executive PDF Report" paywall={paywall} placeholder={<FakeChart />} />
                 ) : (
-                  <ReportPreview html={resultsTab === "report" ? reportHtml(analysis, forecast, goalReport, inflationLabel) : ""} onDownload={downloadReport} hasGoal={!!goalReport} onSetGoal={() => jumpTo("goal-tracker", "input")} />
+                  <ReportPreview html={resultsTab === "report" ? reportHtml(analysis, forecast, goalReport, inflationLabel, reportExtras) : ""} onDownload={downloadReport} hasGoal={!!goalReport} onSetGoal={() => jumpTo("goal-tracker", "input")} />
                 )}
               </PanelBoundary>
             </div>
@@ -1154,18 +1396,24 @@ export default function DashboardPage() {
           // Saved data but no report (yet): still the 4-tab dashboard. Fiscal Year & Actuals works from the logged
           // months; the report tabs explain what's missing and rebuild it from the saved documents.
           <div ref={resultsRef} className={cn("scroll-mt-6 space-y-6", inputsOpen ? "mt-10" : "mt-2")}>
-            <h2 className="text-xl font-semibold">
-              Results<span className="text-base font-normal text-slate-400"> · {ws.name}</span>
-            </h2>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-xl font-semibold">
+                Results<span className="text-base font-normal text-slate-400"> · {ws.name}</span>
+              </h2>
+              {versions.length > 0 && <ReportHistory versions={versions} activeId={null} onRestore={restoreVersion} noneShowing />}
+            </div>
             <ResultsTabs value={resultsTab} onChange={setResultsTab} />
             {(["overview", "forecast", "report"] as const).map((t) => (
-              <div key={t} role="tabpanel" id={`results-panel-${t}`} aria-labelledby={`results-tab-${t}`} hidden={resultsTab !== t}>
+              <div key={t} role="tabpanel" id={`results-panel-${t}`} aria-labelledby={`results-tab-${t}`} hidden={resultsTab !== t} className="space-y-6">
                 <NoReportPanel
                   rebuilding={rebuilding === ws.id || (loading && !!canRebuild && !current)}
                   docCount={workspaceDocs.length}
                   loggedCount={Object.keys(tracker.state.actuals).length}
                   reportLoadFailed={reportStatus[ws.id] === "error"}
-                  onRebuild={canRebuild && !loading ? () => void rebuildFromDocuments(ws.id) : undefined}
+                  rebuildFrom={rebuildSource ? (rebuildSource.documents ? "documents" : "actuals") : null}
+                  onRebuild={canRebuild && !loading ? () => void rebuildFromDocuments(ws.id, { quiet: false }) : undefined}
+                  onRetryLoad={reportStatus[ws.id] === "error" ? retryReportLoad : undefined}
+                  onRestoreLatest={versions[0] ? () => void restoreVersion(versions[0].id).catch((e) => setError(e instanceof Error ? e.message : "Couldn't restore that version.")) : undefined}
                   onNewAnalysis={() => {
                     setInputsOverride(true);
                     requestAnimationFrame(() => jumpTo("analysis-inputs"));
@@ -1173,6 +1421,18 @@ export default function DashboardPage() {
                   onOpenFiscal={() => setResultsTab("fiscal")}
                   onOpenDocuments={workspaceDocs.length ? () => setDocsOpen(true) : undefined}
                 />
+                {t === "overview" && workspaceDocs.length > 0 && (
+                  <PanelBoundary title="Monthly breakdown">
+                    <MonthlyBreakdown
+                      docs={workspaceDocs}
+                      revenueLabel={copy.revenue}
+                      expensesLabel={copy.expenses}
+                      loggedActuals={trackerActuals ?? undefined}
+                      onRemoveLine={removeDocLine}
+                      onSyncMonth={trackerActuals ? (period, actual) => setLogNotice(logStatementMonth(period, actual)) : undefined}
+                    />
+                  </PanelBoundary>
+                )}
               </div>
             ))}
             <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"}>
@@ -1204,10 +1464,12 @@ export default function DashboardPage() {
           onSetMonth={async (id, period) => {
             await updateDocument(id, { period });
             setDocsByWs((cur) => ({ ...cur, [ws.id]: (cur[ws.id] ?? []).map((d) => (d.id === id ? { ...d, period } : d)) }));
+            markDocsChanged(ws.id, true);
           }}
           onDelete={async (id) => {
             await deleteDocument(id);
             setDocsByWs((cur) => ({ ...cur, [ws.id]: (cur[ws.id] ?? []).filter((d) => d.id !== id) }));
+            markDocsChanged(ws.id, true);
           }}
           onLogToTracker={
             tracker.status === "loading" || tracker.loadFailed
@@ -1265,6 +1527,8 @@ interface AnalysisExtras {
   /** "Skip review": the document is saved with the lines the analysis read from it. */
   docFromAnalysis?: Pick<NewWorkspaceDocument, "name" | "fileName" | "fileSize" | "contentHash" | "kind">;
   log?: { key: string; actual: MonthActual }[];
+  /** Months of data the analysis covers ("YYYY-MM"), recorded on the report version. */
+  months?: string[];
 }
 
 function AnalysisTargetDialog({
@@ -1646,7 +1910,10 @@ function NoReportPanel({
   docCount,
   loggedCount,
   reportLoadFailed,
+  rebuildFrom,
   onRebuild,
+  onRetryLoad,
+  onRestoreLatest,
   onNewAnalysis,
   onOpenFiscal,
   onOpenDocuments,
@@ -1655,7 +1922,13 @@ function NoReportPanel({
   docCount: number;
   loggedCount: number;
   reportLoadFailed: boolean;
+  /** What a rebuild would run on. */
+  rebuildFrom: "documents" | "actuals" | null;
   onRebuild?: () => void;
+  /** Re-tries loading the saved report (shown after a failed load). */
+  onRetryLoad?: () => void;
+  /** Restores the newest saved report version. */
+  onRestoreLatest?: () => void;
   onNewAnalysis: () => void;
   onOpenFiscal: () => void;
   onOpenDocuments?: () => void;
@@ -1674,12 +1947,30 @@ function NoReportPanel({
           </p>
           <p className="mt-1 text-sm text-slate-400">
             {saved ? `It has ${saved}. ` : ""}
-            {onRebuild ? "Rebuild the report from the saved documents, or run a new analysis." : "Run an analysis to see the overview, forecast and executive report — logged months are already in Fiscal Year & Actuals."}
+            {reportLoadFailed
+              ? "Your data is safe — retry the load, or rebuild the report from what's saved."
+              : onRestoreLatest
+                ? "Restore your most recent saved report, or rebuild it from everything saved so far."
+                : onRebuild
+                  ? rebuildFrom === "actuals"
+                    ? "Build a report from your logged months, or run a new analysis with full line items."
+                    : "Rebuild the report from every saved document (all months combined), or run a new analysis."
+                  : "Run an analysis to see the overview, forecast and executive report — logged months are already in Fiscal Year & Actuals."}
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
+            {onRetryLoad && (
+              <button type="button" onClick={onRetryLoad} className={primaryBtn}>
+                <RotateCw className="h-4 w-4" /> Retry loading report
+              </button>
+            )}
+            {onRestoreLatest && (
+              <button type="button" onClick={onRestoreLatest} className={onRetryLoad ? secondaryBtn : primaryBtn}>
+                <History className="h-4 w-4" /> Restore latest version
+              </button>
+            )}
             {onRebuild && (
-              <button type="button" onClick={onRebuild} className={primaryBtn}>
-                <Repeat className="h-4 w-4" /> Rebuild report from documents
+              <button type="button" onClick={onRebuild} className={onRetryLoad || onRestoreLatest ? secondaryBtn : primaryBtn}>
+                <Repeat className="h-4 w-4" /> {rebuildFrom === "actuals" ? "Build report from logged months" : "Rebuild report from all documents"}
               </button>
             )}
             <button type="button" onClick={onNewAnalysis} className={secondaryBtn}>
@@ -1697,6 +1988,84 @@ function NoReportPanel({
             )}
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+const VERSION_DATE = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+const VERSION_SOURCE: Record<ReportVersionSummary["source"], string> = { analysis: "New analysis", rebuild: "Re-analyzed from documents", unlock: "Unlocked full report" };
+
+/** "Report history": every saved version of this workspace's report, newest first, each restorable. */
+function ReportHistory({ versions, activeId, onRestore, noneShowing = false }: { versions: ReportVersionMeta[]; activeId: string | null; onRestore: (id: string) => Promise<void>; noneShowing?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const menuId = useId();
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && setOpen(false);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  const restore = async (id: string) => {
+    setBusy(id);
+    setErr(null);
+    try {
+      await onRestore(id);
+      setOpen(false);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't restore that version.");
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <div ref={ref} className="relative">
+      <button type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-controls={menuId} className={cn(secondaryBtn, "text-slate-200")}>
+        <History className="h-4 w-4" /> Report history <span className="rounded-full bg-white/10 px-1.5 text-[11px] tabular-nums">{versions.length}</span>
+      </button>
+      {open && (
+        <div id={menuId} className={cn(glass, "absolute right-0 z-40 mt-2 w-[min(22rem,calc(100vw-2rem))] bg-slate-900/95 p-2")}>
+          <p className="px-2 pb-1.5 pt-1 text-[11px] text-slate-500">Each analysis is saved as its own version. Restoring one never deletes the others.</p>
+          {err && <p role="alert" className="mx-2 mb-1.5 text-xs text-rose-200">{err}</p>}
+          <ul className="max-h-80 space-y-1 overflow-y-auto overscroll-contain">
+            {versions.map((v, i) => {
+              const current = !noneShowing && (v.id === activeId || (!activeId && i === 0));
+              const s = v.summary;
+              const span = s.months?.length ? (s.months.length === 1 ? periodLabel(s.months[0]) : `${periodLabel(s.months[0])} – ${periodLabel(s.months[s.months.length - 1])}`) : null;
+              return (
+                <li key={v.id} className={cn("flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs", current ? "bg-indigo-500/15" : "hover:bg-white/[0.03]")}>
+                  <div className="min-w-0 flex-1">
+                    <p className="font-medium text-slate-200">
+                      {VERSION_DATE.format(new Date(v.createdAt))}
+                      {i === 0 && <span className="ml-1.5 text-[10px] uppercase text-slate-500">latest</span>}
+                    </p>
+                    <p className="truncate text-[11px] text-slate-400">
+                      {VERSION_SOURCE[s.source]}
+                      {span ? ` · ${span}` : ""}
+                      {s.monthlyRevenue != null ? ` · ${usd.format(s.monthlyRevenue)}/mo in` : ""}
+                      {s.monthlyExpenses != null ? ` · ${usd.format(s.monthlyExpenses)} out` : ""}
+                    </p>
+                  </div>
+                  {current ? (
+                    <span className="shrink-0 rounded-full border border-indigo-300/30 px-2 py-0.5 text-[10px] text-indigo-100">Showing</span>
+                  ) : (
+                    <button type="button" onClick={() => void restore(v.id)} disabled={busy !== null} className="shrink-0 rounded-md border border-white/15 px-2 py-0.5 text-slate-200 hover:bg-white/10 disabled:opacity-40">
+                      {busy === v.id ? <Loader2 className="h-3 w-3 animate-spin" /> : "Restore"}
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       )}
     </div>
   );
@@ -2583,6 +2952,10 @@ interface UploadReviewState {
   statements: ParsedStatement[];
   /** Saved documents for the same months, folded into those months' totals when included. */
   earlier: EarlierStatement[];
+  /** Saved documents for *other* months in this workspace (cumulative ingestion). */
+  history: EarlierStatement[];
+  /** Fold `history` into the report so it covers every month so far, not just this upload. */
+  cumulative: boolean;
   months: { key: string; actual: MonthActual; statementIds: string[] }[];
   duplicateLines: number;
   excludedOneTime: number;
@@ -2639,10 +3012,44 @@ function earlierFor(statements: ParsedStatement[], docs: WorkspaceDocument[], pr
     );
 }
 
+const HISTORY_PREFIX = "hist-";
+const isHistoryId = (id: string) => id.startsWith(HISTORY_PREFIX);
+
+/**
+ * Saved workspace documents for months this upload does *not* cover (excluding the same files): the earlier months a
+ * cumulative report folds in, so a new month adds to the analysis instead of replacing it.
+ */
+function historyFor(statements: ParsedStatement[], docs: WorkspaceDocument[]): EarlierStatement[] {
+  const months = new Set(statements.map((s) => s.month).filter(Boolean));
+  const hashes = new Set(statements.map((s) => s.contentHash).filter(Boolean));
+  return docs
+    .filter((d) => !(d.contentHash && hashes.has(d.contentHash)))
+    .flatMap((d) =>
+      documentSlices(d)
+        .filter((sl) => !months.has(sl.period))
+        .map(
+          (sl): EarlierStatement => ({
+            id: `${HISTORY_PREFIX}${d.id}-${sl.period}`,
+            name: d.months.length ? `${d.name} · ${periodLabel(sl.period)}` : d.name,
+            fileName: d.fileName,
+            fileSize: d.fileSize,
+            contentHash: d.contentHash,
+            kind: d.kind === "pasted" ? "pasted" : "statement",
+            items: sl.items,
+            detected: sl.period,
+            month: sl.period,
+            savedAt: d.createdAt,
+            include: true,
+          }),
+        ),
+    );
+}
+
 /** (Re)builds the review from the statements: per-month totals and, for several months, averaged line items. */
-function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[], mode: WorkspaceMode, prev?: UploadReviewState): UploadReviewState {
+function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[], history: EarlierStatement[], mode: WorkspaceMode, prev?: UploadReviewState): UploadReviewState {
   const personal = mode === "PERSONAL";
-  const included = [...statements, ...earlier.filter((e) => e.include)];
+  const cumulative = prev?.cumulative ?? true;
+  const included = [...statements, ...earlier.filter((e) => e.include), ...(cumulative ? history : [])];
   const agg = aggregateStatements(included, statements[0]?.items.businessType ?? "OTHER_CUSTOM");
   const rows = itemsToRows(agg, personal);
   return {
@@ -2651,10 +3058,12 @@ function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[],
     expenses: rows.expenses,
     statements,
     earlier,
+    history,
+    cumulative,
     months: agg.months,
     duplicateLines: agg.duplicateLines,
     excludedOneTime: agg.excludedOneTime,
-    logToTracker: prev?.logToTracker ?? agg.months.some((m) => m.key),
+    logToTracker: prev?.logToTracker ?? agg.months.some((m) => m.key && m.statementIds.some((id) => !isHistoryId(id))),
     loggedKeys: prev?.loggedKeys ?? [],
     rebuilt: !!prev,
   };
@@ -2673,9 +3082,23 @@ function reviewTotals(review: Pick<UploadReviewState, "revenue" | "expenses">): 
  * lines, since the rows on screen are the averaged baseline.
  */
 function monthActuals(review: UploadReviewState): { key: string; actual: MonthActual }[] {
-  const keyed = review.months.filter((m) => m.key);
+  // Months that come only from earlier saved documents (cumulative mode) are already in the workspace: never re-logged.
+  const keyed = review.months.filter((m) => m.key && m.statementIds.some((id) => !isHistoryId(id)));
   if (review.months.length === 1 && keyed.length === 1) return [{ key: keyed[0].key, actual: reviewTotals(review) }];
   return keyed.map((m) => ({ key: m.key, actual: m.actual }));
+}
+
+/** Months the review's line items cover: this upload and (cumulatively) earlier ones. */
+const reviewMonthKeys = (review: UploadReviewState) => review.months.map((m) => m.key).filter(Boolean);
+
+/** The reviewed rows → the analysis request + what to save / log alongside it. */
+function reviewSubmission(review: UploadReviewState, personal: boolean): { payload: FormPayload; extras: AnalysisExtras } {
+  // Months are logged into whichever workspace the report goes to, once that workspace has loaded.
+  const log = review.logToTracker ? monthActuals(review).filter((m) => !review.loggedKeys.includes(m.key) && (m.actual.revenue > 0 || m.actual.expenses > 0)) : [];
+  return {
+    payload: { mode: "form", businessType: review.businessType, origin: "statement", ...toPayloadLines(review.revenue, review.expenses, personal) },
+    extras: { log, docs: docsToSave(review, personal), months: reviewMonthKeys(review) },
+  };
 }
 
 /** Rows → line items (for saving a single reviewed statement as edited). */
@@ -2693,7 +3116,8 @@ function rowsToItems(review: UploadReviewState, personal: boolean): ExtractedLin
  * review) kept as a per-month breakdown; months moved onto the same month are merged.
  */
 function docsToSave(review: UploadReviewState, personal: boolean): NewWorkspaceDocument[] {
-  const single = review.statements.length === 1 && !review.earlier.some((e) => e.include);
+  // The on-screen rows are this one statement's own lines only when nothing else is folded into them.
+  const single = review.statements.length === 1 && !review.earlier.some((e) => e.include) && !(review.cumulative && review.history.length);
   const groups = new Map<string, ParsedStatement[]>();
   for (const s of review.statements) {
     const k = s.source?.id ?? s.id;
@@ -2746,6 +3170,24 @@ function payloadFromDocuments(docs: WorkspaceDocument[], businessType: BusinessT
   };
 }
 
+/**
+ * Logged tracker months → a minimal "form" payload (average monthly revenue and recurring expenses), for a workspace
+ * that has actuals but no documents or report. Keeps it from dead-ending on "run an analysis" when data exists.
+ */
+function payloadFromActuals(actuals: Record<string, MonthActual>, businessType: BusinessType): FormPayload | null {
+  const agg = aggregateActuals(actuals);
+  if (!agg || !(agg.revenue > 0)) return null;
+  const personal = businessType === "PERSONAL_FAMILY";
+  const span = agg.months === 1 ? "1 logged month" : `${agg.months} logged months`;
+  return {
+    mode: "form",
+    businessType,
+    origin: "manual",
+    revenue: [{ label: `Average monthly ${personal ? "income" : "revenue"} (${span})`, amount: agg.revenue, ...(personal ? {} : { margin: 0.5 }) }],
+    expenses: agg.expenses > 0 ? [{ label: `Average monthly expenses (${span})`, amount: agg.expenses, category: "Other" }] : [],
+  };
+}
+
 function StatementUploader({
   mode,
   disabled,
@@ -2753,6 +3195,7 @@ function StatementUploader({
   trackerReady,
   onLogActuals,
   existingDocs,
+  onBalanceDetected,
 }: {
   mode: WorkspaceMode;
   disabled: boolean;
@@ -2761,6 +3204,8 @@ function StatementUploader({
   onLogActuals: (key: string, actual: MonthActual) => string;
   /** Documents already saved in this workspace (duplicate detection + same-month totals). */
   existingDocs: WorkspaceDocument[];
+  /** The latest bank-statement closing balance read in this batch (offered as cash on hand for the runway). */
+  onBalanceDetected?: (b: { amount: number; period: string | null }) => void;
 }) {
   const personal = mode === "PERSONAL";
   const [files, setFiles] = useState<File[]>([]);
@@ -2809,7 +3254,7 @@ function StatementUploader({
   };
 
   /** Reads each statement in turn (one request at a time keeps large batches inside rate limits), then aggregates. */
-  const extract = async () => {
+  const extract = async (opts: { direct?: boolean } = {}) => {
     setExtracting(true);
     setExtractError(null);
     setBatchNotes([]);
@@ -2817,6 +3262,7 @@ function StatementUploader({
     const parsed: ParsedStatement[] = [];
     const notes: string[] = [];
     const seen = new Set<string>();
+    let balance: { amount: number; period: string | null } | null = null;
     const headers = await authHeaders();
     for (let i = 0; i < sources.length; i++) {
       const f = sources[i];
@@ -2836,6 +3282,11 @@ function StatementUploader({
         if (!res.ok) throw new Error(await errorMessage(res));
         const data = parseExtractResponse(await res.json());
         if (!data) throw new Error("Received an unexpected response from the analysis service.");
+        if (data.endingBalance != null) {
+          const at = data.months.length ? data.months[data.months.length - 1].period.key : data.period?.key ?? null;
+          if (!balance || (at ?? "") >= (balance.period ?? "")) balance = { amount: data.endingBalance, period: at };
+        }
+        if (data.reviewFlags.length) notes.push(`${label}: ${data.reviewFlags.length} transaction${data.reviewFlags.length === 1 ? "" : "s"} flagged for review (${DOCUMENT_KIND_LABELS[data.documentKind].toLowerCase()}).`);
         const id = `st-${i}-${hash?.slice(0, 8) ?? i}`;
         const common = { fileName: f?.name ?? null, fileSize: f?.size ?? null, contentHash: hash, kind: f ? ("statement" as const) : ("pasted" as const) };
         if (data.months.length >= 2) {
@@ -2851,6 +3302,7 @@ function StatementUploader({
               detected: m.period.key,
               month: m.period.key,
               source: { id, name },
+              ...(m === data.months[0] && data.reviewFlags.length ? { reviewFlags: data.reviewFlags } : {}),
             });
           }
           notes.push(`${label}: covers ${data.months.length} months (${data.months[0].period.label} – ${data.months[data.months.length - 1].period.label}) — each month's rows were assigned to that month.`);
@@ -2864,6 +3316,7 @@ function StatementUploader({
           items: { ...data.items, businessType: typeForMode(data.items.businessType, mode) },
           detected: period?.key ?? "",
           month: period?.key ?? "",
+          ...(data.reviewFlags.length ? { reviewFlags: data.reviewFlags } : {}),
         });
       } catch (e) {
         notes.push(`${label}: ${e instanceof Error ? e.message : "couldn't be read."}`);
@@ -2872,11 +3325,19 @@ function StatementUploader({
     setProgress(null);
     setExtracting(false);
     setBatchNotes(notes);
+    if (balance) onBalanceDetected?.(balance);
     if (!parsed.length) {
       setExtractError(notes.join(" ") || "Couldn't read the statement.");
       return;
     }
-    setReview(buildReview(parsed, earlierFor(parsed, existingDocs), mode));
+    const built = buildReview(parsed, earlierFor(parsed, existingDocs), historyFor(parsed, existingDocs), mode);
+    if (opts.direct && validRevenueRows(built.revenue).length > 0) {
+      // "Skip review" in a workspace with earlier months: generate straight away, cumulatively.
+      const { payload, extras } = reviewSubmission(built, personal);
+      const ok = await onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType, extras);
+      if (ok) return;
+    }
+    setReview(built);
   };
 
   if (review) {
@@ -2897,7 +3358,10 @@ function StatementUploader({
   }
 
   const single = input === "paste" || files.length === 1;
+  /** Earlier months already saved here: a skipped review still reads the file, then folds those months in. */
+  const hasHistory = existingDocs.some((d) => documentSlices(d).length > 0);
   const skipDirect = async () => {
+    if (hasHistory) return extract({ direct: true });
     const f = input === "file" ? files[0] : null;
     const hash = await hashFile(f ?? new Blob([pasted], { type: "text/plain" }));
     await onSubmit(fileInit(f, false), businessType || undefined, {
@@ -3019,7 +3483,7 @@ function StatementUploader({
         </p>
       )}
 
-      <button onClick={extract} disabled={busy || !ready} className={cn(primaryBtn, "mt-4 py-2.5")}>
+      <button onClick={() => void extract()} disabled={busy || !ready} className={cn(primaryBtn, "mt-4 py-2.5")}>
         {extracting && <Loader2 className="h-4 w-4 animate-spin" />}
         {extracting && progress
           ? progress.total > 1
@@ -3031,7 +3495,7 @@ function StatementUploader({
       </button>
       {single && (
         <button type="button" onClick={() => void skipDirect()} disabled={busy || !ready} className="mt-2 self-center text-xs text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline disabled:opacity-40">
-          Skip review and analyze directly
+          {hasHistory ? "Skip review — analyze together with earlier months" : "Skip review and analyze directly"}
         </button>
       )}
     </div>
@@ -3039,6 +3503,39 @@ function StatementUploader({
 }
 
 /** Post-upload step: the owner edits, re-categorizes, deletes or adds parsed lines, assigns months, then generates the report. */
+/** Raw transactions the parser flagged (unrecognized merchants, duplicate transaction IDs, unusual charges). */
+function ReviewFlagsList({ statements }: { statements: ParsedStatement[] }) {
+  const flags = statements.flatMap((s) => (s.reviewFlags ?? []).map((f) => ({ ...f, from: s.source?.name ?? s.name })));
+  const [open, setOpen] = useState(true);
+  if (!flags.length) return null;
+  const tone = { UNRECOGNIZED_MERCHANT: "text-amber-200", DUPLICATE_TRANSACTION: "text-rose-200", UNUSUAL_CHARGE: "text-sky-200" } as const;
+  return (
+    <div className="mt-3 rounded-xl border border-amber-300/25 bg-amber-400/[0.05] px-3 py-2 text-xs">
+      <button type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} className="flex w-full items-center justify-between gap-2 text-left font-medium text-amber-100">
+        <span className="flex items-center gap-1.5">
+          <AlertTriangle className="h-3.5 w-3.5" aria-hidden /> {flags.length} transaction{flags.length === 1 ? "" : "s"} to double-check
+        </span>
+        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      </button>
+      {open && (
+        <ul className="mt-2 space-y-1.5">
+          {flags.map((f, i) => (
+            <li key={`${f.kind}-${f.merchant}-${f.date}-${i}`} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-slate-300">
+              <span className={cn("font-medium", tone[f.kind])}>{REVIEW_FLAG_LABELS[f.kind]}</span>
+              <span className="text-slate-100">{f.merchant}</span>
+              <span className="tabular-nums">{exactMoney(f.amount)}</span>
+              {f.date && <span className="text-slate-500">{f.date}</span>}
+              {f.transactionId && <span className="font-mono text-[10px] text-slate-500">#{f.transactionId}</span>}
+              <span className="basis-full text-slate-400">{f.note}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-[11px] text-slate-500">Flagged charges are still included in the line items below — remove or edit them if they shouldn&apos;t count.</p>
+    </div>
+  );
+}
+
 function UploadReview({
   mode,
   review,
@@ -3081,16 +3578,22 @@ function UploadReview({
   const restructure = (statements: ParsedStatement[], earlierPrev: EarlierStatement[]) => {
     setLogNote(null);
     const earlier = earlierFor(statements, existingDocs, earlierPrev);
+    const history = historyFor(statements, existingDocs);
     setReview((r) => {
       if (!r) return r;
       // One statement, nothing to fold in: just re-label the month and keep the owner's edited rows.
-      if (statements.length === 1 && !earlier.length && !r.earlier.length) {
+      if (statements.length === 1 && !earlier.length && !r.earlier.length && !(r.cumulative && (history.length || r.history.length))) {
         const m = statements[0].month;
-        return { ...r, statements, months: [{ key: m, actual: reviewTotals(r), statementIds: [statements[0].id] }], logToTracker: !!m, loggedKeys: [] };
+        return { ...r, statements, history, months: [{ key: m, actual: reviewTotals(r), statementIds: [statements[0].id] }], logToTracker: !!m, loggedKeys: [] };
       }
-      return buildReview(statements, earlier, mode, { ...r, loggedKeys: [] });
+      return buildReview(statements, earlier, history, mode, { ...r, loggedKeys: [] });
     });
   };
+  const setCumulative = (cumulative: boolean) => {
+    setLogNote(null);
+    setReview((r) => r && buildReview(r.statements, r.earlier, r.history, mode, { ...r, cumulative }));
+  };
+  const historyMonths = [...new Set(review.history.map((h) => h.month))].sort();
 
   const logNow = () => {
     if (!canLog) return;
@@ -3099,9 +3602,8 @@ function UploadReview({
     setReview((r) => r && { ...r, loggedKeys: [...r.loggedKeys, ...pendingLog.map((m) => m.key)] });
   };
   const generate = async () => {
-    // Months are logged into whichever workspace the report goes to, once that workspace has loaded.
-    const log = review.logToTracker ? pendingLog.filter((m) => m.actual.revenue > 0 || m.actual.expenses > 0) : [];
-    await onGenerate({ mode: "form", businessType, origin: "statement", ...toPayloadLines(revenue, expenses, personal) }, { log, docs: docsToSave(review, personal) });
+    const { payload, extras } = reviewSubmission(review, personal);
+    await onGenerate(payload, extras);
   };
 
   return (
@@ -3117,7 +3619,7 @@ function UploadReview({
           return `We read ${files} document${files === 1 ? "" : "s"} covering ${review.statements.length} month entries. `;
         })()}
         {multiMonth
-          ? `The lines below are the monthly average across ${review.months.length} months; each month's own totals are logged separately.`
+          ? `The lines below are the monthly average across ${review.months.length} months${review.cumulative && historyMonths.length ? ` (${historyMonths.length} of them already saved in this workspace)` : ""}; each new month's own totals are logged separately.`
           : `We read ${revenue.length + expenses.length} line${revenue.length + expenses.length === 1 ? "" : "s"}.`}{" "}
         Fix amounts or categories, delete anything that doesn&apos;t belong, add what&apos;s missing — then generate the report.
       </p>
@@ -3207,6 +3709,29 @@ function UploadReview({
             )}
           </>
         )}
+
+        {review.history.length > 0 && (
+          <div className="mt-3 rounded-lg border border-emerald-300/25 bg-emerald-500/[0.06] px-3 py-2.5 text-xs">
+            <label className="flex cursor-pointer items-start gap-2 text-slate-200">
+              <input type="checkbox" className="mt-0.5 h-3.5 w-3.5 accent-emerald-400" checked={review.cumulative} onChange={(e) => setCumulative(e.target.checked)} />
+              <span>
+                <span className="font-medium">
+                  Combine with {historyMonths.length} earlier month{historyMonths.length === 1 ? "" : "s"} already in this workspace
+                </span>{" "}
+                <span className="text-slate-400">
+                  ({historyMonths.length === 1 ? periodLabel(historyMonths[0]) : `${periodLabel(historyMonths[0])} – ${periodLabel(historyMonths[historyMonths.length - 1])}`})
+                </span>
+              </span>
+            </label>
+            <p className="mt-1 pl-5 text-[11px] text-slate-400">
+              {review.cumulative
+                ? "The report and forecast cover every month so far. Earlier months stay saved and aren't re-logged; the previous report is kept in Report history."
+                : "This report covers only this upload. Earlier months stay saved in My Documents either way."}
+            </p>
+          </div>
+        )}
+
+        <ReviewFlagsList statements={review.statements} />
 
         {(review.duplicateLines > 0 || review.excludedOneTime > 0 || review.rebuilt) && (
           <ul className="mt-3 space-y-1 text-[11px] text-slate-400">
@@ -3969,6 +4494,7 @@ function AuditPanel({
           figures={{ monthlyRevenue: analysis.monthlyRevenue, monthlyExpenses: splitTotals(analysis.itemizedExpenses).recurring, personal: analysis.businessType === "PERSONAL_FAMILY" }}
           onClose={() => setOpenFlag(null)}
           implemented={!!doneFor(openFlag)}
+          implementedSince={doneFor(openFlag)?.since}
           onToggleImplemented={onToggleImplemented ? () => onToggleImplemented(openFlag) : undefined}
         />
       )}
@@ -4223,7 +4749,35 @@ function LineItems({ analysis, onApply }: { analysis: FinancialAnalysis; onApply
 // Executive report → browser print dialog ("Save as PDF"). Rendered client-side only.
 // ---------------------------------------------------------------------------
 
-function reportHtml(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string) {
+/** Benchmarks, runway and vendor creep for the executive report. */
+interface ReportExtras {
+  benchmarkProfile: BenchmarkProfile;
+  cash: number | null;
+  creep: VendorCreep[];
+}
+
+function reportExtrasHtml(a: FinancialAnalysis, x: ReportExtras): string {
+  const personal = a.businessType === "PERSONAL_FAMILY";
+  const { be, runway, paces } = runwayFigures(a, x.cash);
+  const vsBe = (v: number | null) => (v == null || personal ? "—" : v >= 0 ? `${usd.format(v)} above` : `${usd.format(-v)} short`);
+  const paceRows = paces
+    .map((p) => `<tr><td>${esc(p.label)} <span class="muted">(${esc(p.range)})</span></td><td class="${p.net < 0 ? "neg" : "pos"}">${p.net >= 0 ? "▲" : "▼"} On pace for ${signedUsd(p.net)}</td><td>${vsBe(p.vsBreakEven)}</td></tr>`)
+    .join("");
+  const runwayLine = runway
+    ? `<p><strong>${runway.months == null ? (runway.avgNet >= 0 ? "Cash-flow positive" : "10+ years of runway") : `${runway.months.toFixed(1)} months of runway`}</strong> on ${usd.format(runway.cash)} cash on hand. ${esc(runwaySentence(runway, personal))}</p>`
+    : `<p class="muted">Cash on hand not entered — runway not calculated.</p>`;
+  const paceTable = paceRows ? `<table><thead><tr><th>Period</th><th>Direction</th><th>${personal ? "" : "Vs. break-even"}</th></tr></thead><tbody>${paceRows}</tbody></table>` : "";
+  const creep = x.creep.length
+    ? `<h2>Vendor price creep</h2><ul>${x.creep
+        .slice(0, 10)
+        .map((c) => `<li><strong>[${c.severity}]</strong> ${esc(creepHeadline(c))} <em>(+${usd.format(c.increase)}/mo · ${usd.format(c.annualImpact)}/yr)</em></li>`)
+        .join("")}</ul>`
+    : "";
+  const benchmarks = benchmarksReportHtml(evaluateBenchmarks(x.benchmarkProfile, a.itemizedRevenue, a.itemizedExpenses), x.benchmarkProfile, esc);
+  return `<h2>Cash runway &amp; break-even</h2>${runwayLine}<p>${esc(breakEvenSentence(be, personal))}</p>${paceTable}${benchmarks}${creep}`;
+}
+
+function reportHtml(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string, extras?: ReportExtras) {
   const months = settings.months;
   const macro = macroSummary(settings, a.inflationRateAssumed, inflationLabel);
   const copy = MODE_COPY[modeOf(a.businessType)];
@@ -4250,7 +4804,7 @@ h1{font-size:24px;margin:0}h2{font-size:16px;margin:28px 0 8px;border-bottom:1px
 .muted{color:#666}.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:20px}
 .kpi{border:1px solid #ddd;border-radius:8px;padding:12px}.kpi b{display:block;font-size:18px;font-variant-numeric:tabular-nums}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}td,th{padding:6px 8px;border-bottom:1px solid #eee;text-align:right}
-td:first-child,th:first-child{text-align:left}.neg{color:#b42318}.pos{color:#047857}li{margin-bottom:6px}.kpi .muted{font-size:11px}
+td:first-child,th:first-child{text-align:left}.neg{color:#b42318}.pos{color:#047857}.warn{color:#b54708}li{margin-bottom:6px}.kpi .muted{font-size:11px}
 .pace-banner{margin-top:20px;border:2px solid;border-radius:10px;padding:14px 16px;break-inside:avoid}.pace-good{border-color:#047857;background:#ecfdf5}.pace-bad{border-color:#b42318;background:#fef3f2}
 .pace-head{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}.pace-good .pace-head{color:#047857}.pace-bad .pace-head{color:#b42318}
 @page{margin:16mm}@media print{body{margin:0;max-width:none}}
@@ -4266,6 +4820,7 @@ td:first-child,th:first-child{text-align:left}.neg{color:#b42318}.pos{color:#047
 ${goal ? goalPaceBannerHtml(goal.pace, goal.fyLabel, esc) : ""}
 <h2>${a.businessType === "PERSONAL_FAMILY" ? "Biggest budget lever" : "Top performer"}: ${esc(a.winnerInsight.topService)}</h2><p>${esc(a.winnerInsight.message)}</p>
 <h2>Priority actions</h2>${flags ? `<ol>${flags}</ol>` : "<p>No issues found.</p>"}
+${extras ? reportExtrasHtml(a, extras) : ""}
 ${a.missingCategories.length ? `<h2>Missing categories</h2><p>${a.missingCategories.map(esc).join(", ")}</p>` : ""}
 <h2>${months}-month projection</h2>
 <table><thead><tr><th>Month</th><th>${esc(copy.revenue)}</th><th>${esc(copy.expenses)}</th><th>Net</th><th>Cumulative</th></tr></thead><tbody>${projRows}</tbody></table>
@@ -4275,6 +4830,6 @@ ${goal ? goalPaceReportHtml(goal.pace, goal.fyLabel, esc) : ""}
 }
 
 /** Opens the browser's print dialog with the executive report so the user can save a PDF. */
-function printExecutiveReport(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string) {
-  printHtml(reportHtml(a, settings, goal, inflationLabel));
+function printExecutiveReport(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string, extras?: ReportExtras) {
+  printHtml(reportHtml(a, settings, goal, inflationLabel, extras));
 }
