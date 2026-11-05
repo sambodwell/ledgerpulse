@@ -1,10 +1,126 @@
 @import "tailwindcss";
 
-/* LedgerPulse is dark-only (glassmorphism on slate-950). */
+/*
+ * LedgerPulse defaults to dark (glassmorphism on slate-950). A high-contrast light theme is opt-in via the Sun/Moon
+ * toggle, which sets `data-theme="light"` on <html> (see ThemeToggle + the no-flash script in layout.tsx).
+ *
+ * Light mode works by remapping Tailwind's color tokens rather than rewriting every class:
+ *  - the slate scale is mirrored (slate-950 ↔ slate-100, slate-400 ↔ slate-600, …), so `text-slate-400` stays "muted"
+ *    and `bg-slate-900` stays "raised surface" in both themes;
+ *  - `white` becomes ink, so translucent overlays (`bg-white/5`, `border-white/10`) and `text-white` headings flip;
+ *  - pale accent shades used for text (indigo/emerald/rose/amber/sky 50–300) map to their 700–800 steps for contrast.
+ */
 :root {
   --background: #020617;
   --foreground: #f1f5f9;
   color-scheme: dark;
+
+  --chart-grid: rgba(255, 255, 255, 0.06);
+  --chart-cursor: rgba(255, 255, 255, 0.25);
+  --chart-cursor-fill: rgba(255, 255, 255, 0.04);
+  --chart-zero: rgba(255, 255, 255, 0.3);
+  --chart-legend: #cbd5e1;
+  --chart-surface: #0f172a;
+  --chart-axis: #64748b;
+  --chart-tick: #94a3b8;
+
+  --select-bg: #0f172a;
+  --select-fg: #e2e8f0;
+  --select-checked-bg: #312e81;
+  --select-checked-fg: #ffffff;
+}
+
+:root[data-theme="light"] {
+  --background: #f1f5f9;
+  --foreground: #0f172a;
+  color-scheme: light;
+
+  --chart-grid: rgba(15, 23, 42, 0.08);
+  --chart-cursor: rgba(15, 23, 42, 0.25);
+  --chart-cursor-fill: rgba(15, 23, 42, 0.04);
+  --chart-zero: rgba(15, 23, 42, 0.3);
+  --chart-legend: #334155;
+  --chart-surface: #ffffff;
+  --chart-axis: #94a3b8;
+  --chart-tick: #475569;
+
+  --select-bg: #ffffff;
+  --select-fg: #0f172a;
+  --select-checked-bg: #e0e7ff;
+  --select-checked-fg: #1e1b4b;
+
+  /* Mirrored slate scale. */
+  --color-slate-50: oklch(12.9% 0.042 264.695);
+  --color-slate-100: oklch(20.8% 0.042 265.755);
+  --color-slate-200: oklch(27.9% 0.041 260.031);
+  --color-slate-300: oklch(37.2% 0.044 257.287);
+  --color-slate-400: oklch(44.6% 0.043 257.281);
+  --color-slate-500: oklch(50.5% 0.045 257.35);
+  --color-slate-600: oklch(70.4% 0.04 256.788);
+  --color-slate-700: oklch(86.9% 0.022 252.894);
+  --color-slate-800: oklch(92.9% 0.013 255.508);
+  --color-slate-900: oklch(98.4% 0.003 247.858);
+  --color-slate-950: oklch(96.8% 0.007 247.896);
+
+  /* "White" overlays and headings become ink. */
+  --color-white: #0f172a;
+
+  /* Pale accent text → deep accent text. */
+  --color-indigo-50: oklch(39.8% 0.195 277.366);
+  --color-indigo-100: oklch(39.8% 0.195 277.366);
+  --color-indigo-200: oklch(39.8% 0.195 277.366);
+  --color-indigo-300: oklch(45.7% 0.24 277.023);
+  --color-emerald-50: oklch(43.2% 0.095 166.913);
+  --color-emerald-100: oklch(43.2% 0.095 166.913);
+  --color-emerald-200: oklch(43.2% 0.095 166.913);
+  --color-emerald-300: oklch(50.8% 0.118 165.612);
+  --color-rose-50: oklch(45.5% 0.188 13.697);
+  --color-rose-100: oklch(45.5% 0.188 13.697);
+  --color-rose-200: oklch(45.5% 0.188 13.697);
+  --color-rose-300: oklch(51.4% 0.222 16.935);
+  --color-amber-50: oklch(47.3% 0.137 46.201);
+  --color-amber-100: oklch(47.3% 0.137 46.201);
+  --color-amber-200: oklch(47.3% 0.137 46.201);
+  --color-amber-300: oklch(55.5% 0.163 48.998);
+  --color-sky-50: oklch(44.3% 0.11 240.79);
+  --color-sky-100: oklch(44.3% 0.11 240.79);
+  --color-sky-200: oklch(44.3% 0.11 240.79);
+  --color-sky-300: oklch(50% 0.134 242.749);
+}
+
+/* Light mode: cards are solid white paper with a soft shadow instead of dark glass. */
+:root[data-theme="light"] .glass-card {
+  background-color: #ffffff;
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 8px 24px rgba(15, 23, 42, 0.06);
+}
+
+/* Light mode: keep white labels on solid accent fills (buttons, active segments), and real white where it's paper. */
+:root[data-theme="light"]
+  .text-white:is(
+    [class~="bg-indigo-500"],
+    [class~="bg-indigo-500/80"],
+    [class~="bg-indigo-500/90"],
+    [class~="bg-indigo-600"],
+    [class~="bg-rose-500"],
+    [class~="bg-emerald-500"],
+    [class~="bg-emerald-600"],
+    [class~="bg-amber-500/80"]
+  ) {
+  color: #ffffff;
+}
+:root[data-theme="light"] [class~="bg-white"] {
+  background-color: #ffffff;
+}
+
+/* Smooth the switch without animating every hover. */
+:root.theme-transition,
+:root.theme-transition * {
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    color 200ms ease !important;
 }
 
 @theme inline {
@@ -16,19 +132,16 @@
 
 /*
  * Native <select> popups ignore the page's translucent backgrounds; on Windows/Chrome they fall back to a white list
- * with the select's light text color (white-on-white). Give every select and option an explicit dark surface.
+ * with the select's text color (white-on-white in dark mode). Give every select and option an explicit surface.
  */
-select {
-  color-scheme: dark;
-}
 select option,
 select optgroup {
-  background-color: #0f172a;
-  color: #e2e8f0;
+  background-color: var(--select-bg);
+  color: var(--select-fg);
 }
 select option:checked {
-  background-color: #312e81;
-  color: #ffffff;
+  background-color: var(--select-checked-bg);
+  color: var(--select-checked-fg);
 }
 
 body {

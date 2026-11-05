@@ -30,6 +30,7 @@ import {
   Settings2,
   ShieldAlert,
   ShieldCheck,
+  BadgeCheck,
   Sparkles,
   SplitSquareHorizontal,
   Trash2,
@@ -52,6 +53,7 @@ import {
   isExtractedLineItems,
   isBusinessType,
   modeOf,
+  monthKey,
   normalizeForecastSettings,
   projectBaseline,
   projectionOptions,
@@ -83,10 +85,10 @@ import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu } from "@/components/ProfileMenu";
 import { PlanCard } from "@/components/PlanCard";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
-import { COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml } from "@/components/dashboard/chartKit";
+import { CHART, COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml } from "@/components/dashboard/chartKit";
 import { ForecastControls } from "@/components/dashboard/ForecastControls";
 import { ScenarioPanel, scenarioExamples } from "@/components/dashboard/ScenarioPanel";
-import { FiscalYearTracker, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
+import { FiscalYearTracker, ImplementedToggle, toggleImplemented, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
 import { GoalPaceBanner, GoalTracker, goalPaceBannerHtml, goalPaceReportHtml } from "@/components/dashboard/GoalTracker";
 import { clearLocalTracker, clearUnsyncedTracker, readLocalTracker, useFiscalTracker } from "@/components/dashboard/useFiscalTracker";
 import { InfoTip } from "@/components/InfoTip";
@@ -653,7 +655,7 @@ export default function DashboardPage() {
         {/* Goal Tracker first: the year-end delta is the first thing an owner sees. */}
         <div className="mb-8">
           <PanelBoundary title="Goal Tracker">
-            <GoalTracker tracker={tracker} id="goal-tracker" />
+            <GoalTracker tracker={tracker} id="goal-tracker" onViewSavings={() => (analysis && paywall ? openTab("fiscal", "savings-tracker") : jumpTo("savings-tracker"))} />
           </PanelBoundary>
         </div>
 
@@ -792,7 +794,17 @@ export default function DashboardPage() {
                     <LineItems analysis={analysis} onApply={updateLineItems} />
                   </PanelBoundary>
                   <PanelBoundary title="Audit Mode">
-                    <AuditPanel analysis={analysis} paywall={paywall} workspaceId={ws?.id ?? null} />
+                    <AuditPanel
+                      analysis={analysis}
+                      paywall={paywall}
+                      workspaceId={ws?.id ?? null}
+                      implemented={tracker.state.savings}
+                      onToggleImplemented={
+                        teaser || tracker.status === "loading" || tracker.loadFailed
+                          ? undefined
+                          : (f) => tracker.update((s) => toggleImplemented(s, { title: f.title, monthly: f.potentialSavings }, monthKey(new Date())))
+                      }
+                    />
                   </PanelBoundary>
                 </div>
               </div>
@@ -2511,7 +2523,7 @@ function FakeChart() {
     <div className="h-72">
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={FAKE_ROWS}>
-          <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+          <CartesianGrid stroke={CHART.grid} vertical={false} />
           <Line dataKey="a" stroke={COLOR.revenue} strokeWidth={2} dot={false} isAnimationActive={false} />
           <Line dataKey="b" stroke={COLOR.expenses} strokeWidth={2} dot={false} isAnimationActive={false} />
         </LineChart>
@@ -2723,13 +2735,13 @@ function ProjectionCharts({
           <div className="mt-4 h-72">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
-                <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                <CartesianGrid stroke={CHART.grid} vertical={false} />
                 <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
                 <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
-                <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
-                <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
-                <Line name={`Projected ${copy.revenue.toLowerCase()}`} type="monotone" dataKey="projectedRevenue" stroke={COLOR.revenue} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
-                <Line name={`Projected ${copy.expenses.toLowerCase()}`} type="monotone" dataKey="projectedExpenses" stroke={COLOR.expenses} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
+                <Tooltip content={<ChartTooltip />} cursor={{ stroke: CHART.cursor }} />
+                <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: CHART.legend }} />
+                <Line name={`Projected ${copy.revenue.toLowerCase()}`} type="monotone" dataKey="projectedRevenue" stroke={COLOR.revenue} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
+                <Line name={`Projected ${copy.expenses.toLowerCase()}`} type="monotone" dataKey="projectedExpenses" stroke={COLOR.expenses} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -2744,12 +2756,12 @@ function ProjectionCharts({
                     <stop offset="100%" stopColor={COLOR.cash} stopOpacity={0.02} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                <CartesianGrid stroke={CHART.grid} vertical={false} />
                 <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
                 <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
-                <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" />
-                <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
-                <Area name="Cumulative net cash" type="monotone" dataKey="cumulative" stroke={COLOR.cash} strokeWidth={2} fill="url(#cashFill)" activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }} />
+                <ReferenceLine y={0} stroke={CHART.zero} />
+                <Tooltip content={<ChartTooltip />} cursor={{ stroke: CHART.cursor }} />
+                <Area name="Cumulative net cash" type="monotone" dataKey="cumulative" stroke={COLOR.cash} strokeWidth={2} fill="url(#cashFill)" activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
               </AreaChart>
             </ResponsiveContainer>
           </div>
@@ -2769,20 +2781,44 @@ const SEVERITY_STYLE: Record<Severity, { badge: string; Icon: typeof ShieldAlert
   LOW: { badge: "border-sky-400/40 bg-sky-500/15 text-sky-200", Icon: Info },
 };
 
-function AuditPanel({ analysis, paywall, workspaceId }: { analysis: FinancialAnalysis; paywall: Paywall; workspaceId: string | null }) {
+type AuditFlag = FinancialAnalysis["auditFlags"][number];
+
+function AuditPanel({
+  analysis,
+  paywall,
+  workspaceId,
+  implemented = [],
+  onToggleImplemented,
+}: {
+  analysis: FinancialAnalysis;
+  paywall: Paywall;
+  workspaceId: string | null;
+  /** The tracker's savings list, to show which recommendations the owner has already acted on. */
+  implemented?: { title: string; status: "IDENTIFIED" | "IMPLEMENTED"; since?: string }[];
+  onToggleImplemented?: (flag: AuditFlag) => void;
+}) {
   const [showAll, setShowAll] = useState(false);
   const teaser = paywall.access.level === "teaser";
   const flags = analysis.auditFlags;
   const visible = showAll || teaser ? flags : flags.filter((f) => f.severity !== "LOW").slice(0, 6);
   const savings = sum(flags, (f) => f.potentialSavings);
   const locked = paywall.access.lockedFlagCount;
+  const doneFor = (f: AuditFlag) => implemented.find((x) => x.title === f.title && x.status === "IMPLEMENTED");
 
   return (
     <div className={cn(glass, "p-6")}>
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="flex items-center gap-2 text-lg font-semibold">
-          <ShieldAlert className="h-5 w-5 text-rose-300" /> Audit Mode
-        </h2>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h2 className="flex items-center gap-2 text-lg font-semibold">
+            <ShieldAlert className="h-5 w-5 text-rose-300" /> Audit Mode
+          </h2>
+          <p
+            className="mt-1.5 inline-flex items-center gap-1.5 rounded-full border border-sky-300/25 bg-sky-500/10 px-2.5 py-0.5 text-[11px] font-medium text-sky-200"
+            title="Every line item is reviewed by AI against category benchmarks; flagged amounts are estimates for you to confirm."
+          >
+            <BadgeCheck className="h-3.5 w-3.5 shrink-0" aria-hidden /> AI-verified cost optimization
+          </p>
+        </div>
         {teaser ? (
           <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-400">
             <Lock className="h-3 w-3" /> Savings total locked
@@ -2809,7 +2845,14 @@ function AuditPanel({ analysis, paywall, workspaceId }: { analysis: FinancialAna
                   </span>
                 </div>
                 <p className="mt-1.5 text-sm text-slate-400">{f.message}</p>
-                {f.potentialSavings > 0 && <p className="mt-2 text-xs text-emerald-300">Save ~{usd.format(f.potentialSavings)}/mo</p>}
+                {f.potentialSavings > 0 && (
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs text-emerald-300">
+                      {doneFor(f) ? `Saving ~${usd.format(f.potentialSavings)}/mo` : `Save ~${usd.format(f.potentialSavings)}/mo`}
+                    </p>
+                    {onToggleImplemented && <ImplementedToggle on={!!doneFor(f)} title={f.title} since={doneFor(f)?.since} onToggle={() => onToggleImplemented(f)} />}
+                  </div>
+                )}
               </li>
             );
           })}
@@ -2905,6 +2948,26 @@ function PartialBadge({ share }: { share: number }) {
     >
       <SplitSquareHorizontal className="h-3 w-3" /> Partial · {Math.round(share * 100)}% of 1st month
     </span>
+  );
+}
+
+/** Sum of an itemized list, shown above it so the lines can be checked against the total at a glance. */
+function ListTotal({ count, totals }: { count: number; totals: { recurring: number; oneTime: number } }) {
+  const all = totals.recurring + totals.oneTime;
+  return (
+    <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm">
+      <span className="text-xs text-slate-400">
+        Total · {count} item{count === 1 ? "" : "s"}
+      </span>
+      <span className="tabular-nums">
+        <span className="font-semibold text-slate-100">{usd.format(all)}</span>
+        {totals.oneTime > 0 && (
+          <span className="ml-1.5 text-xs text-slate-500">
+            ({usd.format(totals.recurring)} recurring + {usd.format(totals.oneTime)} one-time)
+          </span>
+        )}
+      </span>
+    </div>
   );
 }
 
@@ -3017,7 +3080,8 @@ function LineItems({ analysis, onApply }: { analysis: FinancialAnalysis; onApply
           <div className="grid gap-6 md:grid-cols-2">
             <div>
               <h3 className="text-sm font-medium text-slate-300">{copy.revenue}</h3>
-              <ul className="mt-3 max-h-[28rem] divide-y divide-white/5 overflow-y-auto overscroll-contain pr-1 text-sm [scrollbar-gutter:stable]">
+              <ListTotal count={analysis.itemizedRevenue.length} totals={revTotals} />
+              <ul className="mt-2 max-h-[28rem] divide-y divide-white/5 overflow-y-auto overscroll-contain pr-1 text-sm [scrollbar-gutter:stable]">
                 {analysis.itemizedRevenue.map((r, i) => {
                   const share = r.oneTime ? undefined : validShare(r.firstMonthShare);
                   return (
@@ -3040,7 +3104,8 @@ function LineItems({ analysis, onApply }: { analysis: FinancialAnalysis; onApply
             </div>
             <div>
               <h3 className="text-sm font-medium text-slate-300">{copy.expenses}</h3>
-              <ul className="mt-3 max-h-[28rem] divide-y divide-white/5 overflow-y-auto overscroll-contain pr-1 text-sm [scrollbar-gutter:stable]">
+              <ListTotal count={analysis.itemizedExpenses.length} totals={expTotals} />
+              <ul className="mt-2 max-h-[28rem] divide-y divide-white/5 overflow-y-auto overscroll-contain pr-1 text-sm [scrollbar-gutter:stable]">
                 {analysis.itemizedExpenses.map((e, i) => {
                   const share = e.oneTime ? undefined : validShare(e.firstMonthShare);
                   return (

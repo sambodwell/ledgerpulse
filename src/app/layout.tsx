@@ -3,6 +3,8 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { AppProvider } from "@/components/AppProvider";
 import { ChatAssistant } from "@/components/ChatAssistant";
 import { Footer } from "@/components/Footer";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { THEME_BOOT_SCRIPT } from "@/lib/theme";
 import { WorkspaceProvider } from "@/context/WorkspaceContext";
 import "./globals.css";
 
@@ -23,13 +25,18 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
+    // suppressHydrationWarning: the boot script may set data-theme on <html> before React hydrates.
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`} suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
+      </head>
       <body className="flex min-h-full flex-col bg-slate-950 text-slate-100">
         <AppProvider>
           <WorkspaceProvider>
             <div className="flex-1">{children}</div>
             <Footer />
             <ChatAssistant />
+            <ThemeToggle />
           </WorkspaceProvider>
         </AppProvider>
       </body>

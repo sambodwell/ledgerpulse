@@ -24,7 +24,7 @@ import {
 } from "@/lib/schemas";
 import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
-import { ChartTooltip, COLOR, Stat, axisProps, esc, impactColor, monthTick, printHtml, scenarioSvg, signedUsd } from "@/components/dashboard/chartKit";
+import { CHART, ChartTooltip, COLOR, Stat, axisProps, esc, impactColor, monthTick, printHtml, scenarioSvg, signedUsd } from "@/components/dashboard/chartKit";
 import { cn, errorMessage, glass, inputCls, pct, secondaryBtn, usd, usdCompact } from "@/components/ui";
 
 const MAX_PROMPT = 1000;
@@ -417,12 +417,12 @@ function ScenarioResultView({
       <div className="mt-4 h-64">
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={result.points} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
-            <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+            <CartesianGrid stroke={CHART.grid} vertical={false} />
             <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
             <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
-            <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" />
-            <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
-            <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
+            <ReferenceLine y={0} stroke={CHART.zero} />
+            <Tooltip content={<ChartTooltip />} cursor={{ stroke: CHART.cursor }} />
+            <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: CHART.legend }} />
             <Line name="Baseline runway" type="monotone" dataKey="baselineCumulative" stroke={COLOR.baseline} strokeDasharray="5 4" strokeWidth={2} dot={false} isAnimationActive={false} />
             <Line
               name={`Adjusted runway (${result.delta >= 0 ? "gain" : "loss"})`}
@@ -431,7 +431,7 @@ function ScenarioResultView({
               stroke={lineColor}
               strokeWidth={2.5}
               dot={false}
-              activeDot={{ r: 4, strokeWidth: 2, stroke: "#0f172a" }}
+              activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }}
             />
           </LineChart>
         </ResponsiveContainer>

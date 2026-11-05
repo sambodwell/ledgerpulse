@@ -8,7 +8,7 @@ export const LEGAL_DISCLAIMER =
 export function Footer() {
   return (
     <footer className="relative border-t border-white/10 bg-slate-950/80 backdrop-blur-xl">
-      <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-6 text-xs text-slate-500 sm:px-6 lg:px-8">
+      <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 pt-6 pb-16 text-xs text-slate-500 sm:px-6 sm:pb-6 sm:pl-16 lg:px-8 lg:pl-16">
         <p className="max-w-3xl leading-relaxed text-slate-400">{LEGAL_DISCLAIMER}</p>
         <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
           <span className="inline-flex items-center gap-1.5">

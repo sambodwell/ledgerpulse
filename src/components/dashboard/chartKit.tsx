@@ -15,7 +15,22 @@ export const COLOR = {
 
 export const impactColor = (delta: number) => (delta >= 0 ? COLOR.gain : COLOR.loss);
 
-export const axisProps = { stroke: "#64748b", tick: { fill: "#94a3b8", fontSize: 12 }, tickLine: false, axisLine: false } as const;
+/**
+ * Theme-aware chart chrome. These resolve CSS variables defined in globals.css (dark default + `[data-theme="light"]`),
+ * so Recharts strokes/fills follow the Sun/Moon toggle without re-rendering.
+ */
+export const CHART = {
+  grid: "var(--chart-grid)",
+  cursor: "var(--chart-cursor)",
+  cursorFill: "var(--chart-cursor-fill)",
+  zero: "var(--chart-zero)",
+  legend: "var(--chart-legend)",
+  surface: "var(--chart-surface)",
+  axis: "var(--chart-axis)",
+  tick: "var(--chart-tick)",
+} as const;
+
+export const axisProps = { stroke: CHART.axis, tick: { fill: CHART.tick, fontSize: 12 }, tickLine: false, axisLine: false } as const;
 
 /** X-axis tick: "Jan" for a 12-month view, "Jan '27" when the horizon spans several years. */
 export const monthTick = (long: boolean) => (m: string) => {

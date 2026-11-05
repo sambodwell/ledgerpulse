@@ -6,6 +6,7 @@ import { PieChart as PieIcon } from "lucide-react";
 import { MODE_COPY, modeOf, splitTotals, type FinancialAnalysis } from "@/lib/schemas";
 import { InfoTip } from "@/components/InfoTip";
 import { cn, glass, usd } from "@/components/ui";
+import { CHART } from "@/components/dashboard/chartKit";
 
 /**
  * Categorical slots (dark steps), fixed order; validated on #0f172a: CVD ΔE ≥ 8.4, normal-vision ≥ 19.3, ≥ 3:1 contrast.
@@ -13,7 +14,7 @@ import { cn, glass, usd } from "@/components/ui";
  */
 const SLOTS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"] as const;
 const OTHER = "#64748b";
-const SURFACE = "#0f172a";
+const SURFACE = CHART.surface;
 const MAX_SLICES = SLOTS.length;
 
 interface Slice {

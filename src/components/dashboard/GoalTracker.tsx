@@ -1,11 +1,11 @@
 "use client";
 
 import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { CheckCircle2, Cloud, Flag, Loader2, RotateCw, TrendingDown, TrendingUp } from "lucide-react";
+import { CheckCircle2, Cloud, Flag, Loader2, PiggyBank, RotateCw, TrendingDown, TrendingUp } from "lucide-react";
 import { GOAL_METRICS, GOAL_METRIC_LABEL, annualDeltaWords, exactMoney, paceWordsPct, signedMoney, signedPct, targetKeyFor, type GoalMetric, type GoalPace } from "@/lib/fiscal";
 import { round2 } from "@/lib/schemas";
 import { InfoTip } from "@/components/InfoTip";
-import { ChartTooltip, COLOR, axisProps } from "@/components/dashboard/chartKit";
+import { CHART, ChartTooltip, COLOR, axisProps } from "@/components/dashboard/chartKit";
 import { MoneyNumberInput } from "@/components/dashboard/MoneyInput";
 import type { FiscalTrackerHandle, SaveStatus } from "@/components/dashboard/useFiscalTracker";
 import { cn, usdCompact } from "@/components/ui";
@@ -19,8 +19,8 @@ const GOAL_NOUN: Record<GoalMetric, string> = { NET: "net income goal", REVENUE:
  * Goal Tracker: pick Net income (default), Revenue or an Expense budget, set an annual (or monthly) target, and see the
  * year-end delta, the pace chart and the monthly / quarterly breakdown. The goal is spread evenly (goal ÷ 12 per month).
  */
-export function GoalTracker({ tracker, id }: { tracker: FiscalTrackerHandle; id?: string }) {
-  const { state, update, pace, goal, fyLabel, status, loadFailed } = tracker;
+export function GoalTracker({ tracker, id, onViewSavings }: { tracker: FiscalTrackerHandle; id?: string; onViewSavings?: () => void }) {
+  const { state, update, pace, goal, fyLabel, status, loadFailed, summary } = tracker;
   const metric = state.goalMetric;
   const label = GOAL_METRIC_LABEL[metric];
   const setGoal = (v: number | null) => update((s) => ({ ...s, targets: { ...s.targets, [targetKeyFor(s.goalMetric)]: v } }));
@@ -38,7 +38,7 @@ export function GoalTracker({ tracker, id }: { tracker: FiscalTrackerHandle; id?
   const disabled = status === "loading" || loadFailed;
 
   return (
-    <section id={id} aria-label="Goal Tracker" className="scroll-mt-6 rounded-2xl border border-indigo-300/25 bg-gradient-to-br from-indigo-500/[0.09] via-white/[0.02] to-transparent p-5 shadow-[0_8px_32px_rgba(0,0,0,0.35)] backdrop-blur-xl sm:p-6">
+    <section id={id} aria-label="Goal Tracker" className="glass-card scroll-mt-6 rounded-2xl border border-indigo-300/25 bg-gradient-to-br from-indigo-500/[0.09] via-white/[0.02] to-transparent p-5 shadow-[0_8px_32px_rgba(0,0,0,0.35)] backdrop-blur-xl sm:p-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-100">
@@ -51,7 +51,10 @@ export function GoalTracker({ tracker, id }: { tracker: FiscalTrackerHandle; id?
           </h2>
           <p className="mt-0.5 text-sm text-slate-400">Set a year-end target and see exactly how far ahead or behind you are.</p>
         </div>
-        <TrackerSaveBadge tracker={tracker} />
+        <div className="flex flex-wrap items-center gap-2 sm:flex-col sm:items-end">
+          {!loadFailed && status !== "loading" && <RealizedSavingsChip monthly={summary.savings.implementedMonthly} realizedYtd={summary.savings.realizedYtd} onClick={onViewSavings} />}
+          <TrackerSaveBadge tracker={tracker} />
+        </div>
       </div>
 
       {loadFailed ? (
@@ -127,21 +130,32 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
   const label = GOAL_METRIC_LABEL[pace.metric];
   const progress = pace.goal !== 0 ? Math.max(0, Math.min(1, pace.ytd.value / pace.goal)) : 0;
   const remainingMonths = 12 - pace.ytd.months;
+  const delta = deltaParts(pace);
   return (
     <div
       role="status"
       className={cn(
-        "rounded-xl border px-4 py-3",
+        "rounded-xl border px-3 py-2.5 sm:px-4 sm:py-3",
         good ? "border-emerald-300/30 bg-emerald-500/[0.08]" : "border-rose-300/30 bg-rose-500/[0.08]",
         className,
       )}
     >
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
-        <p className={cn("flex items-center gap-2 font-semibold tabular-nums", compact ? "text-base" : "text-xl", good ? "text-emerald-100" : "text-rose-100")}>
-          <Icon className={cn("shrink-0", compact ? "h-4 w-4" : "h-5 w-5")} aria-hidden />
-          {annualDeltaWords(pace)}
+        {/* Figure and wording wrap as two units, so a narrow screen breaks "+$10,451.39 (+17.4%)" / "ahead of annual target", never mid-figure. */}
+        <p
+          className={cn(
+            "flex min-w-0 items-start gap-2 font-semibold leading-snug tabular-nums sm:items-center",
+            compact ? "text-sm sm:text-base" : "text-lg sm:text-xl",
+            good ? "text-emerald-100" : "text-rose-100",
+          )}
+        >
+          <Icon className={cn("mt-0.5 shrink-0 sm:mt-0", compact ? "h-4 w-4" : "h-5 w-5")} aria-hidden />
+          <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+            {delta.figure && <span className="whitespace-nowrap">{delta.figure}</span>}
+            <span className={cn(delta.figure && "text-[0.85em] font-medium opacity-90")}>{delta.words}</span>
+          </span>
         </p>
-        <p className="text-xs text-slate-400">
+        <p className="text-[11px] leading-relaxed text-slate-400 sm:text-xs">
           {label} {expense ? "budget" : "goal"} {exactMoney(pace.goal)}
           {fyLabel ? ` · ${fyLabel}` : ""} · projected {exactMoney(pace.annual.projected)}
         </p>
@@ -149,7 +163,7 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/10" aria-hidden>
         <div className={cn("h-full rounded-full", good ? "bg-emerald-400/80" : "bg-rose-400/80")} style={{ width: `${progress * 100}%` }} />
       </div>
-      <p className="mt-2 text-xs text-slate-300">
+      <p className="mt-2 text-[11px] leading-relaxed text-slate-300 sm:text-xs">
         {pace.ytd.months > 0 ? (
           <>
             Actuals so far: <span className="font-medium tabular-nums text-slate-100">{exactMoney(pace.ytd.value)}</span> over {pace.ytd.months} logged month
@@ -178,6 +192,40 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
   );
 }
 
+/** Splits the headline into its money figure and wording: "+$1,200.00 (+2.0%)" + "ahead of annual target". */
+function deltaParts(pace: GoalPace): { figure: string; words: string } {
+  const full = annualDeltaWords(pace);
+  const m = full.match(/^(.*?)\s+((?:ahead of|behind|under|over)\s+annual\s+\w+)$/);
+  return m ? { figure: m[1], words: m[2] } : { figure: "", words: full };
+}
+
+/** Vibrant running total of implemented (user-executed) recurring savings: the platform's realized ROI at a glance. */
+export function RealizedSavingsChip({ monthly, realizedYtd, onClick, className }: { monthly: number; realizedYtd?: number; onClick?: () => void; className?: string }) {
+  if (!(monthly > 0)) return null;
+  const label = `+${exactMoney(monthly).replace(/\.00$/, "")}/mo saved`;
+  const title = `Recurring savings you've implemented${realizedYtd ? ` · ${exactMoney(realizedYtd)} captured this fiscal year` : ""}${onClick ? " · View in the ROI & Savings Tracker" : ""}`;
+  const cls = cn(
+    "inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-emerald-400/40 bg-emerald-500/15 px-3 py-1 text-sm font-semibold tabular-nums text-emerald-200 shadow-[0_0_18px_rgba(16,185,129,0.25)]",
+    onClick && "transition hover:bg-emerald-500/25 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400",
+    className,
+  );
+  const body = (
+    <>
+      <PiggyBank className="h-4 w-4 shrink-0" aria-hidden />
+      {label}
+    </>
+  );
+  return onClick ? (
+    <button type="button" onClick={onClick} title={title} aria-label={`${label}. View the ROI and Savings Tracker`} className={cls}>
+      {body}
+    </button>
+  ) : (
+    <span title={title} className={cls}>
+      {body}
+    </span>
+  );
+}
+
 function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: string; target: number; actual: number | null; projected: number | null }[]; label: string }) {
   return (
     <>
@@ -186,12 +234,12 @@ function GoalPaceDetail({ pace, rows, label }: { pace: GoalPace; rows: { month: 
           <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
-                <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                <CartesianGrid stroke={CHART.grid} vertical={false} />
                 <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0]} minTickGap={8} />
                 <YAxis {...axisProps} width={60} tickFormatter={(v: number) => usdCompact.format(v)} />
-                <ReferenceLine y={0} stroke="rgba(255,255,255,0.2)" />
-                <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.25)" }} />
-                <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: "#cbd5e1" }} />
+                <ReferenceLine y={0} stroke={CHART.zero} />
+                <Tooltip content={<ChartTooltip />} cursor={{ stroke: CHART.cursor }} />
+                <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: CHART.legend }} />
                 <Line name={pace.metric === "EXPENSE" ? "Budget path" : "Goal path"} type="linear" dataKey="target" stroke={COLOR.baseline} strokeWidth={2} strokeDasharray="6 4" dot={false} isAnimationActive={false} />
                 <Line name="Actual" type="linear" dataKey="actual" stroke={COLOR.cash} strokeWidth={2.5} dot={{ r: 3, strokeWidth: 0, fill: COLOR.cash }} connectNulls={false} isAnimationActive={false} />
                 <Line name="Projected" type="linear" dataKey="projected" stroke={COLOR.cash} strokeOpacity={0.7} strokeWidth={2} strokeDasharray="3 3" dot={false} connectNulls={false} isAnimationActive={false} />

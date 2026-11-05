@@ -1,10 +1,10 @@
 import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 
-/** Shared design-system tokens for the dark glassmorphism UI. */
+/** Shared design-system tokens for the glassmorphism UI (dark default; light mode remaps tokens in globals.css). */
 export const cn = (...inputs: Parameters<typeof clsx>) => twMerge(clsx(inputs));
 
-export const glass = "rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.35)]";
+export const glass = "glass-card rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.35)]";
 
 export const inputCls =
   "w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-indigo-400 focus:outline-none";

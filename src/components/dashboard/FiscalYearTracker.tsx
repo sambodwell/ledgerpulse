@@ -23,8 +23,8 @@ import { StatementMonthPicker } from "@/components/dashboard/StatementMonth";
 import { SeasonalityControls } from "@/components/dashboard/SeasonalityControls";
 import { authHeaders } from "@/lib/supabase";
 import { InfoTip } from "@/components/InfoTip";
-import { ChartTooltip, COLOR, axisProps, signedUsd } from "@/components/dashboard/chartKit";
-import { TrackerSaveBadge } from "@/components/dashboard/GoalTracker";
+import { CHART, ChartTooltip, COLOR, axisProps, signedUsd } from "@/components/dashboard/chartKit";
+import { RealizedSavingsChip, TrackerSaveBadge } from "@/components/dashboard/GoalTracker";
 import { MoneyNumberInput } from "@/components/dashboard/MoneyInput";
 import { StatusSwitch } from "@/components/dashboard/ForecastControls";
 import type { FiscalTrackerHandle } from "@/components/dashboard/useFiscalTracker";
@@ -35,6 +35,8 @@ export { clearLocalTracker, readLocalTracker } from "@/components/dashboard/useF
 const FORECAST_FILL = "rgba(25,158,112,0.35)";
 /** importFor marker for the "auto-detect month" import (row imports use the row's month key). */
 const AUTO_IMPORT = "auto";
+/** Actuals-table inputs: compact, with a placeholder that fades out as soon as the field is focused. */
+const FY_INPUT = "py-1 placeholder:text-slate-500/70 focus:placeholder:text-transparent";
 
 /** Goal pace + label, reported up so the executive PDF can include it. */
 export interface GoalReport {
@@ -377,6 +379,14 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
                   </div>
                 </div>
               )}
+              <p className="mt-2 flex items-start gap-1.5 rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5 text-[11px] leading-relaxed text-slate-400">
+                <Repeat1 className="mt-0.5 h-3 w-3 shrink-0 text-amber-200" aria-hidden />
+                <span>
+                  <strong className="font-medium text-slate-200">Expenses (total)</strong> is the full monthly expense.{" "}
+                  <strong className="font-medium text-slate-200">Of which one-time</strong> isolates the non-recurring part of that total — e.g. $5,000 total with a $1,200 repair
+                  → enter 5,000 and 1,200, not 3,800.
+                </span>
+              </p>
               {/*
                 Sticky header: the inputs below are positioned (relative wrappers for the $ prefix), so without its own
                 stacking layer and an opaque fill the header would be painted under the scrolling rows.
@@ -387,11 +397,21 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
                     <tr>
                       <th className="bg-slate-900 py-2 pl-2 font-medium">Month</th>
                       <th className="bg-slate-900 py-2 font-medium">Revenue</th>
-                      <th className="bg-slate-900 py-2 font-medium">Expenses (total)</th>
+                      <th className="bg-slate-900 py-2 font-medium">
+                        <span className="inline-flex items-center gap-1">
+                          Expenses (total)
+                          <InfoTip label="Total expenses">
+                            The month&apos;s <strong className="font-medium text-slate-100">full</strong> expenses: recurring and one-time together, exactly as they appear on the statement.
+                          </InfoTip>
+                        </span>
+                      </th>
                       <th className="bg-slate-900 py-2 font-medium">
                         <span className="inline-flex items-center gap-1">
                           of which one-time
-                          <InfoTip label="One-time expenses">Part of the month&apos;s expenses that won&apos;t repeat (a repair, a single purchase). It counts toward the month&apos;s total but is left out of the trailing average.</InfoTip>
+                          <InfoTip label="One-time expenses">
+                            The non-recurring slice <em>already included</em> in the total (a repair, a single purchase) — don&apos;t add it on top. It still counts toward the
+                            month&apos;s net but is left out of the trailing average.
+                          </InfoTip>
                         </span>
                       </th>
                       <th className="bg-slate-900 py-2 pr-2 text-right font-medium">Net</th>
@@ -417,19 +437,38 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
                           </td>
                           {loggable ? (
                             <>
+                              {/*
+                                Untouched fields stay empty (zeroAsEmpty) with a faded hint that disappears on focus, so a
+                                stored 0 never blocks typing. Before anything is logged the hint is the month's forecast.
+                              */}
                               <td className="w-36 py-1.5 pr-2">
-                                <MoneyNumberInput aria-label={`${m.label} revenue`} value={m.actual?.revenue ?? null} placeholder={m.forecastRevenue.toFixed(2)} onChange={(v) => setActual(m.key, "revenue", v)} className="py-1" />
+                                <MoneyNumberInput
+                                  aria-label={`${m.label} revenue`}
+                                  value={m.actual?.revenue ?? null}
+                                  zeroAsEmpty
+                                  placeholder={m.actual ? "0.00" : m.forecastRevenue.toFixed(2)}
+                                  onChange={(v) => setActual(m.key, "revenue", v)}
+                                  className={FY_INPUT}
+                                />
                               </td>
                               <td className="w-36 py-1.5 pr-2">
-                                <MoneyNumberInput aria-label={`${m.label} expenses`} value={m.actual?.expenses ?? null} placeholder={m.forecastExpenses.toFixed(2)} onChange={(v) => setActual(m.key, "expenses", v)} className="py-1" />
+                                <MoneyNumberInput
+                                  aria-label={`${m.label} total expenses`}
+                                  value={m.actual?.expenses ?? null}
+                                  zeroAsEmpty
+                                  placeholder={m.actual ? "0.00" : m.forecastExpenses.toFixed(2)}
+                                  onChange={(v) => setActual(m.key, "expenses", v)}
+                                  className={FY_INPUT}
+                                />
                               </td>
                               <td className="w-32 py-1.5 pr-2">
                                 <MoneyNumberInput
-                                  aria-label={`${m.label} one-time expenses`}
+                                  aria-label={`${m.label} one-time expenses (part of total)`}
                                   value={m.actual?.oneTimeExpenses ?? null}
+                                  zeroAsEmpty
                                   placeholder="0.00"
                                   onChange={(v) => setActual(m.key, "oneTimeExpenses", v)}
-                                  className={cn("py-1", m.actual?.oneTimeExpenses ? "border-amber-300/40 text-amber-100" : "")}
+                                  className={cn(FY_INPUT, m.actual?.oneTimeExpenses ? "border-amber-300/40 text-amber-100" : "")}
                                 />
                               </td>
                             </>
@@ -493,11 +532,11 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
                 <div className="mt-2 h-48">
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={chartRows} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                      <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                      <CartesianGrid stroke={CHART.grid} vertical={false} />
                       <XAxis dataKey="month" {...axisProps} tickFormatter={(m: string) => m.split(" ")[0].slice(0, 1)} interval={0} />
                       <YAxis {...axisProps} width={56} tickFormatter={(v: number) => usdCompact.format(v)} />
-                      <ReferenceLine y={0} stroke="rgba(255,255,255,0.3)" />
-                      <Tooltip content={<ChartTooltip />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
+                      <ReferenceLine y={0} stroke={CHART.zero} />
+                      <Tooltip content={<ChartTooltip />} cursor={{ fill: CHART.cursorFill }} />
                       <Bar dataKey="net" name="Net" radius={[4, 4, 0, 0]} isAnimationActive={false}>
                         {chartRows.map((r) => (
                           <Cell key={r.month} fill={r.actual ? COLOR.cash : FORECAST_FILL} />
@@ -525,6 +564,19 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
   );
 }
 
+/**
+ * Marks an audit recommendation implemented (adding it to the savings list if it isn't there yet), or undoes it.
+ * Implemented savings count from `currentKey` onward.
+ */
+export function toggleImplemented(s: FiscalTrackerState, item: { title: string; monthly: number }, currentKey: string): FiscalTrackerState {
+  const existing = s.savings.find((x) => x.title === item.title);
+  if (!existing) return { ...s, savings: [...s.savings, { id: `a${Date.now()}`, title: item.title.slice(0, 160), monthly: item.monthly, status: "IMPLEMENTED", since: currentKey }] };
+  return {
+    ...s,
+    savings: s.savings.map((y) => (y.id !== existing.id ? y : y.status === "IMPLEMENTED" ? { ...y, status: "IDENTIFIED", since: undefined } : { ...y, status: "IMPLEMENTED", since: currentKey })),
+  };
+}
+
 function SavingsTracker({
   state,
   update,
@@ -547,10 +599,14 @@ function SavingsTracker({
     setMonthly(null);
   };
   return (
-    <div className="rounded-xl border border-emerald-400/20 bg-gradient-to-br from-emerald-500/[0.07] to-transparent p-4">
-      <h3 className="flex items-center gap-2 text-sm font-medium text-emerald-100">
-        <PiggyBank className="h-4 w-4" /> ROI &amp; Savings Tracker
-      </h3>
+    <div id="savings-tracker" className="scroll-mt-6 rounded-xl border border-emerald-400/20 bg-gradient-to-br from-emerald-500/[0.07] to-transparent p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="flex items-center gap-2 text-sm font-medium text-emerald-100">
+          <PiggyBank className="h-4 w-4" /> ROI &amp; Savings Tracker
+        </h3>
+        <RealizedSavingsChip monthly={summary.implementedMonthly} realizedYtd={summary.realizedYtd} className="px-2.5 py-0.5 text-xs" />
+      </div>
+      <p className="mt-1 text-[11px] text-slate-500">Mark a recommendation <span className="text-emerald-200">Implemented</span> once you&apos;ve acted on it — it counts as realized savings from this month on.</p>
       <dl className="mt-3 grid grid-cols-2 gap-3 text-xs">
         <div>
           <dt className="text-slate-500">Identified (not yet acted on)</dt>
@@ -588,29 +644,20 @@ function SavingsTracker({
       {state.savings.length > 0 && (
         <ul className="mt-3 max-h-56 space-y-1.5 overflow-y-auto pr-1 text-xs">
           {state.savings.map((x) => (
-            <li key={x.id} className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.02] px-2 py-1.5">
-              <button
-                type="button"
-                role="switch"
-                aria-checked={x.status === "IMPLEMENTED"}
-                aria-label={`Mark "${x.title}" implemented`}
-                title={x.status === "IMPLEMENTED" ? `Implemented since ${x.since ?? "the start of the year"}. Click to undo.` : "Mark implemented (counts from this month)"}
-                onClick={() =>
-                  update((s) => ({
-                    ...s,
-                    savings: s.savings.map((y) =>
-                      y.id === x.id ? (y.status === "IMPLEMENTED" ? { ...y, status: "IDENTIFIED", since: undefined } : { ...y, status: "IMPLEMENTED", since: currentKey }) : y,
-                    ),
-                  }))
-                }
-                className={cn("grid h-5 w-5 shrink-0 place-items-center rounded border", x.status === "IMPLEMENTED" ? "border-emerald-300/60 bg-emerald-500/30" : "border-white/20")}
-              >
-                {x.status === "IMPLEMENTED" && <CheckCircle2 className="h-3.5 w-3.5 text-emerald-200" />}
-              </button>
+            <li key={x.id} className={cn("flex items-center gap-2 rounded-lg border px-2 py-1.5", x.status === "IMPLEMENTED" ? "border-emerald-400/30 bg-emerald-500/[0.06]" : "border-white/10 bg-white/[0.02]")}>
               <span className={cn("min-w-0 flex-1 truncate", x.status === "IMPLEMENTED" ? "text-slate-200" : "text-slate-400")} title={x.title}>
                 {x.title}
               </span>
-              <span className="tabular-nums text-slate-300">{exactMoney(x.monthly)}/mo</span>
+              <span className={cn("tabular-nums", x.status === "IMPLEMENTED" ? "font-medium text-emerald-200" : "text-slate-300")}>
+                {x.status === "IMPLEMENTED" ? "+" : ""}
+                {exactMoney(x.monthly)}/mo
+              </span>
+              <ImplementedToggle
+                on={x.status === "IMPLEMENTED"}
+                title={x.title}
+                since={x.since}
+                onToggle={() => update((s) => toggleImplemented(s, x, currentKey))}
+              />
               <button type="button" aria-label={`Remove "${x.title}"`} onClick={() => update((s) => ({ ...s, savings: s.savings.filter((y) => y.id !== x.id) }))} className="text-slate-500 hover:text-rose-300">
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
@@ -629,5 +676,27 @@ function SavingsTracker({
         </button>
       </div>
     </div>
+  );
+}
+
+/** Labeled "Mark implemented" / "Implemented" pill (a switch), shared by the savings list and the audit panel. */
+export function ImplementedToggle({ on, title, since, onToggle, className }: { on: boolean; title: string; since?: string; onToggle: () => void; className?: string }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={`${title}: ${on ? "implemented" : "mark implemented"}`}
+      title={on ? `Implemented since ${since ? periodLabel(since) : "the start of the year"}. Click to undo.` : "Mark implemented (counts as realized savings from this month)"}
+      onClick={onToggle}
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-emerald-400",
+        on ? "border-emerald-400/50 bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30" : "border-white/15 text-slate-400 hover:border-emerald-400/40 hover:text-emerald-200",
+        className,
+      )}
+    >
+      <CheckCircle2 className={cn("h-3 w-3", !on && "opacity-60")} aria-hidden />
+      {on ? "Implemented" : "Mark implemented"}
+    </button>
   );
 }

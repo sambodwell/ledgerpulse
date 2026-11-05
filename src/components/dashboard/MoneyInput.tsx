@@ -59,14 +59,32 @@ export function MoneyInput({
 
 const fmt = (v: number | null) => (v == null ? "" : v.toFixed(2));
 
-/** MoneyInput bound to a number (null = empty). Keeps the typed text while the number round-trips through state. */
-export function MoneyNumberInput({ value, onChange, ...rest }: { value: number | null; onChange: (v: number | null) => void; placeholder?: string; className?: string; "aria-label": string }) {
+/**
+ * MoneyInput bound to a number (null = empty). Keeps the typed text while the number round-trips through state.
+ * `zeroAsEmpty`: a stored 0 renders as an empty field (showing the faded placeholder) instead of a hard "0.00" the
+ * user has to delete first — for fields where 0 just means "nothing entered yet".
+ */
+export function MoneyNumberInput({
+  value: rawValue,
+  onChange,
+  zeroAsEmpty = false,
+  ...rest
+}: {
+  value: number | null;
+  onChange: (v: number | null) => void;
+  placeholder?: string;
+  className?: string;
+  zeroAsEmpty?: boolean;
+  "aria-label": string;
+}) {
+  const norm = (v: number | null) => (zeroAsEmpty && v === 0 ? null : v);
+  const value = norm(rawValue);
   const [text, setText] = useState(fmt(value));
   const [synced, setSynced] = useState(value);
   // External change (e.g. imported from a statement): adopt it, unless it's just our own text round-tripping.
   if (value !== synced) {
     setSynced(value);
-    if ((text === "" ? null : Number(text)) !== value) setText(fmt(value));
+    if (norm(text === "" ? null : Number(text)) !== value) setText(fmt(value));
   }
   return (
     <MoneyInput
@@ -76,7 +94,7 @@ export function MoneyNumberInput({ value, onChange, ...rest }: { value: number |
         setText(v);
         const n = v === "" ? null : Number(v);
         const next = n != null && Number.isFinite(n) ? n : null;
-        setSynced(next);
+        setSynced(norm(next));
         onChange(next);
       }}
     />
