@@ -1,7 +1,7 @@
 "use client";
 
 import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { CheckCircle2, Cloud, Flag, Loader2, PiggyBank, RotateCw, TrendingDown, TrendingUp } from "lucide-react";
+import { CheckCircle2, Cloud, Flag, Info, Loader2, PiggyBank, RotateCw, TrendingDown, TrendingUp, Trophy } from "lucide-react";
 import { GOAL_METRICS, GOAL_METRIC_LABEL, annualDeltaWords, exactMoney, paceWordsPct, signedMoney, signedPct, targetKeyFor, type GoalMetric, type GoalPace } from "@/lib/fiscal";
 import { round2 } from "@/lib/schemas";
 import { InfoTip } from "@/components/InfoTip";
@@ -116,6 +116,7 @@ export function GoalTracker({ tracker, id, onViewSavings }: { tracker: FiscalTra
               <GoalPaceDetail pace={pace} rows={rows} label={label} />
             </>
           )}
+          <DataCompletenessNote loggedCount={summary.loggedCount} className="mt-4" />
         </>
       )}
     </section>
@@ -125,7 +126,8 @@ export function GoalTracker({ tracker, id, onViewSavings }: { tracker: FiscalTra
 /** The prominent year-end delta: "$1,200.00 ahead of annual target", with actuals-to-date and what's still needed. */
 export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { pace: GoalPace; fyLabel?: string; className?: string; compact?: boolean }) {
   const good = pace.annual.variance >= -0.004;
-  const Icon = good ? TrendingUp : TrendingDown;
+  const reached = goalReached(pace);
+  const Icon = reached ? Trophy : good ? TrendingUp : TrendingDown;
   const expense = pace.metric === "EXPENSE";
   const label = GOAL_METRIC_LABEL[pace.metric];
   const progress = pace.goal !== 0 ? Math.max(0, Math.min(1, pace.ytd.value / pace.goal)) : 0;
@@ -136,7 +138,11 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
       role="status"
       className={cn(
         "rounded-xl border px-3 py-2.5 sm:px-4 sm:py-3",
-        good ? "border-emerald-300/30 bg-emerald-500/[0.08]" : "border-rose-300/30 bg-rose-500/[0.08]",
+        reached
+          ? "border-amber-300/40 bg-gradient-to-r from-amber-400/[0.14] via-emerald-500/[0.10] to-emerald-500/[0.06]"
+          : good
+            ? "border-emerald-300/30 bg-emerald-500/[0.08]"
+            : "border-rose-300/30 bg-rose-500/[0.08]",
         className,
       )}
     >
@@ -146,14 +152,23 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
           className={cn(
             "flex min-w-0 items-start gap-2 font-semibold leading-snug tabular-nums sm:items-center",
             compact ? "text-sm sm:text-base" : "text-lg sm:text-xl",
-            good ? "text-emerald-100" : "text-rose-100",
+            reached ? "text-amber-100" : good ? "text-emerald-100" : "text-rose-100",
           )}
         >
-          <Icon className={cn("mt-0.5 shrink-0 sm:mt-0", compact ? "h-4 w-4" : "h-5 w-5")} aria-hidden />
-          <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
-            {delta.figure && <span className="whitespace-nowrap">{delta.figure}</span>}
-            <span className={cn(delta.figure && "text-[0.85em] font-medium opacity-90")}>{delta.words}</span>
-          </span>
+          <Icon className={cn("mt-0.5 shrink-0 sm:mt-0", compact ? "h-4 w-4" : "h-5 w-5", reached && "text-amber-300")} aria-hidden />
+          {reached ? (
+            <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+              <span className="whitespace-nowrap">Goal Reached!</span>
+              <span className="text-[0.85em] font-medium opacity-90">
+                {reached === "ACTUAL" ? `${signedMoney(pace.ytd.value - pace.goal)} past your goal already` : `on track to beat it by ${signedMoney(pace.annual.variance)}`}
+              </span>
+            </span>
+          ) : (
+            <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+              {delta.figure && <span className="whitespace-nowrap">{delta.figure}</span>}
+              <span className={cn(delta.figure && "text-[0.85em] font-medium opacity-90")}>{delta.words}</span>
+            </span>
+          )}
         </p>
         <p className="text-[11px] leading-relaxed text-slate-400 sm:text-xs">
           {label} {expense ? "budget" : "goal"} {exactMoney(pace.goal)}
@@ -172,7 +187,13 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
         ) : (
           <>No months logged yet — this is based on your forecast. Log actuals in the Fiscal Year Tracker to track real pace. </>
         )}
-        {pace.requiredMonthly != null && (
+        {reached === "ACTUAL" ? (
+          <>Your logged actuals already exceed the {exactMoney(pace.goal)} goal — anything more this year is extra.</>
+        ) : reached === "PROJECTED" ? (
+          <>
+            {exactMoney(pace.remainingToGoal)} more to lock it in ({exactMoney(pace.requiredMonthly ?? 0)}/mo); your forecast puts you {exactMoney(pace.annual.variance)} past the goal.
+          </>
+        ) : pace.requiredMonthly != null && (
           <>
             {expense ? (
               <>
@@ -192,6 +213,33 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
   );
 }
 
+/**
+ * Revenue / net goals: "ACTUAL" once logged actuals alone pass the goal, "PROJECTED" when actuals + forecast beat it,
+ * otherwise null. Expense budgets are never "reached" (staying under them is shown as "under budget").
+ */
+export function goalReached(pace: GoalPace): "ACTUAL" | "PROJECTED" | null {
+  if (pace.metric === "EXPENSE" || pace.goal <= 0) return null;
+  if (pace.ytd.months > 0 && pace.ytd.value >= pace.goal) return "ACTUAL";
+  if (pace.annual.projected >= pace.goal) return "PROJECTED";
+  return null;
+}
+
+/** Projections firm up as more months are logged: shown under the goal and projection views. */
+export function DataCompletenessNote({ loggedCount, className }: { loggedCount: number; className?: string }) {
+  if (loggedCount >= 12) return null;
+  return (
+    <p className={cn("flex items-start gap-1.5 rounded-lg border border-sky-300/20 bg-sky-500/[0.06] px-3 py-2 text-[11px] leading-relaxed text-sky-100/90 sm:text-xs", className)}>
+      <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sky-300" aria-hidden />
+      <span>
+        {loggedCount === 0
+          ? "Pace and projections are estimates from your plan until you log real months."
+          : `Based on ${loggedCount} logged month${loggedCount === 1 ? "" : "s"} of actuals.`}{" "}
+        They get more accurate with every month you add — upload several past statements (or a full year) so seasonal swings and one-off months average out.
+      </span>
+    </p>
+  );
+}
+
 /** Splits the headline into its money figure and wording: "+$1,200.00 (+2.0%)" + "ahead of annual target". */
 function deltaParts(pace: GoalPace): { figure: string; words: string } {
   const full = annualDeltaWords(pace);
@@ -202,7 +250,7 @@ function deltaParts(pace: GoalPace): { figure: string; words: string } {
 /** Vibrant running total of implemented (user-executed) recurring savings: the platform's realized ROI at a glance. */
 export function RealizedSavingsChip({ monthly, realizedYtd, onClick, className }: { monthly: number; realizedYtd?: number; onClick?: () => void; className?: string }) {
   if (!(monthly > 0)) return null;
-  const label = `+${exactMoney(monthly).replace(/\.00$/, "")}/mo saved`;
+  const label = `+${exactMoney(monthly)}/mo saved`;
   const title = `Recurring savings you've implemented${realizedYtd ? ` · ${exactMoney(realizedYtd)} captured this fiscal year` : ""}${onClick ? " · View in the ROI & Savings Tracker" : ""}`;
   const cls = cn(
     "inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-emerald-400/40 bg-emerald-500/15 px-3 py-1 text-sm font-semibold tabular-nums text-emerald-200 shadow-[0_0_18px_rgba(16,185,129,0.25)]",
@@ -359,14 +407,19 @@ export function goalPaceBannerHtml(pace: GoalPace, fyLabel: string, esc: (s: str
     pace.ytd.months > 0
       ? `Actuals so far: <b>${exactMoney(pace.ytd.value)}</b> over ${pace.ytd.months} logged month${pace.ytd.months === 1 ? "" : "s"} vs ${exactMoney(pace.ytd.target)} goal pace (${esc(paceWordsPct(pace.ytd.variance, pace.ytd.target, pace.metric))}).`
       : "No months logged yet — based on the tracker forecast.";
+  const reached = goalReached(pace);
   const need =
-    pace.requiredMonthly == null
+    reached === "ACTUAL"
+      ? " Logged actuals already exceed the goal."
+      : pace.requiredMonthly == null
       ? ""
-      : expense
+      : reached === "PROJECTED"
+        ? ` ${exactMoney(pace.remainingToGoal)} more to lock it in; the forecast finishes ${exactMoney(pace.annual.variance)} past the goal.`
+        : expense
         ? ` ${exactMoney(Math.max(0, pace.remainingToGoal))} of budget left (up to ${exactMoney(Math.max(0, pace.requiredMonthly))}/mo).`
         : ` ${exactMoney(pace.remainingToGoal)} to go (${exactMoney(pace.requiredMonthly)}/mo needed).`;
   return `<div class="pace-banner ${good ? "pace-good" : "pace-bad"}">
-<div class="pace-head">${esc(annualDeltaWords(pace))}</div>
+<div class="pace-head">${reached ? `Goal Reached! ${esc(signedMoney(reached === "ACTUAL" ? pace.ytd.value - pace.goal : pace.annual.variance))} ${reached === "ACTUAL" ? "past the goal" : "projected past the goal"}` : esc(annualDeltaWords(pace))}</div>
 <div class="muted">${esc(label)} ${expense ? "budget" : "goal"} ${exactMoney(pace.goal)} · ${esc(fyLabel)} · projected year-end ${exactMoney(pace.annual.projected)}</div>
 <div style="margin-top:4px">${ytd}${need}</div>
 </div>`;

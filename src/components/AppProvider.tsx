@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { User } from "@supabase/supabase-js";
 import {
+  createWorkspace,
   deleteWorkspace,
   fetchProfile,
   getSupabase,
@@ -11,7 +12,7 @@ import {
   onAuthChange,
   setDefaultWorkspace,
 } from "@/lib/supabase";
-import type { UserProfile, WorkspaceMode, WorkspaceProfile } from "@/lib/schemas";
+import type { BusinessType, UserProfile, WorkspaceMode, WorkspaceProfile } from "@/lib/schemas";
 import { AuthDialog } from "@/components/AuthDialog";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 
@@ -37,8 +38,16 @@ interface AppState {
   setActiveWorkspaceId: (id: string | null) => void;
   refreshProfile: () => Promise<UserProfile | null>;
   refreshWorkspaces: () => Promise<WorkspaceProfile[]>;
-  /** Deletes a workspace (and, by cascade, its tracker and scenarios) and switches to another one if it was active. */
+  /** Deletes a workspace (and, by cascade, its tracker, documents, report and scenarios) and switches to another one if it was active. */
   removeWorkspace: (id: string) => Promise<void>;
+  /**
+   * Creates a workspace from a menu, makes it active and flags it as fresh so the dashboard opens it on a clean
+   * slate: inputs open on the statement upload, nothing carried over from the previous workspace.
+   */
+  createFreshWorkspace: (input: { name: string; businessType: BusinessType }) => Promise<WorkspaceProfile>;
+  /** Id of a workspace just created via `createFreshWorkspace` that the dashboard hasn't set up yet. */
+  freshWorkspaceId: string | null;
+  clearFreshWorkspace: () => void;
   openAuth: (mode?: "signin" | "signup") => void;
   uiHints: UiHints;
   setUiHints: (h: Partial<UiHints>) => void;
@@ -157,6 +166,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [refreshWorkspaces],
   );
 
+  const [freshWorkspaceId, setFreshWorkspaceId] = useState<string | null>(null);
+  const createFreshWorkspace = useCallback(
+    async (input: { name: string; businessType: BusinessType }) => {
+      const ws = await createWorkspace(input);
+      await refreshWorkspaces();
+      setFreshWorkspaceId(ws.id);
+      setActiveId(ws.id);
+      void setDefaultWorkspace(ws.id).catch(() => {});
+      return ws;
+    },
+    [refreshWorkspaces],
+  );
+  const clearFreshWorkspace = useCallback(() => setFreshWorkspaceId(null), []);
+
   const setUiHints = useCallback((h: Partial<UiHints>) => setUiHintsState((cur) => ({ ...cur, ...h })), []);
 
   const value = useMemo<AppState>(
@@ -171,11 +194,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       refreshProfile,
       refreshWorkspaces,
       removeWorkspace,
+      createFreshWorkspace,
+      freshWorkspaceId,
+      clearFreshWorkspace,
       openAuth: (mode = "signin") => setAuthMode(mode),
       uiHints,
       setUiHints,
     }),
-    [ready, user, profile, workspaces, activeId, setActiveWorkspaceId, refreshProfile, refreshWorkspaces, removeWorkspace, uiHints, setUiHints],
+    [ready, user, profile, workspaces, activeId, setActiveWorkspaceId, refreshProfile, refreshWorkspaces, removeWorkspace, createFreshWorkspace, freshWorkspaceId, clearFreshWorkspace, uiHints, setUiHints],
   );
 
   return (

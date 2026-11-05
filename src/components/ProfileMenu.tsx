@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
 import { Briefcase, Check, CreditCard, Home, Loader2, LogIn, LogOut, Plus, User as UserIcon } from "lucide-react";
-import { createWorkspace, signOut } from "@/lib/supabase";
+import { signOut } from "@/lib/supabase";
 import { BUSINESS_TYPES, BUSINESS_TYPE_LABELS, type BusinessType } from "@/lib/schemas";
 import { useApp } from "@/components/AppProvider";
 import { cn, glass, inputCls } from "@/components/ui";
@@ -31,6 +32,8 @@ export function ProfileMenu() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const router = useRouter();
+  const pathname = usePathname();
 
   useEffect(() => {
     if (!open) return;
@@ -49,11 +52,12 @@ export function ProfileMenu() {
     setBusy(true);
     setError(null);
     try {
-      const ws = await createWorkspace({ name, businessType: type });
-      await app.refreshWorkspaces();
-      app.setActiveWorkspaceId(ws.id);
+      // Fresh workspace: the dashboard opens it on a clean statement-upload / guided-input screen.
+      await app.createFreshWorkspace({ name, businessType: type });
       setCreating(false);
       setName("");
+      setOpen(false);
+      if (pathname !== "/dashboard") router.push("/dashboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Couldn't create workspace.");
     } finally {

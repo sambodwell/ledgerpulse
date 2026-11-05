@@ -2,7 +2,7 @@
 
 import { Component, useCallback, useEffect, useId, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { Area, AreaChart, CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Area, AreaChart, CartesianGrid, ComposedChart, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -14,6 +14,7 @@ import {
   ClipboardList,
   Download,
   FileText,
+  FolderOpen,
   Home,
   Info,
   Loader2,
@@ -66,6 +67,7 @@ import {
   type BusinessType,
   type CpiReading,
   type ExpenseLine,
+  type ExtractedLineItems,
   type ForecastSettings,
   type RevenueLine,
   type FinancialAnalysis,
@@ -74,10 +76,27 @@ import {
   type WorkspaceMode,
   type WorkspaceProfile,
 } from "@/lib/schemas";
-import { authHeaders, createWorkspace, saveFiscalTracker, updateWorkspace } from "@/lib/supabase";
+import {
+  authHeaders,
+  createWorkspace,
+  deleteDocument,
+  listDocuments,
+  loadWorkspaceReport,
+  saveDocuments,
+  saveFiscalTracker,
+  saveWorkspaceReport,
+  updateDocument,
+  updateWorkspace,
+  type NewWorkspaceDocument,
+  type WorkspaceDocument,
+} from "@/lib/supabase";
 import { exactMoney, normalizeTrackerState, statementTotals, withLoggedActual, type MonthActual } from "@/lib/fiscal";
+import { aggregateActuals, calibrateToActuals, resolveBasis, type ActualsAggregate, type ProjectionBasis } from "@/lib/projectionBasis";
+import { aggregateStatements, documentName, hashFile, type ParsedStatement } from "@/lib/batchStatements";
 import { isStatementPeriod, periodLabel, type StatementPeriod } from "@/lib/statementPeriod";
-import { StatementMonthPicker } from "@/components/dashboard/StatementMonth";
+import { StatementMonthPicker, statementMonthOptions } from "@/components/dashboard/StatementMonth";
+import { DocumentsHub } from "@/components/dashboard/DocumentsHub";
+import { AuditDeepDive } from "@/components/dashboard/AuditDeepDive";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
@@ -85,11 +104,11 @@ import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu } from "@/components/ProfileMenu";
 import { PlanCard } from "@/components/PlanCard";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
-import { CHART, COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml } from "@/components/dashboard/chartKit";
+import { CHART, COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml, signedUsd } from "@/components/dashboard/chartKit";
 import { ForecastControls } from "@/components/dashboard/ForecastControls";
 import { ScenarioPanel, scenarioExamples } from "@/components/dashboard/ScenarioPanel";
 import { FiscalYearTracker, ImplementedToggle, toggleImplemented, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
-import { GoalPaceBanner, GoalTracker, goalPaceBannerHtml, goalPaceReportHtml } from "@/components/dashboard/GoalTracker";
+import { DataCompletenessNote, GoalPaceBanner, GoalTracker, goalPaceBannerHtml, goalPaceReportHtml } from "@/components/dashboard/GoalTracker";
 import { clearLocalTracker, clearUnsyncedTracker, readLocalTracker, useFiscalTracker } from "@/components/dashboard/useFiscalTracker";
 import { InfoTip } from "@/components/InfoTip";
 import { FeedbackWidget } from "@/components/dashboard/FeedbackWidget";
@@ -97,7 +116,7 @@ import { MoneyInput } from "@/components/dashboard/MoneyInput";
 import { ExpenseShareCard } from "@/components/dashboard/ExpenseShare";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
 
-const PRIVACY_BADGE = "🔒 256-Bit Encrypted | Zero File Retention — Your financial data is parsed in memory and never stored.";
+const PRIVACY_BADGE = "🔒 256-Bit Encrypted | Zero File Retention — Statement files are parsed in memory and never stored; only the parsed results are saved to your private workspace.";
 const PENDING_UNLOCK_KEY = "lp:pendingUnlock";
 /** This tab's analysis results per workspace (sessionStorage; cleared on sign-out). */
 const resultsKey = (userId: string) => `lp:results:${userId}`;
@@ -171,8 +190,9 @@ export default function DashboardPage() {
     if (mustSignIn) router.replace(`/signup?next=${encodeURIComponent("/dashboard")}`);
   }, [mustSignIn, router]);
 
-  // Results live in this browser tab only (sessionStorage), per workspace, so switching workspaces or reloading
-  // the tab keeps each workspace's report. They are never sent to our database.
+  // Results per workspace. Saved workspaces persist their latest report to `workspace_reports` (so it survives
+  // reloads, deploys and other devices); this tab also keeps a sessionStorage copy, which is all a temporary
+  // ("guest") report ever gets.
   const [results, setResults] = useState<Record<string, AnalysisResponse>>({});
   const userId = app.user?.id ?? null;
   const resultsLoadedFor = useRef<string | null>(null);
@@ -195,6 +215,83 @@ export default function DashboardPage() {
     safeSession((s) => (Object.keys(results).length ? s.setItem(resultsKey(userId), JSON.stringify(results)) : s.removeItem(resultsKey(userId))));
   }, [results, userId]);
   const current = results[wsKey] ?? null;
+
+  // Load each saved workspace's report from the database once (a report already in this tab wins).
+  const activeWsId = app.activeWorkspace?.id ?? null;
+  const reportFetched = useRef<Set<string>>(new Set());
+  /** Last report written to / read from the database, per workspace, so unchanged reports aren't re-saved. */
+  const reportSynced = useRef<Record<string, AnalysisResponse>>({});
+  const [reportLoading, setReportLoading] = useState<string | null>(null);
+  useEffect(() => {
+    if (!userId || !activeWsId || reportFetched.current.has(activeWsId)) return;
+    const id = activeWsId;
+    reportFetched.current.add(id);
+    setReportLoading(id);
+    loadWorkspaceReport(id)
+      .then((r) => {
+        if (!r) return;
+        reportSynced.current[id] = r;
+        setResults((cur) => (cur[id] ? cur : { ...cur, [id]: r }));
+      })
+      .catch((e) => {
+        reportFetched.current.delete(id);
+        console.warn("[report] load failed", e);
+      })
+      .finally(() => setReportLoading((cur) => (cur === id ? null : cur)));
+  }, [userId, activeWsId]);
+  // Persist changed reports (new analysis, unlock, line-item edits), debounced.
+  useEffect(() => {
+    if (!userId) return;
+    const dirty = Object.entries(results).filter(([k, v]) => k !== "guest" && reportSynced.current[k] !== v && reportFetched.current.has(k));
+    if (!dirty.length) return;
+    const t = setTimeout(() => {
+      for (const [k, v] of dirty) {
+        reportSynced.current[k] = v;
+        saveWorkspaceReport(k, v).catch((e) => {
+          delete reportSynced.current[k];
+          console.warn("[report] save failed", e);
+        });
+      }
+    }, 800);
+    return () => clearTimeout(t);
+    // reportLoading: re-check once a workspace's initial load finishes (a report made meanwhile is saved then).
+  }, [results, userId, reportLoading]);
+
+  // Documents analyzed into each saved workspace ("My Documents").
+  const [docsByWs, setDocsByWs] = useState<Record<string, WorkspaceDocument[]>>({});
+  const [docsState, setDocsState] = useState<{ loading: string | null; error: string | null }>({ loading: null, error: null });
+  const docsFetched = useRef<Set<string>>(new Set());
+  const loadDocs = useCallback(async (id: string) => {
+    docsFetched.current.add(id);
+    setDocsState({ loading: id, error: null });
+    try {
+      const list = await listDocuments(id);
+      setDocsByWs((cur) => ({ ...cur, [id]: list }));
+      setDocsState((s) => (s.loading === id ? { loading: null, error: null } : s));
+    } catch (e) {
+      docsFetched.current.delete(id);
+      setDocsState({ loading: null, error: e instanceof Error ? `Couldn't load documents: ${e.message}` : "Couldn't load documents." });
+    }
+  }, []);
+  useEffect(() => {
+    if (userId && activeWsId && !docsFetched.current.has(activeWsId)) void loadDocs(activeWsId);
+  }, [userId, activeWsId, loadDocs]);
+  const workspaceDocs = activeWsId ? docsByWs[activeWsId] ?? [] : [];
+  const [docsOpen, setDocsOpen] = useState(false);
+
+  /**
+   * Bumped whenever the statement uploader must start clean: a brand-new workspace, or switching to another
+   * workspace from a menu. (Not when the "which workspace?" picker switches mid-review — that keeps the parsed lines.)
+   */
+  const [uploaderEpoch, setUploaderEpoch] = useState(0);
+  const pickerSwitching = useRef(false);
+  const prevWsId = useRef(activeWsId);
+  useEffect(() => {
+    if (prevWsId.current === activeWsId) return;
+    prevWsId.current = activeWsId;
+    if (pickerSwitching.current) pickerSwitching.current = false;
+    else setUploaderEpoch((n) => n + 1);
+  }, [activeWsId]);
 
   const [tab, setTab] = useState<InputTab>("form");
   /** Results command-center tab. */
@@ -319,7 +416,7 @@ export default function DashboardPage() {
 
   /** Runs the analysis and stores the result under `targetKey` (the workspace chosen in the picker). */
   const runAnalysis = useCallback(
-    async (init: RequestInit, targetKey: string): Promise<boolean> => {
+    async (init: RequestInit, targetKey: string): Promise<AnalysisResponse | null> => {
       setLoading(true);
       setError(null);
       setPaywallMsg(null);
@@ -333,10 +430,10 @@ export default function DashboardPage() {
         setResultsTab("overview");
         setInputsOverride(null);
         requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-        return true;
+        return data;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Something went wrong.");
-        return false;
+        return null;
       } finally {
         setLoading(false);
       }
@@ -348,30 +445,67 @@ export default function DashboardPage() {
    * Every new analysis first asks which project / business it belongs to (current workspace preselected), so
    * different businesses or jobs never get mixed in one workspace.
    */
-  const [picker, setPicker] = useState<{ init: RequestInit; businessType: BusinessType; resolve: (ok: boolean) => void } | null>(null);
+  const [picker, setPicker] = useState<{ init: RequestInit; businessType: BusinessType; extras: AnalysisExtras; resolve: (ok: boolean) => void } | null>(null);
   const requestAnalysis = useCallback(
-    (init: RequestInit, businessType: BusinessType) => new Promise<boolean>((resolve) => setPicker({ init, businessType, resolve })),
+    (init: RequestInit, businessType: BusinessType, extras: AnalysisExtras = {}) => new Promise<boolean>((resolve) => setPicker({ init, businessType, extras, resolve })),
     [],
   );
   /** New workspace from the picker: the baseline is seeded from its first analysis. */
   const seedBaselineFor = useRef<string | null>(null);
-  const confirmTarget = async (target: { kind: "existing"; id: string } | { kind: "new"; workspace: WorkspaceProfile } | { kind: "temporary" }) => {
+  /** Months to log once the target workspace's tracker has loaded (the picker may switch workspaces first). */
+  const pendingLog = useRef<{ ws: string | null; entries: { key: string; actual: MonthActual }[] } | null>(null);
+  const [pendingLogTick, setPendingLogTick] = useState(0);
+  const [logNotice, setLogNotice] = useState<string | null>(null);
+  const confirmTarget = async (target: AnalysisTarget) => {
     if (!picker) return;
-    const { init, resolve } = picker;
+    const { init, resolve, extras } = picker;
     setPicker(null);
     let key = "guest";
     if (target.kind === "new") {
       await app.refreshWorkspaces();
+      pickerSwitching.current = true;
       app.setActiveWorkspaceId(target.workspace.id);
       seedBaselineFor.current = target.workspace.id;
       key = target.workspace.id;
+      // Brand-new workspace: it has no report yet, so nothing needs loading (and nothing is inherited).
+      reportFetched.current.add(key);
+      docsFetched.current.add(key);
+      setDocsByWs((cur) => ({ ...cur, [key]: [] }));
     } else if (target.kind === "existing") {
-      if (target.id !== ws?.id) app.setActiveWorkspaceId(target.id);
+      if (target.id !== ws?.id) {
+        pickerSwitching.current = true;
+        app.setActiveWorkspaceId(target.id);
+      }
       key = target.id;
     } else if (ws) {
+      pickerSwitching.current = true;
       app.setActiveWorkspaceId(null);
     }
-    resolve(await runAnalysis(init, key));
+    const report = await runAnalysis(init, key);
+    const ok = !!report;
+    if (report) {
+      if (extras.log?.length) {
+        pendingLog.current = { ws: key === "guest" ? null : key, entries: extras.log };
+        setPendingLogTick((n) => n + 1);
+      }
+      const docs: NewWorkspaceDocument[] = extras.docs ?? [];
+      if (extras.docFromAnalysis) {
+        const items: ExtractedLineItems = { businessType: report.analysis.businessType, revenue: report.analysis.itemizedRevenue, expenses: report.analysis.itemizedExpenses };
+        docs.push({ ...extras.docFromAnalysis, period: null, items, totals: statementTotals({ revenue: items.revenue, expenses: items.expenses }) });
+      }
+      if (docs.length && key !== "guest") {
+        const wsId = key;
+        saveDocuments(wsId, docs)
+          .then((saved) =>
+            setDocsByWs((cur) => {
+              const ids = new Set(saved.map((d) => d.id));
+              return { ...cur, [wsId]: [...saved, ...(cur[wsId] ?? []).filter((d) => !ids.has(d.id))] };
+            }),
+          )
+          .catch((e) => setDocsState({ loading: null, error: e instanceof Error ? `Couldn't save documents: ${e.message}` : "Couldn't save documents." }));
+      }
+    }
+    resolve(ok);
   };
 
   // Seed a brand-new workspace's tracker baseline from its first analysis (only while the plan is still empty).
@@ -383,6 +517,40 @@ export default function DashboardPage() {
     if (tracker.state.baseline.revenue !== 0 || tracker.state.baseline.expenses !== 0) return;
     updateTracker((s) => ({ ...s, businessType: a.businessType, baseline: { revenue: a.monthlyRevenue, expenses: splitTotals(a.itemizedExpenses).recurring } }));
   }, [current, ws, tracker.status, tracker.loadFailed, tracker.state.baseline, updateTracker]);
+
+  // Apply months queued by a statement upload once the target workspace's tracker is ready.
+  useEffect(() => {
+    const p = pendingLog.current;
+    if (!p || tracker.workspaceId !== p.ws || tracker.status === "loading" || tracker.loadFailed) return;
+    pendingLog.current = null;
+    updateTracker((s) => p.entries.reduce((acc, e) => withLoggedActual(acc, e.key, e.actual), s));
+    const names = p.entries.map((e) => periodLabel(e.key));
+    setLogNotice(`Logged ${names.length === 1 ? names[0] : `${names.length} months (${names.join(", ")})`} into the Fiscal Year Tracker. Goal pace and projections now use ${names.length === 1 ? "it" : "them"}.`);
+  }, [pendingLogTick, tracker.workspaceId, tracker.status, tracker.loadFailed, updateTracker]);
+
+  // A workspace just created from a menu opens on a clean slate: inputs open on the statement upload, the uploader
+  // reset, nothing carried over from the previous workspace.
+  const { freshWorkspaceId, clearFreshWorkspace } = app;
+  useEffect(() => {
+    if (!freshWorkspaceId || freshWorkspaceId !== activeWsId) return;
+    clearFreshWorkspace();
+    reportFetched.current.add(freshWorkspaceId);
+    docsFetched.current.add(freshWorkspaceId);
+    setDocsByWs((cur) => ({ ...cur, [freshWorkspaceId]: [] }));
+    setResults((r) => {
+      if (!r[freshWorkspaceId]) return r;
+      const { [freshWorkspaceId]: _drop, ...rest } = r;
+      void _drop;
+      return rest;
+    });
+    setUploaderEpoch((n) => n + 1);
+    setTab("upload");
+    setInputsOverride(true);
+    setResultsTab("overview");
+    setError(null);
+    setLogNotice(null);
+    requestAnimationFrame(() => document.getElementById("analysis-inputs")?.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" }));
+  }, [freshWorkspaceId, activeWsId, clearFreshWorkspace]);
 
   /** Logs a reviewed statement's totals into the Fiscal Year Tracker month; returns a confirmation line. */
   const logStatementMonth = (key: string, actual: MonthActual) => {
@@ -521,7 +689,21 @@ export default function DashboardPage() {
   const rawAnalysis = current?.analysis ?? null;
   // Full reports re-project client-side so line-item edits and the chosen horizon/start month apply immediately.
   // Teasers stay redacted (no projection) exactly as the server sent them.
-  const analysis = useMemo(() => (rawAnalysis && !teaser ? withProjection(rawAnalysis, forecast, inflationRate) : rawAnalysis), [rawAnalysis, teaser, forecast, inflationRate]);
+  // Projection basis: with two or more logged months (AUTO), the projection follows the average of every logged actual
+  // instead of the single report it was generated from. Remembered per workspace for this tab.
+  const [basisByWs, setBasisByWs] = useState<Record<string, ProjectionBasis>>({});
+  const basisChoice = basisByWs[wsKey] ?? "AUTO";
+  const setBasisChoice = (b: ProjectionBasis) => setBasisByWs((cur) => ({ ...cur, [wsKey]: b }));
+  const actualsAgg = useMemo(() => (tracker.status === "loading" || tracker.loadFailed ? null : aggregateActuals(tracker.state.actuals)), [tracker.state.actuals, tracker.status, tracker.loadFailed]);
+  const basis = resolveBasis(basisChoice, actualsAgg);
+  /** The line items the projection and scenarios run on (scaled to the actuals average when that basis is active). */
+  const projectionSource = useMemo(() => (rawAnalysis && !teaser && basis === "ACTUALS" && actualsAgg ? calibrateToActuals(rawAnalysis, actualsAgg) : rawAnalysis), [rawAnalysis, teaser, basis, actualsAgg]);
+  const analysis = useMemo(() => {
+    if (!rawAnalysis || teaser || !projectionSource) return rawAnalysis;
+    // Report figures (KPIs, line items) stay as entered; only the projection switches basis.
+    return { ...withProjection(rawAnalysis, forecast, inflationRate), macroProjections: withProjection(projectionSource, forecast, inflationRate).macroProjections };
+  }, [rawAnalysis, teaser, projectionSource, forecast, inflationRate]);
+  const scenarioAnalysis = useMemo(() => (projectionSource && analysis ? { ...projectionSource, inflationRateAssumed: analysis.inflationRateAssumed } : analysis), [projectionSource, analysis]);
   const updateLineItems = useCallback(
     (revenue: RevenueLine[], expenses: ExpenseLine[]) =>
       setResults((r) => {
@@ -575,7 +757,14 @@ export default function DashboardPage() {
                   Workspace: <span className="font-medium text-slate-100">{ws.name}</span>
                   <span className="text-slate-500">· {BUSINESS_TYPE_LABELS[ws.businessType]}</span>
                   <WorkspaceMenu
+                    // Keyed by id: the menu's name field must never show the previous workspace's name.
+                    key={ws.id}
                     workspace={ws}
+                    docCount={docsByWs[ws.id]?.length ?? null}
+                    onOpenDocuments={() => {
+                      setDocsOpen(true);
+                      if (!docsFetched.current.has(ws.id)) void loadDocs(ws.id);
+                    }}
                     onRename={async (name) => {
                       await updateWorkspace(ws.id, { name });
                       await app.refreshWorkspaces();
@@ -585,6 +774,14 @@ export default function DashboardPage() {
                       await app.removeWorkspace(id);
                       // Drop everything this device kept for the deleted workspace.
                       clearUnsyncedTracker(app.user!.id, id);
+                      delete reportSynced.current[id];
+                      reportFetched.current.delete(id);
+                      docsFetched.current.delete(id);
+                      setDocsByWs((d) => {
+                        const { [id]: _gone, ...rest } = d;
+                        void _gone;
+                        return rest;
+                      });
                       setResults((r) => {
                         const { [id]: _gone, ...rest } = r;
                         void _gone;
@@ -709,13 +906,15 @@ export default function DashboardPage() {
             <div className={cn("min-w-0", tab !== "upload" && "hidden lg:block")}>
               <PanelBoundary title="Statement upload">
                 {/* Not keyed by workspace: picking a workspace for the report must not throw away the parsed lines under review. */}
+                {/* Reset (via uploaderEpoch) for a brand-new workspace or a menu switch, so no parsed numbers carry over. */}
                 <StatementUploader
-                  key={mode}
+                  key={`${mode}-${uploaderEpoch}`}
                   mode={mode}
                   disabled={loading}
-                  onSubmit={(init, bt) => requestAnalysis(init, bt ?? formDefaultType)}
+                  onSubmit={(init, bt, extras) => requestAnalysis(init, bt ?? formDefaultType, extras)}
                   trackerReady={tracker.status !== "loading" && !tracker.loadFailed}
                   onLogActuals={logStatementMonth}
+                  existingDocs={workspaceDocs}
                 />
               </PanelBoundary>
             </div>
@@ -726,6 +925,20 @@ export default function DashboardPage() {
           <div className={cn(glass, "mt-6 flex items-center gap-3 p-5 text-slate-300")} role="status">
             <Loader2 className="h-5 w-5 animate-spin text-indigo-300" />
             Analyzing in memory — large statements can take a minute.
+          </div>
+        )}
+        {!current && reportLoading === activeWsId && activeWsId && (
+          <div className={cn(glass, "mt-6 flex items-center gap-3 p-5 text-sm text-slate-300")} role="status">
+            <Loader2 className="h-4 w-4 animate-spin text-indigo-300" /> Loading this workspace&apos;s saved report…
+          </div>
+        )}
+        {logNotice && (
+          <div className="mt-6 flex items-start gap-3 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100" role="status">
+            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />
+            <span className="flex-1">{logNotice}</span>
+            <button onClick={() => setLogNotice(null)} aria-label="Dismiss" className="text-slate-400 hover:text-white">
+              <X className="h-4 w-4" />
+            </button>
           </div>
         )}
         {error && (
@@ -815,12 +1028,23 @@ export default function DashboardPage() {
                 {teaser ? (
                   <LockedSection title="Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
                 ) : (
-                  <ProjectionCharts analysis={analysis} settings={forecast} onSettingsChange={setForecast} cpi={cpi} inflationLabel={inflationLabel} actuals={tracker.state.actuals} />
+                  <ProjectionCharts
+                    analysis={analysis}
+                    settings={forecast}
+                    onSettingsChange={setForecast}
+                    cpi={cpi}
+                    inflationLabel={inflationLabel}
+                    actuals={tracker.state.actuals}
+                    basis={basis}
+                    basisChoice={basisChoice}
+                    onBasisChange={setBasisChoice}
+                    actualsAgg={actualsAgg}
+                  />
                 )}
               </PanelBoundary>
               <PanelBoundary title="Scenario forecasting">
-                {isPro && !teaser ? (
-                  <ScenarioPanel analysis={analysis} workspaceId={ws?.id ?? null} settings={forecast} onSettingsChange={setForecast} />
+                {isPro && !teaser && scenarioAnalysis ? (
+                  <ScenarioPanel analysis={scenarioAnalysis} workspaceId={ws?.id ?? null} settings={forecast} onSettingsChange={setForecast} />
                 ) : (
                   <LockedSection title="Interactive Scenario Forecasting" paywall={paywall} proOnly placeholder={<FakeScenarioChat mode={mode} />} />
                 )}
@@ -861,6 +1085,33 @@ export default function DashboardPage() {
         )}
       </main>
 
+      {docsOpen && ws && (
+        <DocumentsHub
+          workspaceName={ws.name}
+          docs={workspaceDocs}
+          loading={docsState.loading === ws.id}
+          error={docsState.error}
+          onClose={() => setDocsOpen(false)}
+          onRename={async (id, name) => {
+            await updateDocument(id, { name });
+            setDocsByWs((cur) => ({ ...cur, [ws.id]: (cur[ws.id] ?? []).map((d) => (d.id === id ? { ...d, name: name.trim().slice(0, 160) } : d)) }));
+          }}
+          onSetMonth={async (id, period) => {
+            await updateDocument(id, { period });
+            setDocsByWs((cur) => ({ ...cur, [ws.id]: (cur[ws.id] ?? []).map((d) => (d.id === id ? { ...d, period } : d)) }));
+          }}
+          onDelete={async (id) => {
+            await deleteDocument(id);
+            setDocsByWs((cur) => ({ ...cur, [ws.id]: (cur[ws.id] ?? []).filter((d) => d.id !== id) }));
+          }}
+          onLogToTracker={
+            tracker.status === "loading" || tracker.loadFailed
+              ? undefined
+              : (d) => (d.period ? logStatementMonth(d.period, { revenue: d.totals.revenue, expenses: d.totals.expenses, ...(d.totals.oneTimeExpenses ? { oneTimeExpenses: d.totals.oneTimeExpenses } : {}) }) : null)
+          }
+        />
+      )}
+
       {picker && (
         <AnalysisTargetDialog
           userId={app.user.id}
@@ -894,6 +1145,14 @@ function suggestWorkspaceName(bt: BusinessType, existing: WorkspaceProfile[]) {
 
 type AnalysisTarget = { kind: "existing"; id: string } | { kind: "new"; workspace: WorkspaceProfile } | { kind: "temporary" };
 
+/** What a statement upload hands over with its analysis: documents to keep in the workspace and months to log. */
+interface AnalysisExtras {
+  docs?: NewWorkspaceDocument[];
+  /** "Skip review": the document is saved with the lines the analysis read from it. */
+  docFromAnalysis?: Pick<NewWorkspaceDocument, "name" | "fileName" | "fileSize" | "contentHash" | "kind">;
+  log?: { key: string; actual: MonthActual }[];
+}
+
 function AnalysisTargetDialog({
   userId,
   workspaces,
@@ -914,6 +1173,14 @@ function AnalysisTargetDialog({
   const [choice, setChoice] = useState<string>(activeId ?? "new");
   const [name, setName] = useState(() => suggestWorkspaceName(businessType, workspaces));
   const [busy, setBusy] = useState(false);
+  // Device-only tracker data (logged before any workspace existed). New workspaces start clean unless the owner opts in.
+  const [localTracker] = useState(() => {
+    const raw = readLocalTracker(userId);
+    const s = raw ? normalizeTrackerState(raw, businessType) : null;
+    const months = s ? Object.keys(s.actuals).length : 0;
+    return s && (months > 0 || s.targets.net != null || s.targets.revenue != null || s.baseline.revenue > 0) ? { raw, months } : null;
+  });
+  const [carryLocal, setCarryLocal] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const titleId = useId();
   const nameRef = useRef<HTMLInputElement>(null);
@@ -937,11 +1204,10 @@ function AnalysisTargetDialog({
     setBusy(true);
     try {
       const created = await createWorkspace({ name, businessType });
-      // Carry over anything logged on this device before a workspace existed.
-      const local = readLocalTracker(userId);
-      if (local) {
+      // Only when explicitly chosen: link the goals / actuals kept on this device into the new workspace.
+      if (carryLocal && localTracker) {
         try {
-          await saveFiscalTracker(created.id, normalizeTrackerState(local, businessType));
+          await saveFiscalTracker(created.id, normalizeTrackerState(localTracker.raw, businessType));
           clearLocalTracker(userId);
         } catch (err) {
           console.warn("[workspace] tracker copy failed", err);
@@ -1010,7 +1276,15 @@ function AnalysisTargetDialog({
                     className={cn(inputCls, "mt-2")}
                     autoFocus
                   />
-                  <span className="mt-1 block text-xs text-slate-500">Type: {BUSINESS_TYPE_LABELS[businessType]}. Change it any time in workspace settings.</span>
+                  <span className="mt-1 block text-xs text-slate-500">Type: {BUSINESS_TYPE_LABELS[businessType]}. Starts clean — no numbers from other workspaces.</span>
+                  {localTracker && (
+                    <label className="mt-2 flex items-start gap-2 text-xs text-slate-300">
+                      <input type="checkbox" className="mt-0.5 h-3.5 w-3.5 accent-indigo-400" checked={carryLocal} onChange={(e) => setCarryLocal(e.target.checked)} />
+                      <span>
+                        Also bring in the goals{localTracker.months ? ` and ${localTracker.months} logged month${localTracker.months === 1 ? "" : "s"}` : ""} saved on this device without a workspace
+                      </span>
+                    </label>
+                  )}
                 </>
               )}
             </>,
@@ -1038,7 +1312,7 @@ function AnalysisTargetDialog({
             {choice === "new" ? "Create & analyze" : "Analyze"}
           </button>
         </div>
-        <p className="mt-3 text-xs text-slate-500">Uploaded statement files are never stored — only the monthly totals and goals you track.</p>
+        <p className="mt-3 text-xs text-slate-500">Statement files are never stored. A saved workspace keeps the parsed results (documents, report, monthly totals and goals) so nothing disappears on reload.</p>
       </form>
     </div>
   );
@@ -1048,20 +1322,40 @@ function AnalysisTargetDialog({
 // Workspace settings (rename / delete) next to the workspace name
 // ---------------------------------------------------------------------------
 
-function WorkspaceMenu({ workspace, onRename, onDelete }: { workspace: WorkspaceProfile; onRename: (name: string) => Promise<void>; onDelete: () => Promise<void> }) {
+function WorkspaceMenu({
+  workspace,
+  docCount,
+  onOpenDocuments,
+  onRename,
+  onDelete,
+}: {
+  workspace: WorkspaceProfile;
+  docCount: number | null;
+  onOpenDocuments: () => void;
+  onRename: (name: string) => Promise<void>;
+  onDelete: () => Promise<void>;
+}) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState(workspace.name);
   const [confirming, setConfirming] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
   const [busy, setBusy] = useState<"rename" | "delete" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const titleId = useId();
+  const confirmOk = confirmText.trim().toLowerCase() === workspace.name.trim().toLowerCase();
 
   const reset = () => {
     setOpen(false);
     setConfirming(false);
+    setConfirmText("");
     setError(null);
     setName(workspace.name);
+  };
+  // Always open on the current name (a rename elsewhere, e.g. in Settings, must show here too).
+  const openMenu = () => {
+    setName(workspace.name);
+    setOpen(true);
   };
   useEffect(() => {
     if (!open) return;
@@ -1093,7 +1387,7 @@ function WorkspaceMenu({ workspace, onRename, onDelete }: { workspace: Workspace
     <div ref={ref} className="relative">
       <button
         type="button"
-        onClick={() => (open ? reset() : setOpen(true))}
+        onClick={() => (open ? reset() : openMenu())}
         aria-expanded={open}
         aria-haspopup="dialog"
         className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-xs text-slate-300 hover:bg-white/5 hover:text-white"
@@ -1118,27 +1412,57 @@ function WorkspaceMenu({ workspace, onRename, onDelete }: { workspace: Workspace
             </button>
           </form>
 
+          <button
+            type="button"
+            onClick={() => {
+              reset();
+              onOpenDocuments();
+            }}
+            className="mt-3 flex w-full items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
+          >
+            <FolderOpen className="h-4 w-4 text-indigo-300" />
+            <span className="flex-1">My Documents</span>
+            {docCount != null && <span className="rounded-full bg-white/10 px-2 py-0.5 text-[11px] tabular-nums text-slate-300">{docCount}</span>}
+          </button>
+
           <div className="mt-4 border-t border-white/10 pt-3">
             {confirming ? (
-              <div className="rounded-lg border border-rose-300/30 bg-rose-500/10 p-3">
-                <p className="text-sm text-rose-100">
-                  Permanently delete <strong>{workspace.name}</strong>?
+              <form
+                className="rounded-lg border border-rose-300/30 bg-rose-500/10 p-3"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (confirmOk && !busy) void run("delete", onDelete);
+                }}
+              >
+                <p className="text-sm font-medium text-rose-100">Are you sure? This cannot be undone.</p>
+                <p className="mt-1 text-xs text-rose-200/80">
+                  Deleting <strong>{workspace.name}</strong> permanently removes its documents, report, Fiscal Year Tracker (monthly actuals, goals, savings) and saved scenarios.
                 </p>
-                <p className="mt-1 text-xs text-rose-200/80">Its Fiscal Year Tracker (monthly actuals, goals, savings) and saved scenarios are deleted too. This can&apos;t be undone.</p>
+                <label className="mt-2 block text-xs text-rose-100">
+                  Type <strong className="select-all">{workspace.name}</strong> to confirm
+                  <input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} autoFocus aria-label="Type the workspace name to confirm" className={cn(inputCls, "mt-1 py-1.5")} />
+                </label>
                 <div className="mt-3 flex justify-end gap-2">
-                  <button type="button" onClick={() => setConfirming(false)} disabled={!!busy} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirming(false);
+                      setConfirmText("");
+                    }}
+                    disabled={!!busy}
+                    className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}
+                  >
                     Cancel
                   </button>
                   <button
-                    type="button"
-                    onClick={() => void run("delete", onDelete)}
-                    disabled={!!busy}
+                    type="submit"
+                    disabled={!!busy || !confirmOk}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-400 disabled:opacity-50"
                   >
                     {busy === "delete" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} Delete workspace
                   </button>
                 </div>
-              </div>
+              </form>
             ) : (
               <button type="button" onClick={() => setConfirming(true)} className="inline-flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200">
                 <Trash2 className="h-3.5 w-3.5" /> Delete workspace…
@@ -2066,28 +2390,33 @@ function ReviewRow({ label, value }: { label: string; value: string }) {
 // ---------------------------------------------------------------------------
 
 const ACCEPT = ".pdf,.txt,.csv,application/pdf,text/plain,text/csv";
+const MAX_BATCH_FILES = 12;
+
+/** An earlier document from this workspace covering a month in the current upload (e.g. last week's card statement). */
+type EarlierStatement = ParsedStatement & { include: boolean; savedAt: string };
 
 interface UploadReviewState {
   businessType: BusinessType;
   revenue: FormRevenue[];
   expenses: FormExpense[];
-  /** Month detected from the statement (null = not found). */
-  period: StatementPeriod | null;
-  /** Month the totals will be logged against ("" = not chosen yet). */
-  month: string;
-  /** Log the reviewed totals into the Fiscal Year Tracker when the report is generated. */
+  /** Statements read in this upload (one or many). */
+  statements: ParsedStatement[];
+  /** Saved documents for the same months, folded into those months' totals when included. */
+  earlier: EarlierStatement[];
+  months: { key: string; actual: MonthActual; statementIds: string[] }[];
+  duplicateLines: number;
+  excludedOneTime: number;
+  /** Log each month's totals into the Fiscal Year Tracker when the report is generated. */
   logToTracker: boolean;
-  /** Month already logged from this review (prevents double logging). */
-  loggedMonth: string | null;
+  /** Months already logged from this review via "Log now" (prevents double logging). */
+  loggedKeys: string[];
+  /** The line items were rebuilt after a month / document change (edits were reset). */
+  rebuilt: boolean;
 }
 
-/** Parsed statement lines → editable form rows. Amounts are shown with cents; margins as percents. */
-function toReviewState(items: { businessType: BusinessType; revenue: RevenueLine[]; expenses: ExpenseLine[] }, mode: WorkspaceMode, period: StatementPeriod | null): UploadReviewState {
-  const personal = mode === "PERSONAL";
-  // A business workspace always gets a business analysis, even if the statement looked personal.
-  const businessType: BusinessType = personal ? "PERSONAL_FAMILY" : items.businessType === "PERSONAL_FAMILY" ? "OTHER_CUSTOM" : items.businessType;
+/** Parsed lines → editable form rows. Amounts are shown with cents; margins as percents. */
+function itemsToRows(items: { revenue: RevenueLine[]; expenses: ExpenseLine[] }, personal: boolean) {
   return {
-    businessType,
     revenue: items.revenue.map((r) => ({
       ...blankRevenue(r.label),
       amount: r.amount.toFixed(2),
@@ -2095,18 +2424,96 @@ function toReviewState(items: { businessType: BusinessType; revenue: RevenueLine
       oneTime: r.oneTime === true,
     })),
     expenses: items.expenses.map((e) => ({ ...blankExpense(e.category), label: e.label, amount: e.amount.toFixed(2), oneTime: e.oneTime === true })),
-    period,
-    month: period?.key ?? "",
-    logToTracker: !!period,
-    loggedMonth: null,
   };
 }
 
-/** The reviewed rows → that month's actual totals (exact to the cent). */
-function reviewTotals(review: UploadReviewState): MonthActual {
+/** A business workspace always gets a business analysis, even if the statement looked personal. */
+const typeForMode = (bt: BusinessType, mode: WorkspaceMode): BusinessType => (mode === "PERSONAL" ? "PERSONAL_FAMILY" : bt === "PERSONAL_FAMILY" ? "OTHER_CUSTOM" : bt);
+
+/** Saved workspace documents for the months these statements cover (excluding the same files). */
+function earlierFor(statements: ParsedStatement[], docs: WorkspaceDocument[], prev: EarlierStatement[] = []): EarlierStatement[] {
+  const months = new Set(statements.map((s) => s.month).filter(Boolean));
+  const hashes = new Set(statements.map((s) => s.contentHash).filter(Boolean));
+  return docs
+    .filter((d) => d.period && months.has(d.period) && d.items && !(d.contentHash && hashes.has(d.contentHash)))
+    .map((d) => ({
+      id: `doc-${d.id}`,
+      name: d.name,
+      fileName: d.fileName,
+      fileSize: d.fileSize,
+      contentHash: d.contentHash,
+      kind: d.kind === "pasted" ? "pasted" : "statement",
+      items: d.items!,
+      detected: d.period!,
+      month: d.period!,
+      savedAt: d.createdAt,
+      include: prev.find((p) => p.id === `doc-${d.id}`)?.include ?? true,
+    }));
+}
+
+/** (Re)builds the review from the statements: per-month totals and, for several months, averaged line items. */
+function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[], mode: WorkspaceMode, prev?: UploadReviewState): UploadReviewState {
+  const personal = mode === "PERSONAL";
+  const included = [...statements, ...earlier.filter((e) => e.include)];
+  const agg = aggregateStatements(included, statements[0]?.items.businessType ?? "OTHER_CUSTOM");
+  const rows = itemsToRows(agg, personal);
+  return {
+    businessType: prev?.businessType ?? typeForMode(agg.businessType, mode),
+    revenue: rows.revenue,
+    expenses: rows.expenses,
+    statements,
+    earlier,
+    months: agg.months,
+    duplicateLines: agg.duplicateLines,
+    excludedOneTime: agg.excludedOneTime,
+    logToTracker: prev?.logToTracker ?? agg.months.some((m) => m.key),
+    loggedKeys: prev?.loggedKeys ?? [],
+    rebuilt: !!prev,
+  };
+}
+
+/** The reviewed rows → one month's actual totals (exact to the cent). */
+function reviewTotals(review: Pick<UploadReviewState, "revenue" | "expenses">): MonthActual {
   return statementTotals({
     revenue: validRevenueRows(review.revenue).map((r) => ({ amount: Number(r.amount) })),
     expenses: validExpenseRows(effectiveExpenses(review.expenses, review.revenue)).map((e) => ({ amount: Number(e.amount), oneTime: e.oneTime })),
+  });
+}
+
+/**
+ * What each month logs. A single month uses the reviewed (edited) rows; several months use each month's parsed
+ * lines, since the rows on screen are the averaged baseline.
+ */
+function monthActuals(review: UploadReviewState): { key: string; actual: MonthActual }[] {
+  const keyed = review.months.filter((m) => m.key);
+  if (review.months.length === 1 && keyed.length === 1) return [{ key: keyed[0].key, actual: reviewTotals(review) }];
+  return keyed.map((m) => ({ key: m.key, actual: m.actual }));
+}
+
+/** Rows → line items (for saving a single reviewed statement as edited). */
+function rowsToItems(review: UploadReviewState, personal: boolean): ExtractedLineItems {
+  const lines = toPayloadLines(review.revenue, review.expenses, personal);
+  return {
+    businessType: review.businessType,
+    revenue: lines.revenue.map((r) => ({ ...r, margin: personal ? 1 : r.margin ?? 0.5 })),
+    expenses: lines.expenses.map((e) => ({ ...e, category: e.category === "Uncategorized" ? "Other" : e.category })) as ExpenseLine[],
+  };
+}
+
+function docsToSave(review: UploadReviewState, personal: boolean): NewWorkspaceDocument[] {
+  const single = review.statements.length === 1 && !review.earlier.some((e) => e.include);
+  return review.statements.map((s) => {
+    const items = single ? rowsToItems(review, personal) : s.items;
+    return {
+      name: s.name,
+      fileName: s.fileName,
+      fileSize: s.fileSize,
+      contentHash: s.contentHash,
+      kind: s.kind,
+      period: s.month || null,
+      items,
+      totals: statementTotals({ revenue: items.revenue, expenses: items.expenses }),
+    };
   });
 }
 
@@ -2116,32 +2523,52 @@ function StatementUploader({
   onSubmit,
   trackerReady,
   onLogActuals,
+  existingDocs,
 }: {
   mode: WorkspaceMode;
   disabled: boolean;
-  onSubmit: (init: RequestInit, businessType?: BusinessType) => Promise<boolean>;
+  onSubmit: (init: RequestInit, businessType: BusinessType | undefined, extras: AnalysisExtras) => Promise<boolean>;
   trackerReady: boolean;
   onLogActuals: (key: string, actual: MonthActual) => string;
+  /** Documents already saved in this workspace (duplicate detection + same-month totals). */
+  existingDocs: WorkspaceDocument[];
 }) {
   const personal = mode === "PERSONAL";
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [pasted, setPasted] = useState("");
   const [input, setInput] = useState<"file" | "paste">("file");
   const [businessType, setBusinessType] = useState<BusinessType | "">(personal ? "PERSONAL_FAMILY" : "");
   const [dragOver, setDragOver] = useState(false);
   const [extracting, setExtracting] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number; name: string } | null>(null);
   const [extractError, setExtractError] = useState<string | null>(null);
+  const [batchNotes, setBatchNotes] = useState<string[]>([]);
   const [review, setReview] = useState<UploadReviewState | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const ready = input === "file" ? !!file : pasted.trim().length > 0;
+  const ready = input === "file" ? files.length > 0 : pasted.trim().length > 0;
   const busy = disabled || extracting;
+  const savedHashes = useMemo(() => new Map(existingDocs.filter((d) => d.contentHash).map((d) => [d.contentHash!, d])), [existingDocs]);
 
-  /** Same document payload for both paths; "extract" returns line items only, "text"/file runs the full analysis. */
-  const documentInit = (extract: boolean): RequestInit => {
-    if (input === "file" && file) {
+  /** Adds files, keeping order, skipping exact repeats of the same file and capping the batch. */
+  const addFiles = (list: FileList | File[] | null) => {
+    if (!list) return;
+    const key = (f: File) => `${f.name}|${f.size}|${f.lastModified}`;
+    const seen = new Set(files.map(key));
+    const next = [...files];
+    for (const f of Array.from(list)) {
+      if (seen.has(key(f))) continue;
+      seen.add(key(f));
+      next.push(f);
+    }
+    setExtractError(next.length > MAX_BATCH_FILES ? `Up to ${MAX_BATCH_FILES} statements at a time — the first ${MAX_BATCH_FILES} were kept.` : null);
+    setFiles(next.slice(0, MAX_BATCH_FILES));
+  };
+
+  const fileInit = (f: File | null, extract: boolean): RequestInit => {
+    if (f) {
       const fd = new FormData();
-      fd.append("file", file);
+      fd.append("file", f);
       if (businessType) fd.append("businessType", businessType);
       if (extract) fd.append("mode", "extract");
       return { body: fd };
@@ -2152,21 +2579,58 @@ function StatementUploader({
     };
   };
 
+  /** Reads each statement in turn (one request at a time keeps large batches inside rate limits), then aggregates. */
   const extract = async () => {
     setExtracting(true);
     setExtractError(null);
-    try {
-      const init = documentInit(true);
-      const res = await fetch("/api/analyze", { method: "POST", ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...(await authHeaders()) } });
-      if (!res.ok) throw new Error(await errorMessage(res));
-      const data = (await res.json()) as { items?: unknown; period?: unknown };
-      if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response from the analysis service.");
-      setReview(toReviewState(data.items, mode, isStatementPeriod(data.period) ? data.period : null));
-    } catch (e) {
-      setExtractError(e instanceof Error ? e.message : "Couldn't read the statement.");
-    } finally {
-      setExtracting(false);
+    setBatchNotes([]);
+    const sources: (File | null)[] = input === "file" ? files : [null];
+    const parsed: ParsedStatement[] = [];
+    const notes: string[] = [];
+    const seen = new Set<string>();
+    const headers = await authHeaders();
+    for (let i = 0; i < sources.length; i++) {
+      const f = sources[i];
+      const label = f?.name ?? "Pasted text";
+      setProgress({ done: i, total: sources.length, name: label });
+      try {
+        const hash = await hashFile(f ?? new Blob([pasted], { type: "text/plain" }));
+        if (hash && seen.has(hash)) {
+          notes.push(`${label}: same file as another in this batch — read once.`);
+          continue;
+        }
+        if (hash) seen.add(hash);
+        const prior = hash ? savedHashes.get(hash) : undefined;
+        if (prior) notes.push(`${label}: already in My Documents as “${prior.name}” — it will be updated, not added twice.`);
+        const init = fileInit(f, true);
+        const res = await fetch("/api/analyze", { method: "POST", ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...headers } });
+        if (!res.ok) throw new Error(await errorMessage(res));
+        const data = (await res.json()) as { items?: unknown; period?: unknown };
+        if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response from the analysis service.");
+        const period: StatementPeriod | null = isStatementPeriod(data.period) ? data.period : null;
+        parsed.push({
+          id: `st-${i}-${hash?.slice(0, 8) ?? i}`,
+          name: f ? documentName(f.name) : `Pasted statement${period ? ` · ${period.label}` : ""}`,
+          fileName: f?.name ?? null,
+          fileSize: f?.size ?? null,
+          contentHash: hash,
+          kind: f ? "statement" : "pasted",
+          items: { ...data.items, businessType: typeForMode(data.items.businessType, mode) },
+          detected: period?.key ?? "",
+          month: period?.key ?? "",
+        });
+      } catch (e) {
+        notes.push(`${label}: ${e instanceof Error ? e.message : "couldn't be read."}`);
+      }
     }
+    setProgress(null);
+    setExtracting(false);
+    setBatchNotes(notes);
+    if (!parsed.length) {
+      setExtractError(notes.join(" ") || "Couldn't read the statement.");
+      return;
+    }
+    setReview(buildReview(parsed, earlierFor(parsed, existingDocs), mode));
   };
 
   if (review) {
@@ -2175,71 +2639,106 @@ function StatementUploader({
         mode={mode}
         review={review}
         setReview={setReview}
+        notes={batchNotes}
+        existingDocs={existingDocs}
         disabled={disabled}
         onBack={() => setReview(null)}
         trackerReady={trackerReady}
         onLogActuals={onLogActuals}
-        onGenerate={(payload) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType)}
+        onGenerate={(payload, extras) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType, extras)}
       />
     );
   }
+
+  const single = input === "paste" || files.length === 1;
+  const skipDirect = async () => {
+    const f = input === "file" ? files[0] : null;
+    const hash = await hashFile(f ?? new Blob([pasted], { type: "text/plain" }));
+    await onSubmit(fileInit(f, false), businessType || undefined, {
+      docFromAnalysis: { name: f ? documentName(f.name) : "Pasted statement", fileName: f?.name ?? null, fileSize: f?.size ?? null, contentHash: hash, kind: f ? "statement" : "pasted" },
+    });
+  };
 
   return (
     <div className={cn(glass, "flex h-full flex-col p-6")}>
       <div className="flex items-center gap-2">
         <Upload className="h-5 w-5 text-indigo-300" />
-        <h2 className="text-lg font-semibold">{personal ? "Upload Bank / Card Statement" : "Upload Bank / P&L Statement"}</h2>
+        <h2 className="text-lg font-semibold">{personal ? "Upload Bank / Card Statements" : "Upload Bank / P&L Statements"}</h2>
       </div>
-      <p className="mt-1 text-sm text-slate-400">PDF, CSV or plain text. Scanned PDFs work too.</p>
+      <p className="mt-1 text-sm text-slate-400">PDF, CSV or plain text — one statement or several months at once. Scanned PDFs work too.</p>
 
       <div className="mt-5 inline-flex self-start rounded-lg border border-white/10 p-0.5 text-sm">
         {(["file", "paste"] as const).map((m) => (
           <button key={m} onClick={() => setInput(m)} className={cn("rounded-md px-3 py-1.5", input === m ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200")}>
-            {m === "file" ? "Upload file" : "Paste text"}
+            {m === "file" ? "Upload files" : "Paste text"}
           </button>
         ))}
       </div>
 
       <div className="mt-4 flex-1">
         {input === "file" ? (
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragOver(false);
-              const f = e.dataTransfer.files[0];
-              if (f) setFile(f);
-            }}
-            onClick={() => inputRef.current?.click()}
-            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && inputRef.current?.click()}
-            role="button"
-            tabIndex={0}
-            className={cn(
-              "grid h-full min-h-48 cursor-pointer place-items-center rounded-xl border-2 border-dashed p-6 text-center transition",
-              dragOver ? "border-indigo-400 bg-indigo-500/10" : "border-white/15 hover:border-white/30 hover:bg-white/[0.03]",
-            )}
-          >
-            <input ref={inputRef} type="file" accept={ACCEPT} hidden onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-            {file ? (
-              <div className="flex items-center gap-3 text-left">
-                <FileText className="h-8 w-8 text-indigo-300" />
-                <div>
-                  <p className="text-sm font-medium">{file.name}</p>
-                  <p className="text-xs text-slate-400">{(file.size / 1024).toFixed(0)} KB · click to replace</p>
-                </div>
-              </div>
-            ) : (
+          <>
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+                addFiles(e.dataTransfer.files);
+              }}
+              onClick={() => inputRef.current?.click()}
+              onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && inputRef.current?.click()}
+              role="button"
+              tabIndex={0}
+              className={cn(
+                "grid min-h-40 cursor-pointer place-items-center rounded-xl border-2 border-dashed p-6 text-center transition",
+                dragOver ? "border-indigo-400 bg-indigo-500/10" : "border-white/15 hover:border-white/30 hover:bg-white/[0.03]",
+              )}
+            >
+              <input
+                ref={inputRef}
+                type="file"
+                accept={ACCEPT}
+                multiple
+                hidden
+                onChange={(e) => {
+                  addFiles(e.target.files);
+                  e.target.value = "";
+                }}
+              />
               <div>
                 <Upload className="mx-auto h-8 w-8 text-slate-500" />
-                <p className="mt-2 text-sm text-slate-300">Drop a statement here or click to browse</p>
-                <p className="mt-1 text-xs text-slate-500">Up to 15 MB</p>
+                <p className="mt-2 text-sm text-slate-300">{files.length ? "Drop or click to add more statements" : "Drop statements here or click to browse"}</p>
+                <p className="mt-1 text-xs text-slate-500">Select several months at once · up to {MAX_BATCH_FILES} files, 15 MB each</p>
               </div>
+            </div>
+            {files.length > 0 && (
+              <ul className="mt-3 max-h-48 space-y-1.5 overflow-y-auto overscroll-contain pr-1">
+                {files.map((f, i) => (
+                  <li key={`${f.name}-${f.size}-${f.lastModified}`} className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2 text-sm">
+                    <FileText className="h-4 w-4 shrink-0 text-indigo-300" />
+                    <span className="min-w-0 flex-1 truncate" title={f.name}>
+                      {f.name}
+                    </span>
+                    <span className="shrink-0 text-xs text-slate-500">{Math.max(1, Math.round(f.size / 1024))} KB</span>
+                    {progress && progress.name === f.name && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-indigo-300" />}
+                    <button
+                      type="button"
+                      onClick={() => setFiles((cur) => cur.filter((_, j) => j !== i))}
+                      disabled={busy}
+                      aria-label={`Remove ${f.name}`}
+                      className="grid h-6 w-6 shrink-0 place-items-center rounded text-slate-500 hover:bg-white/5 hover:text-rose-300 disabled:opacity-40"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
             )}
-          </div>
+          </>
         ) : (
           <textarea
             value={pasted}
@@ -2265,7 +2764,7 @@ function StatementUploader({
       )}
 
       <p className="mt-4 flex items-start gap-1.5 text-xs text-slate-500">
-        <Lock className="mt-0.5 h-3 w-3 shrink-0" /> Encrypted in transit and parsed in memory. LedgerPulse never writes your file to disk or a database.
+        <Lock className="mt-0.5 h-3 w-3 shrink-0" /> Encrypted in transit and parsed in memory. The file itself is never stored — only the parsed results, in your workspace.
       </p>
 
       {extractError && (
@@ -2275,20 +2774,31 @@ function StatementUploader({
       )}
 
       <button onClick={extract} disabled={busy || !ready} className={cn(primaryBtn, "mt-4 py-2.5")}>
-        {extracting && <Loader2 className="h-4 w-4 animate-spin" />} {extracting ? "Reading line items…" : "Extract & review line items"}
+        {extracting && <Loader2 className="h-4 w-4 animate-spin" />}
+        {extracting && progress
+          ? progress.total > 1
+            ? `Reading ${progress.done + 1} of ${progress.total}…`
+            : "Reading line items…"
+          : files.length > 1 && input === "file"
+            ? `Extract & review ${files.length} statements`
+            : "Extract & review line items"}
       </button>
-      <button type="button" onClick={() => void onSubmit(documentInit(false), businessType || undefined)} disabled={busy || !ready} className="mt-2 self-center text-xs text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline disabled:opacity-40">
-        Skip review and analyze directly
-      </button>
+      {single && (
+        <button type="button" onClick={() => void skipDirect()} disabled={busy || !ready} className="mt-2 self-center text-xs text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline disabled:opacity-40">
+          Skip review and analyze directly
+        </button>
+      )}
     </div>
   );
 }
 
-/** Post-upload step: the owner edits, re-categorizes, deletes or adds parsed lines, then generates the report. */
+/** Post-upload step: the owner edits, re-categorizes, deletes or adds parsed lines, assigns months, then generates the report. */
 function UploadReview({
   mode,
   review,
   setReview,
+  notes,
+  existingDocs,
   disabled,
   onBack,
   onGenerate,
@@ -2298,9 +2808,11 @@ function UploadReview({
   mode: WorkspaceMode;
   review: UploadReviewState;
   setReview: (fn: (r: UploadReviewState | null) => UploadReviewState | null) => void;
+  notes: string[];
+  existingDocs: WorkspaceDocument[];
   disabled: boolean;
   onBack: () => void;
-  onGenerate: (payload: FormPayload) => Promise<boolean>;
+  onGenerate: (payload: FormPayload, extras: AnalysisExtras) => Promise<boolean>;
   trackerReady: boolean;
   onLogActuals: (key: string, actual: MonthActual) => string;
 }) {
@@ -2309,20 +2821,41 @@ function UploadReview({
   const { businessType, revenue, expenses } = review;
   const validRevenue = validRevenueRows(revenue);
   const validExpenses = validExpenseRows(effectiveExpenses(expenses, revenue));
-  const setRevenue = (fn: (rows: FormRevenue[]) => FormRevenue[]) => setReview((r) => r && { ...r, revenue: fn(r.revenue) });
-  const setExpenses = (fn: (rows: FormExpense[]) => FormExpense[]) => setReview((r) => r && { ...r, expenses: fn(r.expenses) });
+  const setRevenue = (fn: (rows: FormRevenue[]) => FormRevenue[]) => setReview((r) => r && { ...r, revenue: fn(r.revenue), rebuilt: false });
+  const setExpenses = (fn: (rows: FormExpense[]) => FormExpense[]) => setReview((r) => r && { ...r, expenses: fn(r.expenses), rebuilt: false });
   const [logNote, setLogNote] = useState<string | null>(null);
-  const totals = reviewTotals(review);
-  const canLog = trackerReady && !!review.month && (totals.revenue > 0 || totals.expenses > 0);
+  const batch = review.statements.length > 1 || review.earlier.length > 0;
+  const toLog = monthActuals(review);
+  const pendingLog = toLog.filter((m) => !review.loggedKeys.includes(m.key));
+  const unassigned = review.statements.filter((s) => !s.month).length;
+  const canLog = trackerReady && pendingLog.some((m) => m.actual.revenue > 0 || m.actual.expenses > 0);
+  const multiMonth = review.months.length > 1;
+
+  /** Re-assign a statement's month (or include / exclude an earlier document) and rebuild. */
+  const restructure = (statements: ParsedStatement[], earlierPrev: EarlierStatement[]) => {
+    setLogNote(null);
+    const earlier = earlierFor(statements, existingDocs, earlierPrev);
+    setReview((r) => {
+      if (!r) return r;
+      // One statement, nothing to fold in: just re-label the month and keep the owner's edited rows.
+      if (statements.length === 1 && !earlier.length && !r.earlier.length) {
+        const m = statements[0].month;
+        return { ...r, statements, months: [{ key: m, actual: reviewTotals(r), statementIds: [statements[0].id] }], logToTracker: !!m, loggedKeys: [] };
+      }
+      return buildReview(statements, earlier, mode, { ...r, loggedKeys: [] });
+    });
+  };
+
   const logNow = () => {
     if (!canLog) return;
-    setLogNote(onLogActuals(review.month, totals));
-    setReview((r) => r && { ...r, loggedMonth: r.month });
+    const lines = pendingLog.map((m) => onLogActuals(m.key, m.actual));
+    setLogNote(lines.length === 1 ? lines[0] : `Logged ${lines.length} months: ${pendingLog.map((m) => periodLabel(m.key)).join(", ")}. Goal pace and projections updated.`);
+    setReview((r) => r && { ...r, loggedKeys: [...r.loggedKeys, ...pendingLog.map((m) => m.key)] });
   };
   const generate = async () => {
-    // Log first so the tracker (and goal pace) already reflect this month when the report opens.
-    if (review.logToTracker && canLog && review.loggedMonth !== review.month) logNow();
-    await onGenerate({ mode: "form", businessType, origin: "statement", ...toPayloadLines(revenue, expenses, personal) });
+    // Months are logged into whichever workspace the report goes to, once that workspace has loaded.
+    const log = review.logToTracker ? pendingLog.filter((m) => m.actual.revenue > 0 || m.actual.expenses > 0) : [];
+    await onGenerate({ mode: "form", businessType, origin: "statement", ...toPayloadLines(revenue, expenses, personal) }, { log, docs: docsToSave(review, personal) });
   };
 
   return (
@@ -2332,9 +2865,151 @@ function UploadReview({
         <h2 className="text-lg font-semibold">Review parsed line items</h2>
       </div>
       <p className="mt-1 text-sm text-slate-400">
-        We read {revenue.length + expenses.length} line{revenue.length + expenses.length === 1 ? "" : "s"} from your statement. Fix amounts or categories, delete anything that doesn&apos;t belong,
-        add what&apos;s missing, and mark single charges one-time — then generate the report.
+        {review.statements.length > 1 ? `We read ${review.statements.length} statements. ` : ""}
+        {multiMonth
+          ? `The lines below are the monthly average across ${review.months.length} months; each month's own totals are logged separately.`
+          : `We read ${revenue.length + expenses.length} line${revenue.length + expenses.length === 1 ? "" : "s"}.`}{" "}
+        Fix amounts or categories, delete anything that doesn&apos;t belong, add what&apos;s missing — then generate the report.
       </p>
+      {notes.length > 0 && (
+        <ul className="mt-3 space-y-1 rounded-lg border border-amber-300/25 bg-amber-400/[0.06] px-3 py-2 text-xs text-amber-100">
+          {notes.map((n) => (
+            <li key={n} className="flex items-start gap-1.5">
+              <Info className="mt-0.5 h-3 w-3 shrink-0" /> {n}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Statements and their months */}
+      <section aria-label="Statements" className="mt-4 rounded-xl border border-indigo-300/25 bg-indigo-500/[0.06] p-4">
+        {!batch ? (
+          <StatementMonthPicker
+            detected={review.statements[0].detected ? { key: review.statements[0].detected, label: periodLabel(review.statements[0].detected), source: "text", confidence: "high" } : null}
+            value={review.statements[0].month}
+            onChange={(month) => restructure([{ ...review.statements[0], month }], review.earlier)}
+          />
+        ) : (
+          <>
+            <p className="text-xs font-medium uppercase tracking-wide text-indigo-200">Statements in this upload</p>
+            <ul className="mt-2 space-y-1.5">
+              {review.statements.map((s) => {
+                const t = statementTotals({ revenue: s.items.revenue, expenses: s.items.expenses });
+                return (
+                  <li key={s.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-white/10 bg-slate-900/40 px-2.5 py-2 text-xs">
+                    <FileText className="h-3.5 w-3.5 shrink-0 text-indigo-300" />
+                    <span className="min-w-0 flex-1 truncate text-slate-200" title={s.fileName ?? s.name}>
+                      {s.name}
+                    </span>
+                    <span className="tabular-nums text-slate-400">
+                      {exactMoney(t.revenue)} in · {exactMoney(t.expenses)} out
+                    </span>
+                    <select
+                      aria-label={`Month for ${s.name}`}
+                      value={s.month}
+                      onChange={(e) => restructure(review.statements.map((x) => (x.id === s.id ? { ...x, month: e.target.value } : x)), review.earlier)}
+                      className={cn(inputCls, "w-auto py-1 pr-7 text-xs", !s.month && "border-amber-300/50")}
+                    >
+                      <option value="">Pick a month…</option>
+                      {statementMonthOptions(s.detected || null).map((k) => (
+                        <option key={k} value={k}>
+                          {periodLabel(k)}
+                          {k === s.detected ? " (detected)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {review.statements.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => restructure(review.statements.filter((x) => x.id !== s.id), review.earlier)}
+                        aria-label={`Leave out ${s.name}`}
+                        className="grid h-6 w-6 place-items-center rounded text-slate-500 hover:bg-white/5 hover:text-rose-300"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+            {review.earlier.length > 0 && (
+              <>
+                <p className="mt-3 text-xs font-medium uppercase tracking-wide text-slate-400">Already in this workspace for the same months</p>
+                <ul className="mt-1.5 space-y-1.5">
+                  {review.earlier.map((e) => (
+                    <li key={e.id}>
+                      <label className="flex cursor-pointer flex-wrap items-center gap-2 rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-2 text-xs">
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5 accent-indigo-400"
+                          checked={e.include}
+                          onChange={(ev) => restructure(review.statements, review.earlier.map((x) => (x.id === e.id ? { ...x, include: ev.target.checked } : x)))}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-slate-300">{e.name}</span>
+                        <span className="text-slate-500">{periodLabel(e.month)} · from My Documents</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-1 text-[11px] text-slate-500">Included documents are added into that month (e.g. checking + credit card), with identical lines counted once.</p>
+              </>
+            )}
+          </>
+        )}
+
+        {(review.duplicateLines > 0 || review.excludedOneTime > 0 || review.rebuilt) && (
+          <ul className="mt-3 space-y-1 text-[11px] text-slate-400">
+            {review.duplicateLines > 0 && <li>• {review.duplicateLines} identical line{review.duplicateLines === 1 ? "" : "s"} found in two statements for the same month — counted once.</li>}
+            {review.excludedOneTime > 0 && <li>• {review.excludedOneTime} past one-time item{review.excludedOneTime === 1 ? " is" : "s are"} logged in {review.excludedOneTime === 1 ? "its" : "their"} month but left out of the monthly baseline.</li>}
+            {review.rebuilt && <li>• Line items were rebuilt for the new month assignment.</li>}
+          </ul>
+        )}
+
+        {/* What gets logged */}
+        <div className="mt-3 border-t border-white/10 pt-3 text-xs">
+          {toLog.length > 0 && (
+            <ul className="mb-2 space-y-1 tabular-nums text-slate-400">
+              {toLog.map((m) => (
+                <li key={m.key} className="flex flex-wrap justify-between gap-x-3">
+                  <span className="text-slate-300">
+                    {periodLabel(m.key)}
+                    {review.loggedKeys.includes(m.key) && <span className="ml-1 text-emerald-300">· logged ✓</span>}
+                  </span>
+                  <span>
+                    {exactMoney(m.actual.revenue)} in · {exactMoney(m.actual.expenses)} out{m.actual.oneTimeExpenses ? ` (${exactMoney(m.actual.oneTimeExpenses)} one-time)` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <label className="inline-flex cursor-pointer items-center gap-2 text-slate-300">
+              <input type="checkbox" className="h-4 w-4 accent-indigo-400" checked={review.logToTracker} disabled={!toLog.length} onChange={(e) => setReview((r) => r && { ...r, logToTracker: e.target.checked })} />
+              {toLog.length > 1 ? `Log these ${toLog.length} months as actuals in the Fiscal Year Tracker` : `Log these totals as ${toLog[0] ? periodLabel(toLog[0].key) : "this month's"} actuals in the Fiscal Year Tracker`}
+            </label>
+            <button
+              type="button"
+              onClick={logNow}
+              disabled={!canLog}
+              className="ml-auto rounded-lg border border-indigo-300/30 px-2.5 py-1 text-indigo-100 hover:bg-indigo-400/10 disabled:opacity-40"
+              title={trackerReady ? "Log now without generating a report" : "The tracker is still loading"}
+            >
+              {toLog.length && !pendingLog.length ? "Logged ✓" : "Log now"}
+            </button>
+          </div>
+          {unassigned > 0 && (
+            <p className="mt-2 text-[11px] text-amber-200">
+              {unassigned} statement{unassigned === 1 ? " has" : "s have"} no month yet — pick one so {unassigned === 1 ? "it" : "they"} can be logged{batch ? " and averaged correctly" : ""}.
+            </p>
+          )}
+          {logNote && (
+            <p role="status" className="mt-2 flex items-start gap-1.5 text-emerald-200">
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {logNote}
+            </p>
+          )}
+          <p className="mt-2 text-[11px] text-slate-500">Logging replaces that month&apos;s actuals (never adds to them), so re-uploading a month can&apos;t double count it.</p>
+        </div>
+      </section>
 
       {!personal && (
         <label className="mt-4 block text-sm">
@@ -2351,73 +3026,31 @@ function UploadReview({
 
       <div className="mt-5 flex-1 space-y-6">
         <section aria-label={copy.revenue}>
-          <h3 className="mb-2 text-sm font-medium text-slate-200">{copy.revenue}</h3>
+          <h3 className="mb-2 text-sm font-medium text-slate-200">
+            {copy.revenue}
+            {multiMonth && <span className="font-normal text-slate-500"> · monthly average</span>}
+          </h3>
           <RevenueRowsEditor rows={revenue} setRows={setRevenue} mode={mode} custom={businessType === "OTHER_CUSTOM"} hint="Recurring lines are average monthly amounts; one-time lines are the full single amount." />
         </section>
         <section aria-label={copy.expenses}>
-          <h3 className="mb-2 text-sm font-medium text-slate-200">{copy.expenses}</h3>
+          <h3 className="mb-2 text-sm font-medium text-slate-200">
+            {copy.expenses}
+            {multiMonth && <span className="font-normal text-slate-500"> · monthly average</span>}
+          </h3>
           <ExpenseRowsEditor rows={expenses} setRows={setExpenses} revenue={revenue} mode={mode} businessType={businessType} hint="Change a category if it was misread; a blank category is auto-classified." />
         </section>
         <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
           <ReviewSummary mode={mode} businessType={businessType} revenue={validRevenue} expenses={validExpenses} />
         </div>
-
-        <section aria-label="Statement month" className="rounded-xl border border-indigo-300/25 bg-indigo-500/[0.06] p-4">
-          <StatementMonthPicker
-            detected={review.period}
-            value={review.month}
-            onChange={(month) => {
-              setLogNote(null);
-              setReview((r) => r && { ...r, month, logToTracker: true });
-            }}
-          />
-          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/10 pt-3 text-xs">
-            <label className="inline-flex cursor-pointer items-center gap-2 text-slate-300">
-              <input
-                type="checkbox"
-                className="h-4 w-4 accent-indigo-400"
-                checked={review.logToTracker}
-                disabled={!review.month}
-                onChange={(e) => setReview((r) => r && { ...r, logToTracker: e.target.checked })}
-              />
-              Log these totals as {review.month ? periodLabel(review.month) : "this month's"} actuals in the Fiscal Year Tracker
-            </label>
-            <span className="tabular-nums text-slate-500">
-              {exactMoney(totals.revenue)} in · {exactMoney(totals.expenses)} out{totals.oneTimeExpenses ? ` (${exactMoney(totals.oneTimeExpenses)} one-time)` : ""}
-            </span>
-            <button
-              type="button"
-              onClick={logNow}
-              disabled={!canLog || review.loggedMonth === review.month}
-              className="ml-auto rounded-lg border border-indigo-300/30 px-2.5 py-1 text-indigo-100 hover:bg-indigo-400/10 disabled:opacity-40"
-              title={trackerReady ? "Log now without generating a report" : "The tracker is still loading"}
-            >
-              {review.loggedMonth === review.month && review.month ? "Logged ✓" : "Log now"}
-            </button>
-          </div>
-          {logNote && (
-            <p role="status" className="mt-2 flex items-start gap-1.5 text-xs text-emerald-200">
-              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {logNote}
-            </p>
-          )}
-          <p className="mt-2 text-[11px] text-slate-500">Uses the reviewed lines above for a single month; only the monthly totals are saved, never the statement.</p>
-        </section>
       </div>
 
-      {validRevenue.length === 0 && (
-        <p className="mt-4 text-sm text-amber-200">Add at least one {personal ? "income" : "revenue"} line with an amount to generate the report.</p>
-      )}
+      {validRevenue.length === 0 && <p className="mt-4 text-sm text-amber-200">Add at least one {personal ? "income" : "revenue"} line with an amount to generate the report.</p>}
 
       <div className="mt-6 flex items-center justify-between">
         <button type="button" onClick={onBack} disabled={disabled} className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-white/5 disabled:opacity-30">
           <ArrowLeft className="h-4 w-4" /> Back to upload
         </button>
-        <button
-          type="button"
-          onClick={() => void generate()}
-          disabled={disabled || validRevenue.length === 0}
-          className={primaryBtn}
-        >
+        <button type="button" onClick={() => void generate()} disabled={disabled || validRevenue.length === 0} className={primaryBtn}>
           {disabled && <Loader2 className="h-4 w-4 animate-spin" />} Generate report
         </button>
       </div>
@@ -2657,6 +3290,31 @@ function KpiRow({ analysis, mode, locked, settings, inflationLabel }: { analysis
   );
 }
 
+/** Rounds a domain outward to "nice" steps so lines fill the plot instead of hugging one edge (e.g. 70k–85k, not 0–85k). */
+function niceDomain(values: number[], { includeZero = false } = {}): [number, number] {
+  const vs = values.filter(Number.isFinite);
+  if (!vs.length) return [0, 1];
+  let lo = Math.min(...vs, ...(includeZero ? [0] : []));
+  let hi = Math.max(...vs, ...(includeZero ? [0] : []));
+  if (lo === hi) {
+    const pad = Math.abs(lo) * 0.1 || 1;
+    lo -= pad;
+    hi += pad;
+  }
+  const span = hi - lo;
+  // Pad 8% each side, then snap to a step of 1/2/2.5/5 × 10^n.
+  lo -= span * 0.08;
+  hi += span * 0.08;
+  const raw = (hi - lo) / 5;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((x) => x >= raw) ?? raw;
+  let min = Math.floor(lo / step) * step;
+  const max = Math.ceil(hi / step) * step;
+  // All-positive data never gets a negative axis.
+  if (Math.min(...vs) >= 0 && min < 0) min = 0;
+  return [min, max];
+}
+
 function ProjectionCharts({
   analysis,
   settings,
@@ -2664,6 +3322,10 @@ function ProjectionCharts({
   cpi,
   inflationLabel,
   actuals,
+  basis,
+  basisChoice,
+  onBasisChange,
+  actualsAgg,
 }: {
   analysis: FinancialAnalysis;
   settings: ForecastSettings;
@@ -2672,22 +3334,49 @@ function ProjectionCharts({
   inflationLabel: string;
   /** Logged monthly actuals, for fitting the seasonal curve. */
   actuals?: Record<string, MonthActual>;
+  /** What the projection is running on right now. */
+  basis: "ACTUALS" | "REPORT";
+  basisChoice: ProjectionBasis;
+  onBasisChange: (b: ProjectionBasis) => void;
+  actualsAgg: ActualsAggregate | null;
 }) {
   const { rows } = useDerived(analysis);
   const [showTable, setShowTable] = useState(false);
   const copy = MODE_COPY[modeOf(analysis.businessType)];
   const months = settings.months;
   const long = months > 12;
+  const gradId = useId().replace(/[^a-zA-Z0-9]/g, "");
+
+  // Profit band (revenue above expenses) and loss band (expenses above revenue) as [low, high] ranges, so the gap
+  // between the two lines is shaded green or red. Both stay continuous (zero height where they don't apply).
+  const chartRows = rows.map((r) => ({
+    ...r,
+    profitBand: [r.projectedExpenses, Math.max(r.projectedRevenue, r.projectedExpenses)] as [number, number],
+    lossBand: [r.projectedRevenue, Math.max(r.projectedRevenue, r.projectedExpenses)] as [number, number],
+  }));
+  const lineDomain = niceDomain(rows.flatMap((r) => [r.projectedRevenue, r.projectedExpenses]));
+  const cumDomain = niceDomain(
+    rows.map((r) => r.cumulative),
+    { includeZero: true },
+  );
+
+  // Summary stats for the header.
+  const totalNet = rows.reduce((acc, r) => acc + r.net, 0);
+  const avgNet = rows.length ? totalNet / rows.length : 0;
+  const profitable = rows.filter((r) => r.net >= 0).length;
+  const best = rows.reduce<(typeof rows)[number] | null>((b, r) => (!b || r.net > b.net ? r : b), null);
+  const worst = rows.reduce<(typeof rows)[number] | null>((b, r) => (!b || r.net < b.net ? r : b), null);
+  const spread = !!best && !!worst && best.month !== worst.month;
 
   return (
     <div className={cn(glass, "p-6")}>
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-start">
+        <div className="min-w-0">
           <h2 className="flex items-center gap-2 text-lg font-semibold">
             {months}-Month Projection
             <InfoTip label="How the projection works" align="left">
-              Each month repeats your recurring line items exactly as entered; one-time items land in month 1 and partial lines are pro-rated there. %-of-revenue
-              expenses move with their revenue line. Seasonality and inflation are off unless you switch them on below.
+              Each month repeats your recurring line items; one-time items land in month 1 and partial lines are pro-rated there. %-of-revenue expenses move with their
+              revenue line. With two or more logged months, the projection uses their average (switch below). Seasonality and inflation are off unless you switch them on.
             </InfoTip>
           </h2>
           <p className="text-sm text-slate-400">
@@ -2699,10 +3388,63 @@ function ProjectionCharts({
             <MacroChip label="Inflation" on={settings.inflation} detail={`${pct(analysis.inflationRateAssumed)} ${settings.inflationSource === "CUSTOM" ? "custom" : "CPI"}`} />
           </p>
         </div>
-        <button onClick={() => setShowTable((s) => !s)} className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5">
+
+        {/* Top-center summary: the projection at a glance. */}
+        <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-2 xl:grid-cols-4" aria-label="Projection summary">
+          <SummaryStat label={avgNet >= 0 ? "Avg monthly profit" : "Avg monthly loss"} value={signedUsd(avgNet)} tone={avgNet >= 0 ? "good" : "bad"} />
+          <SummaryStat label={`${months}-mo total net`} value={signedUsd(totalNet)} tone={totalNet >= 0 ? "good" : "bad"} />
+          <SummaryStat label="Profitable months" value={`${profitable} of ${rows.length}`} tone={profitable === rows.length ? "good" : profitable === 0 ? "bad" : undefined} />
+          <SummaryStat
+            label={spread ? "Best / worst month" : "Monthly net"}
+            value={best ? (spread && worst ? `${monthTick(long)(best.month)} / ${monthTick(long)(worst.month)}` : signedUsd(best.net)) : "—"}
+            title={best && worst ? `Best: ${best.month} ${signedUsd(best.net)} · Worst: ${worst.month} ${signedUsd(worst.net)}` : undefined}
+          />
+        </dl>
+
+        <button onClick={() => setShowTable((s) => !s)} className="justify-self-start rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5 lg:justify-self-end">
           {showTable ? "Show chart" : "Show table"}
         </button>
       </div>
+
+      {/* Projection basis: the latest report vs every logged month. */}
+      <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 text-xs">
+        <span className="text-slate-400">Projection based on</span>
+        <div role="radiogroup" aria-label="Projection basis" className="inline-flex flex-wrap rounded-lg border border-white/10 bg-slate-900/60 p-0.5">
+          {(
+            [
+              ["AUTO", "Auto"],
+              ["ACTUALS", actualsAgg ? `Avg of ${actualsAgg.months} logged month${actualsAgg.months === 1 ? "" : "s"}` : "Logged actuals"],
+              ["REPORT", "This report's line items"],
+            ] as const
+          ).map(([b, label]) => (
+            <button
+              key={b}
+              type="button"
+              role="radio"
+              aria-checked={basisChoice === b}
+              disabled={b === "ACTUALS" && !actualsAgg}
+              onClick={() => onBasisChange(b)}
+              className={cn("rounded-md px-2.5 py-1 font-medium transition disabled:opacity-40", basisChoice === b ? "bg-indigo-500/80 text-white" : "text-slate-400 hover:text-slate-200")}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <span className="min-w-0 text-slate-400">
+          {basis === "ACTUALS" && actualsAgg ? (
+            <>
+              Using {exactMoney(actualsAgg.revenue)} in / {exactMoney(actualsAgg.expenses)} out per month, averaged over {periodLabel(actualsAgg.first)}
+              {actualsAgg.months > 1 ? ` – ${periodLabel(actualsAgg.last)}` : ""}
+              {actualsAgg.oneTimeExcluded > 0 ? ` (one-time costs of ${exactMoney(actualsAgg.oneTimeExcluded)} left out)` : ""}.
+            </>
+          ) : actualsAgg ? (
+            <>Using this report&apos;s line items.{basisChoice === "AUTO" ? " Log one more month to switch to your actuals average automatically." : ""}</>
+          ) : (
+            <>Using this report&apos;s line items — log monthly actuals in the Fiscal Year tab to project from your real average.</>
+          )}
+        </span>
+      </div>
+
       <ForecastControls settings={settings} onChange={onSettingsChange} cpi={cpi} className="mt-4" businessType={analysis.businessType} actuals={actuals} />
 
       {showTable ? (
@@ -2723,7 +3465,7 @@ function ProjectionCharts({
                   <td className="py-2 text-slate-300">{r.month}</td>
                   <td className="py-2 text-right">{usd.format(r.projectedRevenue)}</td>
                   <td className="py-2 text-right">{usd.format(r.projectedExpenses)}</td>
-                  <td className={cn("py-2 text-right", r.net < 0 && "text-rose-300")}>{usd.format(r.net)}</td>
+                  <td className={cn("py-2 text-right", r.net < 0 ? "text-rose-300" : "text-emerald-300")}>{usd.format(r.net)}</td>
                   <td className={cn("py-2 text-right", r.cumulative < 0 && "text-rose-300")}>{usd.format(r.cumulative)}</td>
                 </tr>
               ))}
@@ -2732,41 +3474,95 @@ function ProjectionCharts({
         </div>
       ) : (
         <>
-          <div className="mt-4 h-72">
+          <div className="mt-4 h-80">
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
+              <ComposedChart data={chartRows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
                 <CartesianGrid stroke={CHART.grid} vertical={false} />
                 <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
-                <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
-                <Tooltip content={<ChartTooltip />} cursor={{ stroke: CHART.cursor }} />
+                <YAxis {...axisProps} width={72} domain={lineDomain} tickCount={6} tickFormatter={(v: number) => usdCompact.format(v)} />
+                <Tooltip content={<ProjectionTooltip revenueLabel={copy.revenue} expensesLabel={copy.expenses} />} cursor={{ stroke: CHART.cursor }} />
                 <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: CHART.legend }} />
-                <Line name={`Projected ${copy.revenue.toLowerCase()}`} type="monotone" dataKey="projectedRevenue" stroke={COLOR.revenue} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
-                <Line name={`Projected ${copy.expenses.toLowerCase()}`} type="monotone" dataKey="projectedExpenses" stroke={COLOR.expenses} strokeWidth={2} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
-              </LineChart>
+                <Area name="Profit gap" type="linear" dataKey="profitBand" stroke="none" fill={COLOR.gain} fillOpacity={0.22} isAnimationActive={false} activeDot={false} legendType="square" />
+                <Area name="Loss gap" type="linear" dataKey="lossBand" stroke="none" fill={COLOR.loss} fillOpacity={0.25} isAnimationActive={false} activeDot={false} legendType="square" />
+                <Line name={`Projected ${copy.revenue.toLowerCase()}`} type="linear" dataKey="projectedRevenue" stroke={COLOR.revenue} strokeWidth={2.25} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
+                <Line name={`Projected ${copy.expenses.toLowerCase()}`} type="linear" dataKey="projectedExpenses" stroke={COLOR.expenses} strokeWidth={2.25} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
+              </ComposedChart>
             </ResponsiveContainer>
           </div>
+          <p className="mt-1 text-[11px] text-slate-500">
+            Shaded gap = monthly profit (green: {copy.revenue.toLowerCase()} above {copy.expenses.toLowerCase()}) or loss (red). The axis scales to your numbers, so it may not start at $0.
+          </p>
 
           <h3 className="mt-6 text-sm font-medium text-slate-300">Cumulative cash flow</h3>
           <div className="mt-2 h-40">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
                 <defs>
-                  <linearGradient id="cashFill" x1="0" y1="0" x2="0" y2="1">
+                  <linearGradient id={`cashFill${gradId}`} x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor={COLOR.cash} stopOpacity={0.35} />
                     <stop offset="100%" stopColor={COLOR.cash} stopOpacity={0.02} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid stroke={CHART.grid} vertical={false} />
                 <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
-                <YAxis {...axisProps} width={64} tickFormatter={(v: number) => usdCompact.format(v)} />
+                <YAxis {...axisProps} width={72} domain={cumDomain} tickCount={5} tickFormatter={(v: number) => usdCompact.format(v)} />
                 <ReferenceLine y={0} stroke={CHART.zero} />
                 <Tooltip content={<ChartTooltip />} cursor={{ stroke: CHART.cursor }} />
-                <Area name="Cumulative net cash" type="monotone" dataKey="cumulative" stroke={COLOR.cash} strokeWidth={2} fill="url(#cashFill)" activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
+                <Area name="Cumulative net cash" type="monotone" dataKey="cumulative" stroke={COLOR.cash} strokeWidth={2} fill={`url(#cashFill${gradId})`} activeDot={{ r: 4, strokeWidth: 2, stroke: CHART.surface }} />
               </AreaChart>
             </ResponsiveContainer>
           </div>
         </>
       )}
+      <DataCompletenessNote loggedCount={actualsAgg?.months ?? 0} className="mt-4" />
+    </div>
+  );
+}
+
+function SummaryStat({ label, value, tone, title }: { label: string; value: string; tone?: "good" | "bad"; title?: string }) {
+  return (
+    <div className="min-w-0 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2" title={title}>
+      <dt className="truncate text-[10px] uppercase tracking-wide text-slate-500">{label}</dt>
+      <dd className={cn("mt-0.5 whitespace-nowrap text-sm font-semibold tabular-nums text-slate-100", tone === "good" && "text-emerald-300", tone === "bad" && "text-rose-300")}>{value}</dd>
+    </div>
+  );
+}
+
+/** Revenue, expenses and that month's profit / loss (the shaded bands themselves aren't listed). */
+function ProjectionTooltip({
+  active,
+  payload,
+  label,
+  revenueLabel,
+  expensesLabel,
+}: {
+  active?: boolean;
+  payload?: ReadonlyArray<{ payload?: { projectedRevenue: number; projectedExpenses: number; net: number } }>;
+  label?: string | number;
+  revenueLabel: string;
+  expensesLabel: string;
+}) {
+  const row = payload?.[0]?.payload;
+  if (!active || !row) return null;
+  return (
+    <div className="rounded-lg border border-white/10 bg-slate-900/95 px-3 py-2 text-xs shadow-xl backdrop-blur">
+      <p className="mb-1 font-medium text-slate-200">{label}</p>
+      {(
+        [
+          [revenueLabel, row.projectedRevenue, COLOR.revenue],
+          [expensesLabel, row.projectedExpenses, COLOR.expenses],
+        ] as const
+      ).map(([name, v, color]) => (
+        <p key={name} className="flex items-center gap-2 text-slate-300">
+          <span className="inline-block h-2 w-2 rounded-full" style={{ background: color }} />
+          <span className="text-slate-400">{name}</span>
+          <span className="ml-auto pl-3 tabular-nums text-slate-100">{usd.format(v)}</span>
+        </p>
+      ))}
+      <p className={cn("mt-1 flex items-center gap-2 border-t border-white/10 pt-1 font-medium", row.net >= 0 ? "text-emerald-300" : "text-rose-300")}>
+        {row.net >= 0 ? "Profit" : "Loss"}
+        <span className="ml-auto pl-3 tabular-nums">{signedUsd(row.net)}</span>
+      </p>
     </div>
   );
 }
@@ -2798,6 +3594,7 @@ function AuditPanel({
   onToggleImplemented?: (flag: AuditFlag) => void;
 }) {
   const [showAll, setShowAll] = useState(false);
+  const [openFlag, setOpenFlag] = useState<AuditFlag | null>(null);
   const teaser = paywall.access.level === "teaser";
   const flags = analysis.auditFlags;
   const visible = showAll || teaser ? flags : flags.filter((f) => f.severity !== "LOW").slice(0, 6);
@@ -2837,14 +3634,25 @@ function AuditPanel({
           {visible.map((f, i) => {
             const s = SEVERITY_STYLE[f.severity];
             return (
-              <li key={`${f.title}-${i}`} className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <p className="text-sm font-medium text-slate-100">{f.title}</p>
-                  <span className={cn("inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium", s.badge)}>
-                    <s.Icon className="h-3 w-3" /> {f.severity}
+              <li
+                key={`${f.title}-${i}`}
+                className={cn(
+                  "rounded-xl border bg-white/[0.03] p-4 transition hover:bg-white/[0.05]",
+                  f.severity === "HIGH" ? "border-rose-300/25 hover:border-rose-300/40" : "border-white/10 hover:border-white/20",
+                )}
+              >
+                <button type="button" onClick={() => setOpenFlag(f)} className="group block w-full text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-indigo-300" aria-label={`${f.title}: open strategy and recommendations`}>
+                  <span className="flex items-start justify-between gap-3">
+                    <span className="text-sm font-medium text-slate-100 group-hover:text-white">{f.title}</span>
+                    <span className={cn("inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium", s.badge)}>
+                      <s.Icon className="h-3 w-3" /> {f.severity}
+                    </span>
                   </span>
-                </div>
-                <p className="mt-1.5 text-sm text-slate-400">{f.message}</p>
+                  <span className="mt-1.5 block text-sm text-slate-400">{f.message}</span>
+                  <span className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-indigo-300 group-hover:text-indigo-200">
+                    {f.severity === "HIGH" ? "See the strategy & next steps" : "Details & recommendations"} <ArrowRight className="h-3 w-3" />
+                  </span>
+                </button>
                 {f.potentialSavings > 0 && (
                   <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
                     <p className="text-xs text-emerald-300">
@@ -2903,6 +3711,16 @@ function AuditPanel({
       )}
 
       <FeedbackWidget context="audit" workspaceId={workspaceId} prompt="Rate this audit" className="mt-5 border-t border-white/10 pt-4" />
+
+      {openFlag && (
+        <AuditDeepDive
+          flag={openFlag}
+          figures={{ monthlyRevenue: analysis.monthlyRevenue, monthlyExpenses: splitTotals(analysis.itemizedExpenses).recurring, personal: analysis.businessType === "PERSONAL_FAMILY" }}
+          onClose={() => setOpenFlag(null)}
+          implemented={!!doneFor(openFlag)}
+          onToggleImplemented={onToggleImplemented ? () => onToggleImplemented(openFlag) : undefined}
+        />
+      )}
     </div>
   );
 }

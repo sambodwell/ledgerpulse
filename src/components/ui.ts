@@ -15,7 +15,8 @@ export const primaryBtn =
 export const secondaryBtn =
   "inline-flex items-center justify-center gap-2 rounded-lg border border-white/15 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10 disabled:opacity-50";
 
-export const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+/** Exact dollars and cents everywhere money is shown ($1,234.56); only chart axes use the compact form. */
+export const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 export const usdCompact = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 1 });
 export const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
 

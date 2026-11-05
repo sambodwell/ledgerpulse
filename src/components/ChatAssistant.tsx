@@ -106,7 +106,12 @@ export function ChatAssistant() {
     const d = drag.current;
     drag.current = null;
     if (!d || !d.moved) return;
-    suppressClick.current = true; // the click that ends a drag must not toggle the panel
+    // The click that ends a drag must not toggle the panel. Cleared on the next tick so a drag that ends without a
+    // click (released over the panel header, or cancelled) can never swallow a later click and leave the chat stuck.
+    suppressClick.current = true;
+    setTimeout(() => {
+      suppressClick.current = false;
+    }, 0);
     setDragging(false);
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
     setOffset((o) => {
@@ -119,7 +124,36 @@ export function ChatAssistant() {
     });
   }, []);
 
-  const dragHandlers = { onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp };
+  const dragHandlers = { onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp, onLostPointerCapture: onPointerUp };
+
+  // Escape always closes the panel, wherever it ended up.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // Other parts of the app (e.g. an audit deep-dive) can open the guide with a question: lp:ask-assistant { question }.
+  const sendRef = useRef<(text: string) => void>(() => {});
+  useEffect(() => {
+    const onAsk = (e: Event) => {
+      const q = (e as CustomEvent<{ question?: unknown }>).detail?.question;
+      setOpen(true);
+      if (typeof q === "string" && q.trim()) sendRef.current(q);
+    };
+    window.addEventListener("lp:ask-assistant", onAsk);
+    return () => window.removeEventListener("lp:ask-assistant", onAsk);
+  }, []);
+
+  // Viewport size, so the open panel is always laid out fully on screen.
+  const [vp, setVp] = useState({ w: 1280, h: 800 });
+  useEffect(() => {
+    const read = () => setVp({ w: window.innerWidth, h: window.innerHeight });
+    read();
+    window.addEventListener("resize", read);
+    return () => window.removeEventListener("resize", read);
+  }, []);
 
   /** Arrow keys nudge the widget for keyboard users (with the launcher focused). */
   const onKeyNudge = (e: React.KeyboardEvent) => {
@@ -157,17 +191,31 @@ export function ChatAssistant() {
     }
   };
 
-  // Open the panel toward the roomier side of the screen.
-  const onLeftHalf = typeof window !== "undefined" && offset.right > window.innerWidth / 2 - BUBBLE / 2;
-  const nearTop = typeof window !== "undefined" && offset.bottom > window.innerHeight / 2;
+  useEffect(() => {
+    sendRef.current = (text: string) => void send(text);
+  });
+
+  // The launcher stays exactly where it was dropped. The panel is placed beside it (toward the roomier side) and
+  // clamped to the viewport, so it — and its close button — can never end up off-screen.
+  const bubbleLeft = vp.w - offset.right - BUBBLE;
+  const bubbleTop = vp.h - offset.bottom - BUBBLE;
+  const panelW = Math.min(352, vp.w - 2 * MARGIN);
+  const panelH = Math.min(512, vp.h - BUBBLE - 3 * MARGIN - 12);
+  const clampX = (x: number) => Math.min(Math.max(MARGIN, x), Math.max(MARGIN, vp.w - panelW - MARGIN));
+  const clampY = (y: number) => Math.min(Math.max(MARGIN, y), Math.max(MARGIN, vp.h - panelH - MARGIN));
+  const onLeftHalf = bubbleLeft + BUBBLE / 2 < vp.w / 2;
+  const above = bubbleTop - 12 - panelH >= MARGIN || bubbleTop > vp.h / 2;
+  const panelLeft = clampX(onLeftHalf ? bubbleLeft : bubbleLeft + BUBBLE - panelW);
+  const panelTop = clampY(above ? bubbleTop - 12 - panelH : bubbleTop + BUBBLE + 12);
 
   return (
-    <div
-      className={cn("fixed z-50 flex gap-3", nearTop ? "flex-col-reverse" : "flex-col", onLeftHalf ? "items-start" : "items-end", dragging && "select-none")}
-      style={{ right: offset.right, bottom: nearTop ? undefined : offset.bottom, top: nearTop ? `calc(100vh - ${offset.bottom + BUBBLE}px)` : undefined }}
-    >
+    <div className={cn(dragging && "select-none")}>
       {open && (
-        <section aria-label="LedgerPulse assistant" className={cn(glass, "flex h-[min(32rem,calc(100vh-7rem))] w-[min(22rem,calc(100vw-2rem))] flex-col bg-slate-900/95")}>
+        <section
+          aria-label="LedgerPulse assistant"
+          className={cn(glass, "fixed z-50 flex flex-col bg-slate-900/95")}
+          style={{ left: panelLeft, top: panelTop, width: panelW, height: panelH }}
+        >
           <header className={cn("flex touch-none items-center justify-between border-b border-white/10 px-4 py-3", dragging ? "cursor-grabbing" : "cursor-grab")} {...dragHandlers} title="Drag to move">
             <h2 className="flex items-center gap-2 text-sm font-semibold">
               <Sparkles className="h-4 w-4 text-indigo-300" /> LedgerPulse Guide
@@ -235,9 +283,20 @@ export function ChatAssistant() {
         aria-label={open ? "Close assistant (drag or use arrow keys to move)" : "Open assistant (drag or use arrow keys to move)"}
         aria-expanded={open}
         title="Click to chat · drag to move"
+        onDoubleClick={() => {
+          // Escape hatch: double-click snaps the launcher back to the default corner.
+          const home = { right: 24, bottom: 24 };
+          setOffset(home);
+          try {
+            window.localStorage.setItem(POS_KEY, JSON.stringify(home));
+          } catch {
+            /* ignore */
+          }
+        }}
+        style={{ right: offset.right, bottom: offset.bottom }}
         className={cn(
-          "grid h-14 w-14 touch-none place-items-center rounded-full bg-indigo-500 text-white shadow-xl shadow-indigo-500/30 transition hover:bg-indigo-400",
-          dragging ? "scale-105 cursor-grabbing" : "cursor-grab hover:scale-105",
+          "fixed z-[51] grid h-14 w-14 touch-none place-items-center rounded-full bg-indigo-500 text-white shadow-xl shadow-indigo-500/30 transition-colors hover:bg-indigo-400",
+          dragging ? "cursor-grabbing" : "cursor-grab",
         )}
       >
         {open ? <X className="h-6 w-6" /> : <MessageCircle className="h-6 w-6" />}

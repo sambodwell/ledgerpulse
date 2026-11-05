@@ -68,13 +68,17 @@ export function FeedbackWidget({
               onFocus={() => setHover(n)}
               onBlur={() => setHover(0)}
               onClick={() => setRating(n)}
-              className={cn("rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300", lg ? "p-1 transition hover:scale-110" : "p-0.5")}
+              // No scale/translate on hover: transforms on the hit target made stars jump as the pointer moved across them.
+              className={cn("rounded leading-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300", lg ? "p-1" : "p-0.5")}
             >
-              <Star className={cn("transition", lg ? "h-9 w-9" : "h-4 w-4", n <= shown ? "fill-amber-300 text-amber-300" : lg ? "text-slate-500" : "text-slate-600")} />
+              <Star className={cn("block transition-colors duration-150", lg ? "h-9 w-9" : "h-4 w-4", n <= shown ? "fill-amber-300 text-amber-300" : lg ? "text-slate-500" : "text-slate-600")} />
             </button>
           ))}
         </div>
-        <span className={cn("text-slate-500", lg && "min-w-[5.5rem] text-base text-slate-300")}>{shown > 0 ? RATING_WORDS[shown] : lg ? "Tap a star" : null}</span>
+        {/* Always rendered at a fixed width so the hover word appearing never re-wraps the row (which made the stars jump). */}
+        <span aria-hidden className={cn("inline-block whitespace-nowrap text-slate-500", lg ? "w-[6rem] text-base text-slate-300" : "w-[4.5rem]")}>
+          {shown > 0 ? RATING_WORDS[shown] : lg ? "Tap a star" : " "}
+        </span>
       </div>
       {rating > 0 && (
         <div className={cn("mt-2 flex flex-col gap-2 sm:flex-row sm:items-start", lg && "mx-auto mt-4 max-w-2xl")}>

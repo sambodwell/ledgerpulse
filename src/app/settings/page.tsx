@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ArrowLeft, Briefcase, Check, CheckCircle2, CreditCard, Home, Loader2, Pencil, ShieldCheck, Trash2, X } from "lucide-react";
 import {
   BUSINESS_TYPES,
@@ -13,7 +14,7 @@ import {
   type PlanCategory,
   type WorkspaceProfile,
 } from "@/lib/schemas";
-import { authHeaders, createWorkspace, updatePlanCategory, updateWorkspace } from "@/lib/supabase";
+import { authHeaders, updatePlanCategory, updateWorkspace } from "@/lib/supabase";
 import { useApp } from "@/components/AppProvider";
 import { ProfileMenu, TierBadge } from "@/components/ProfileMenu";
 import { PlanCard } from "@/components/PlanCard";
@@ -229,7 +230,8 @@ function SubscriptionCard() {
 }
 
 function WorkspacesCard() {
-  const { workspaces, activeWorkspace, refreshWorkspaces, setActiveWorkspaceId, removeWorkspace } = useApp();
+  const { workspaces, activeWorkspace, refreshWorkspaces, setActiveWorkspaceId, removeWorkspace, createFreshWorkspace } = useApp();
+  const router = useRouter();
   const [name, setName] = useState("");
   const [type, setType] = useState<BusinessType>("REAL_ESTATE");
   const [busy, setBusy] = useState(false);
@@ -240,10 +242,10 @@ function WorkspacesCard() {
     setBusy(true);
     setError(null);
     try {
-      const ws = await createWorkspace({ name, businessType: type });
-      await refreshWorkspaces();
-      if (!activeWorkspace) setActiveWorkspaceId(ws.id);
+      // A new workspace opens straight onto the dashboard's upload / guided input, starting from a clean slate.
+      await createFreshWorkspace({ name, businessType: type });
       setName("");
+      router.push("/dashboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Couldn't create workspace.");
     } finally {
@@ -356,7 +358,7 @@ function WorkspaceRow({
             <Pencil className="h-4 w-4" />
           </button>
           <button
-            onClick={() => window.confirm(`Permanently delete "${ws.name}"? Its Fiscal Year Tracker (monthly actuals, goals, savings) and saved scenarios are deleted too. This can't be undone.`) && run(onDelete)}
+            onClick={() => window.confirm(`Permanently delete "${ws.name}"? Its documents, report, Fiscal Year Tracker (monthly actuals, goals, savings) and saved scenarios are deleted too. This can't be undone.`) && run(onDelete)}
             aria-label={`Delete ${ws.name}`}
             disabled={busy}
             className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-rose-300"
@@ -377,8 +379,8 @@ function PrivacyCard() {
         <ShieldCheck className="h-5 w-5 text-emerald-300" /> Data &amp; privacy
       </h2>
       <ul className="mt-3 space-y-2 text-sm text-slate-300">
-        <li>Uploaded statements are encrypted in transit, parsed in memory and discarded when the request finishes. They are never written to disk or our database.</li>
-        <li>Analysis results stay in your browser tab. We store only your account, plan, workspace names and any scenarios you choose to save.</li>
+        <li>Uploaded statement files are encrypted in transit, parsed in memory and discarded when the request finishes. The files themselves are never written to disk or our database.</li>
+        <li>Inside each saved workspace we keep what was parsed from your documents (name, statement month, reviewed line items and totals), the latest report, your tracker and any scenarios you save, so nothing disappears on reload. Deleting a workspace deletes all of it.</li>
         <li>Statement contents are sent to our AI provider to produce the analysis.</li>
       </ul>
     </section>

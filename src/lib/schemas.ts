@@ -406,7 +406,7 @@ export function evaluatePersonalBudget(monthlyIncome: number, expenses: Pick<Exp
       severity: leftover < 0 ? "HIGH" : "MEDIUM",
       message:
         leftover < 0
-          ? `Spending exceeds income by ${Math.round(-leftover).toLocaleString("en-US")} a month. Cover the gap before adding savings goals.`
+          ? `Spending exceeds income by $${(-leftover).toLocaleString("en-US", CENTS)} a month. Cover the gap before adding savings goals.`
           : `Savings plus unspent income is ${p(share(savings + leftover))} of income. Automate a transfer on payday to reach the 20% guideline.`,
       potentialSavings: 0,
       source: "BUDGET_RULE",
@@ -967,10 +967,10 @@ export function explainScenario(base: ScenarioBaseline, adjustments: ScenarioAdj
       const matched = a.type === "REVENUE_PCT" ? recurringRevenue.filter((r) => matches(a.match, r.label)) : recurringExpenses.filter((e) => matches(a.match, e.category, e.label));
       const matchedTotal = round2(sum(matched, (l) => l.amount));
       monthlyDelta = round2(matchedTotal * a.pct);
-      basis = `${a.pct >= 0 ? "+" : ""}${round2(a.pct * 100)}% of $${matchedTotal.toLocaleString("en-US")}/mo (${a.match ? `lines matching "${a.match}"` : `all recurring ${side} lines`})`;
+      basis = `${a.pct >= 0 ? "+" : ""}${round2(a.pct * 100)}% of $${matchedTotal.toLocaleString("en-US", CENTS)}/mo (${a.match ? `lines matching "${a.match}"` : `all recurring ${side} lines`})`;
     } else {
       monthlyDelta = round2(a.amount);
-      basis = `${a.amount >= 0 ? "Adds" : "Removes"} $${Math.abs(monthlyDelta).toLocaleString("en-US")}/mo (${a.label})`;
+      basis = `${a.amount >= 0 ? "Adds" : "Removes"} $${Math.abs(monthlyDelta).toLocaleString("en-US", CENTS)}/mo (${a.label})`;
     }
     const netEffect = round2((side === "revenue" ? monthlyDelta : -monthlyDelta) * activeMonths);
     return { description: a.description, side, monthlyDelta, startMonth, activeMonths, netEffect, basis };
@@ -1009,7 +1009,7 @@ export function scenarioShortLabel(plan: Pick<ScenarioPlan, "adjustments" | "pro
   const size =
     "pct" in a
       ? `${a.pct >= 0 ? "+" : ""}${round2(a.pct * 100)}% ${a.match ? a.match.slice(0, 14) : side}`
-      : `${a.amount >= 0 ? "+" : "−"}$${Math.abs(Math.round(a.amount)).toLocaleString("en-US")} ${side}`;
+      : `${a.amount >= 0 ? "+" : "−"}$${Math.abs(a.amount).toLocaleString("en-US", CENTS)} ${side}`;
   const when = clampMonth(a.startMonth) > 1 ? ` · M${clampMonth(a.startMonth)}` : "";
   const more = plan.adjustments.length > 1 ? ` +${plan.adjustments.length - 1}` : "";
   return `${size}${when}${more}`;
@@ -1189,6 +1189,9 @@ export function isFinancialAnalysis(value: unknown): value is FinancialAnalysis 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** toLocaleString options for exact dollars and cents. */
+const CENTS = { minimumFractionDigits: 2, maximumFractionDigits: 2 } as const;
 
 export function round2(n: number): number {
   return Math.round(n * 100) / 100;

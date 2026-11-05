@@ -10,11 +10,15 @@
 import { createClient, type Session, type SupabaseClient, type User } from "@supabase/supabase-js";
 import { clearAllDrafts } from "@/lib/formDraft";
 import {
+  isAnalysisResponse,
   isBusinessType,
+  isExtractedLineItems,
   isScenarioAdjustment,
   modeOf,
   PLAN_CATEGORIES,
+  type AnalysisResponse,
   type BusinessType,
+  type ExtractedLineItems,
   type PlanCategory,
   type SavedScenario,
   type ScenarioAdjustment,
@@ -351,5 +355,164 @@ export async function submitFeedback(input: { rating: number; comment: string; c
     rating,
     comment: comment || null,
   });
+  if (error) throw new Error(error.message);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace documents (parsed statements: name, month, reviewed line items, totals — never the file itself)
+// ---------------------------------------------------------------------------
+
+export type WorkspaceDocumentKind = "statement" | "pasted" | "form";
+
+export interface WorkspaceDocumentTotals {
+  revenue: number;
+  expenses: number;
+  oneTimeExpenses?: number;
+}
+
+export interface WorkspaceDocument {
+  id: string;
+  workspaceId: string;
+  name: string;
+  fileName: string | null;
+  fileSize: number | null;
+  contentHash: string | null;
+  kind: WorkspaceDocumentKind;
+  /** "YYYY-MM" the statement covers, or null. */
+  period: string | null;
+  items: ExtractedLineItems | null;
+  totals: WorkspaceDocumentTotals;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface DocumentRow {
+  id: string;
+  workspace_id: string;
+  name: string;
+  file_name: string | null;
+  file_size: number | null;
+  content_hash: string | null;
+  kind: string;
+  period: string | null;
+  items: unknown;
+  totals: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+const DOCUMENT_COLUMNS = "id,workspace_id,name,file_name,file_size,content_hash,kind,period,items,totals,created_at,updated_at";
+const finiteOr0 = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+function toDocument(r: DocumentRow): WorkspaceDocument {
+  const t = (r.totals ?? {}) as Record<string, unknown>;
+  const oneTime = finiteOr0(t.oneTimeExpenses);
+  return {
+    id: r.id,
+    workspaceId: r.workspace_id,
+    name: r.name,
+    fileName: r.file_name,
+    fileSize: r.file_size,
+    contentHash: r.content_hash,
+    kind: r.kind === "pasted" || r.kind === "form" ? r.kind : "statement",
+    period: r.period && /^\d{4}-\d{2}$/.test(r.period) ? r.period : null,
+    items: isExtractedLineItems(r.items) ? r.items : null,
+    totals: { revenue: finiteOr0(t.revenue), expenses: finiteOr0(t.expenses), ...(oneTime > 0 ? { oneTimeExpenses: oneTime } : {}) },
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+export async function listDocuments(workspaceId: string): Promise<WorkspaceDocument[]> {
+  const { data, error } = await requireClient()
+    .from("workspace_documents")
+    .select(DOCUMENT_COLUMNS)
+    .eq("workspace_id", workspaceId)
+    .order("created_at", { ascending: false })
+    .limit(500);
+  if (error) throw new Error(error.message);
+  return (data as DocumentRow[]).map(toDocument);
+}
+
+export interface NewWorkspaceDocument {
+  name: string;
+  fileName?: string | null;
+  fileSize?: number | null;
+  contentHash?: string | null;
+  kind: WorkspaceDocumentKind;
+  period: string | null;
+  items: ExtractedLineItems;
+  totals: WorkspaceDocumentTotals;
+}
+
+/** Saves parsed documents to a workspace. A file already saved there (same content hash) is updated, not duplicated. */
+export async function saveDocuments(workspaceId: string, docs: NewWorkspaceDocument[]): Promise<WorkspaceDocument[]> {
+  if (!docs.length) return [];
+  const c = requireClient();
+  const { data: u } = await c.auth.getUser();
+  if (!u.user) throw new Error("Sign in to save documents.");
+  const rows = docs.map((d) => ({
+    user_id: u.user!.id,
+    workspace_id: workspaceId,
+    name: d.name.trim().slice(0, 160) || "Statement",
+    file_name: d.fileName ? d.fileName.slice(0, 255) : null,
+    file_size: d.fileSize ?? null,
+    content_hash: d.contentHash ?? null,
+    kind: d.kind,
+    period: d.period,
+    items: d.items,
+    totals: d.totals,
+  }));
+  const hashed = rows.filter((r) => r.content_hash);
+  const plain = rows.filter((r) => !r.content_hash);
+  const out: WorkspaceDocument[] = [];
+  if (hashed.length) {
+    const { data, error } = await c.from("workspace_documents").upsert(hashed, { onConflict: "workspace_id,content_hash" }).select(DOCUMENT_COLUMNS);
+    if (error) throw new Error(error.message);
+    out.push(...(data as DocumentRow[]).map(toDocument));
+  }
+  if (plain.length) {
+    const { data, error } = await c.from("workspace_documents").insert(plain).select(DOCUMENT_COLUMNS);
+    if (error) throw new Error(error.message);
+    out.push(...(data as DocumentRow[]).map(toDocument));
+  }
+  return out;
+}
+
+export async function updateDocument(id: string, patch: { name?: string; period?: string | null }) {
+  const row: Record<string, string | null> = {};
+  if (patch.name !== undefined) {
+    const name = patch.name.trim().slice(0, 160);
+    if (!name) throw new Error("Give the document a name.");
+    row.name = name;
+  }
+  if (patch.period !== undefined) {
+    if (patch.period !== null && !/^\d{4}-\d{2}$/.test(patch.period)) throw new Error("Pick a valid month.");
+    row.period = patch.period;
+  }
+  const { error } = await requireClient().from("workspace_documents").update(row).eq("id", id);
+  if (error) throw new Error(error.message);
+}
+
+export async function deleteDocument(id: string) {
+  const { error } = await requireClient().from("workspace_documents").delete().eq("id", id);
+  if (error) throw new Error(error.message);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace report (the latest analysis per workspace, so it survives reloads and deploys)
+// ---------------------------------------------------------------------------
+
+export async function loadWorkspaceReport(workspaceId: string): Promise<AnalysisResponse | null> {
+  const { data, error } = await requireClient().from("workspace_reports").select("report").eq("workspace_id", workspaceId).maybeSingle<{ report: unknown }>();
+  if (error) throw new Error(error.message);
+  return data && isAnalysisResponse(data.report) ? data.report : null;
+}
+
+export async function saveWorkspaceReport(workspaceId: string, report: AnalysisResponse): Promise<void> {
+  const c = requireClient();
+  const { data: u } = await c.auth.getUser();
+  if (!u.user) throw new Error("Sign in to save reports.");
+  const { error } = await c.from("workspace_reports").upsert({ workspace_id: workspaceId, user_id: u.user.id, report }, { onConflict: "workspace_id" });
   if (error) throw new Error(error.message);
 }

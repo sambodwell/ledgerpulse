@@ -572,7 +572,8 @@ const LINE_ITEMS_SCHEMA = {
 } as const;
 
 const EXTRACT_INSTRUCTIONS = `Extract only the line items; the owner will review and edit them before the audit runs.
-Mark a line "oneTime": true only when it is clearly non-recurring (a single late fee, a one-off purchase, a tax refund); give its full amount rather than a monthly average. Everything else is recurring ("oneTime": false) with an average MONTHLY amount.`;
+Mark a line "oneTime": true only when it is clearly non-recurring (a single late fee, a one-off purchase, a tax refund); give its full amount rather than a monthly average. Everything else is recurring ("oneTime": false) with an average MONTHLY amount.
+Never turn balances into lines: opening, closing, available, ledger and running balances are not transactions. The owner may upload several statements together (e.g. checking plus a credit card), so payments to the owner's own credit card, loan-to-self and transfers between the owner's own accounts are not expenses or revenue (the individual card purchases are the expenses). Amounts must be exact to the cent.`;
 
 async function handleExtract(document: DocumentInput) {
   const raw = await callStructured<{ businessType?: unknown; statementMonth?: unknown; itemizedRevenue?: unknown; itemizedExpenses?: unknown }>({
