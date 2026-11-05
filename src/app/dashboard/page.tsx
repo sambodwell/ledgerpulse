@@ -130,6 +130,8 @@ import { RunwayCard, breakEvenSentence, runwayFigures, runwaySentence } from "@/
 import { BenchmarkGauges, benchmarksReportHtml } from "@/components/dashboard/BenchmarkGauges";
 import { VendorCreepAlerts, useVendorCreep } from "@/components/dashboard/VendorCreepAlerts";
 import { useWorkspacePref } from "@/components/dashboard/useWorkspacePref";
+import { GranularityToggle, PaceStrip } from "@/components/dashboard/GranularityToggle";
+import { GRANULARITY_LABELS, GRANULARITY_UNIT, isGranularity, labelToKey, paceOf, toPeriods, type Granularity } from "@/lib/granularity";
 import { defaultBenchmarkProfile, evaluateBenchmarks, isBenchmarkProfile, type BenchmarkProfile } from "@/lib/benchmarks";
 import { creepHeadline, type VendorCreep } from "@/lib/vendorCreep";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
@@ -943,6 +945,8 @@ export default function DashboardPage() {
     const o = v as { amount?: unknown; period?: unknown } | null;
     return o && typeof o.amount === "number" && Number.isFinite(o.amount) ? { amount: o.amount, period: typeof o.period === "string" ? o.period : null } : null;
   });
+  /** Monthly / Weekly / Daily increment shared by the Overview cash-flow chart and the Forecast projection (per workspace, this device). */
+  const [granularity, setGranularity] = useWorkspacePref<Granularity>(userId ? `lp:granularity:${userId}:${wsKey}` : null, "MONTHLY", (v) => (isGranularity(v) ? v : null));
   /** Benchmark peer group (defaults from the business type; households always use the 50/30/20 profile). */
   const [storedBenchmark, setBenchmarkProfile] = useWorkspacePref<BenchmarkProfile | null>(userId ? `lp:benchmark:${userId}:${wsKey}` : null, null, (v) => (isBenchmarkProfile(v) && v !== "HOUSEHOLD" ? v : null));
   const benchmarkProfile: BenchmarkProfile =
@@ -1290,6 +1294,8 @@ export default function DashboardPage() {
                         revenueLabel={copy.revenue}
                         expensesLabel={copy.expenses}
                         onOpenForecast={() => openTab("forecast", "results-panel-forecast")}
+                        granularity={granularity}
+                        onGranularityChange={setGranularity}
                       />
                     </PanelBoundary>
                   )}
@@ -1348,6 +1354,8 @@ export default function DashboardPage() {
                     basisChoice={basisChoice}
                     onBasisChange={setBasisChoice}
                     actualsAgg={actualsAgg}
+                    granularity={granularity}
+                    onGranularityChange={setGranularity}
                   />
                 )}
               </PanelBoundary>
@@ -4102,6 +4110,8 @@ function ProjectionCharts({
   basisChoice,
   onBasisChange,
   actualsAgg,
+  granularity = "MONTHLY",
+  onGranularityChange,
 }: {
   analysis: FinancialAnalysis;
   settings: ForecastSettings;
@@ -4115,13 +4125,46 @@ function ProjectionCharts({
   basisChoice: ProjectionBasis;
   onBasisChange: (b: ProjectionBasis) => void;
   actualsAgg: ActualsAggregate | null;
+  /** Time increment the chart, table and summary are bucketed into. */
+  granularity?: Granularity;
+  onGranularityChange?: (g: Granularity) => void;
 }) {
-  const { rows } = useDerived(analysis);
+  const { rows: monthRows } = useDerived(analysis);
   const [showTable, setShowTable] = useState(false);
   const copy = MODE_COPY[modeOf(analysis.businessType)];
   const months = settings.months;
   const long = months > 12;
   const gradId = useId().replace(/[^a-zA-Z0-9]/g, "");
+
+  // Re-bucket the monthly projection into weeks / days (each month paced evenly over its calendar days). Falls back
+  // to months if a projection label can't be read as a calendar month.
+  const periods = useMemo(() => {
+    const keys = monthRows.map((r) => labelToKey(r.month));
+    const usable = keys.every((k): k is string => !!k);
+    const g: Granularity = usable ? granularity : "MONTHLY";
+    if (g === "MONTHLY") return { g, rows: monthRows.map((r) => ({ ...r, tick: monthTick(long)(r.month), days: 0 })) };
+    const out = toPeriods(
+      monthRows.map((r, i) => ({ key: keys[i]!, revenue: r.projectedRevenue, expenses: r.projectedExpenses, projected: true })),
+      g,
+    ).map((p) => ({ month: p.label, tick: long ? `${p.tick} '${p.label.slice(-2)}` : p.tick, days: p.days, projectedRevenue: p.revenue, projectedExpenses: p.expenses, net: p.net, cumulative: p.cumulative }));
+    return { g, rows: out };
+  }, [monthRows, granularity, long]);
+  const rows = periods.rows;
+  const granular = periods.g !== "MONTHLY";
+  const unit = GRANULARITY_UNIT[periods.g];
+  const Unit = unit[0].toUpperCase() + unit.slice(1);
+  const ticks = useMemo(() => new Map(rows.map((r) => [r.month, r.tick])), [rows]);
+  const tickOf = (m: string) => ticks.get(m) ?? m;
+  const pace = useMemo(
+    () =>
+      granular
+        ? paceOf(
+            rows.map((r) => ({ label: r.month, tick: r.tick, days: r.days, revenue: r.projectedRevenue, expenses: r.projectedExpenses, net: r.net, cumulative: r.cumulative, projected: true })),
+            periods.g,
+          )
+        : null,
+    [rows, granular, periods.g],
+  );
 
   // Profit band (revenue above expenses) and loss band (expenses above revenue) as [low, high] ranges, so the gap
   // between the two lines is shaded green or red. Both stay continuous (zero height where they don't apply).
@@ -4149,10 +4192,12 @@ function ProjectionCharts({
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-start">
         <div className="min-w-0">
           <h2 className="flex items-center gap-2 text-lg font-semibold">
-            {months}-Month Projection
+            {months}-Month Projection{granular && <span className="font-normal text-slate-400"> · {GRANULARITY_LABELS[periods.g].toLowerCase()}</span>}
             <InfoTip label="How the projection works" align="left">
               Each month repeats your recurring line items; one-time items land in month 1 and partial lines are pro-rated there. %-of-revenue expenses move with their
               revenue line. With two or more logged months, the projection uses their average (switch below). Seasonality and inflation are off unless you switch them on.
+              Weekly and Daily views spread each projected month evenly over its calendar days — weeks are 7-day blocks from the first projected day, and the last
+              one can be shorter.
             </InfoTip>
           </h2>
           <p className="text-sm text-slate-400">
@@ -4167,20 +4212,35 @@ function ProjectionCharts({
 
         {/* Top-center summary: the projection at a glance. */}
         <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-2 xl:grid-cols-4" aria-label="Projection summary">
-          <SummaryStat label={avgNet >= 0 ? "Avg monthly profit" : "Avg monthly loss"} value={signedUsd(avgNet)} tone={avgNet >= 0 ? "good" : "bad"} />
-          <SummaryStat label={`${months}-mo total net`} value={signedUsd(totalNet)} tone={totalNet >= 0 ? "good" : "bad"} />
-          <SummaryStat label="Profitable months" value={`${profitable} of ${rows.length}`} tone={profitable === rows.length ? "good" : profitable === 0 ? "bad" : undefined} />
           <SummaryStat
-            label={spread ? "Best / worst month" : "Monthly net"}
-            value={best ? (spread && worst ? `${monthTick(long)(best.month)} / ${monthTick(long)(worst.month)}` : signedUsd(best.net)) : "—"}
+            label={`Avg ${unit === "day" ? "daily" : `${unit}ly`} ${(pace?.net ?? avgNet) >= 0 ? "profit" : "loss"}`}
+            value={signedUsd(pace?.net ?? avgNet)}
+            tone={(pace?.net ?? avgNet) >= 0 ? "good" : "bad"}
+            title={granular ? `Per full ${unit}, weighted by calendar days` : undefined}
+          />
+          <SummaryStat label={`${months}-mo total net`} value={signedUsd(totalNet)} tone={totalNet >= 0 ? "good" : "bad"} />
+          <SummaryStat label={`Profitable ${unit}s`} value={`${profitable} of ${rows.length}`} tone={profitable === rows.length ? "good" : profitable === 0 ? "bad" : undefined} />
+          <SummaryStat
+            label={spread ? `Best / worst ${unit}` : `${Unit} net`}
+            value={best ? (spread && worst ? `${tickOf(best.month)} / ${tickOf(worst.month)}` : signedUsd(best.net)) : "—"}
             title={best && worst ? `Best: ${best.month} ${signedUsd(best.net)} · Worst: ${worst.month} ${signedUsd(worst.net)}` : undefined}
           />
         </dl>
 
-        <button onClick={() => setShowTable((s) => !s)} className="justify-self-start rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5 lg:justify-self-end">
-          {showTable ? "Show chart" : "Show table"}
-        </button>
+        <div className="flex flex-wrap items-center gap-2 justify-self-start lg:flex-col lg:items-end lg:justify-self-end">
+          {onGranularityChange && <GranularityToggle value={granularity} onChange={onGranularityChange} />}
+          <button onClick={() => setShowTable((s) => !s)} className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5">
+            {showTable ? "Show chart" : "Show table"}
+          </button>
+        </div>
       </div>
+
+      {pace && (
+        <div className="mt-4">
+          <p className="mb-1 text-[11px] uppercase tracking-wide text-slate-500">Average pace per {unit} over the projection</p>
+          <PaceStrip pace={pace} granularity={periods.g} revenueLabel={copy.revenue} />
+        </div>
+      )}
 
       {/* Projection basis: the latest report vs every logged month. */}
       <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 text-xs">
@@ -4228,20 +4288,29 @@ function ProjectionCharts({
           <table className="w-full text-sm tabular-nums">
             <thead className="sticky top-0 z-20 bg-slate-900 text-left text-xs uppercase text-slate-400 shadow-[0_1px_0_rgba(255,255,255,0.08)]">
               <tr>
-                <th className="py-2 font-medium">Month</th>
+                <th className="py-2 font-medium">{Unit}</th>
                 <th className="py-2 text-right font-medium">{copy.revenue}</th>
                 <th className="py-2 text-right font-medium">{copy.expenses}</th>
                 <th className="py-2 text-right font-medium">Net</th>
+                {granular && (
+                  <th className="py-2 text-right font-medium" title={`Extra ${copy.revenue.toLowerCase()} needed that ${unit} to cover its costs`}>
+                    To break even
+                  </th>
+                )}
                 <th className="py-2 text-right font-medium">Cumulative</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-white/5">
               {rows.map((r) => (
                 <tr key={r.month}>
-                  <td className="py-2 text-slate-300">{r.month}</td>
+                  <td className="py-2 text-slate-300">
+                    {r.month}
+                    {periods.g === "WEEKLY" && r.days < 7 && <span className="text-xs text-slate-500"> ({r.days} days)</span>}
+                  </td>
                   <td className="py-2 text-right">{usd.format(r.projectedRevenue)}</td>
                   <td className="py-2 text-right">{usd.format(r.projectedExpenses)}</td>
                   <td className={cn("py-2 text-right", r.net < 0 ? "text-rose-300" : "text-emerald-300")}>{usd.format(r.net)}</td>
+                  {granular && <td className={cn("py-2 text-right", r.net < 0 ? "text-rose-300" : "text-slate-500")}>{r.net < 0 ? usd.format(-r.net) : "—"}</td>}
                   <td className={cn("py-2 text-right", r.cumulative < 0 && "text-rose-300")}>{usd.format(r.cumulative)}</td>
                 </tr>
               ))}
@@ -4254,7 +4323,7 @@ function ProjectionCharts({
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={chartRows} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
                 <CartesianGrid stroke={CHART.grid} vertical={false} />
-                <XAxis dataKey="month" {...axisProps} tickFormatter={monthTick(long)} minTickGap={16} />
+                <XAxis dataKey="month" {...axisProps} tickFormatter={tickOf} minTickGap={16} />
                 <YAxis {...axisProps} width={72} domain={lineDomain} tickCount={6} tickFormatter={(v: number) => usdCompact.format(v)} />
                 <Tooltip content={<ProjectionTooltip revenueLabel={copy.revenue} expensesLabel={copy.expenses} />} cursor={{ stroke: CHART.cursor }} />
                 <Legend iconType="plainline" wrapperStyle={{ fontSize: 12, color: CHART.legend }} />
@@ -4266,7 +4335,8 @@ function ProjectionCharts({
             </ResponsiveContainer>
           </div>
           <p className="mt-1 text-[11px] text-slate-500">
-            Shaded gap = monthly profit (green: {copy.revenue.toLowerCase()} above {copy.expenses.toLowerCase()}) or loss (red). The axis scales to your numbers, so it may not start at $0.
+            Shaded gap = {unit === "day" ? "daily" : `${unit}ly`} profit (green: {copy.revenue.toLowerCase()} above {copy.expenses.toLowerCase()}) or loss (red). The axis scales to your numbers, so it may not start at $0.
+            {granular && " Each month's total is spread evenly over its calendar days."}
           </p>
 
           <h3 className="mt-6 text-sm font-medium text-slate-300">Cumulative cash flow</h3>
