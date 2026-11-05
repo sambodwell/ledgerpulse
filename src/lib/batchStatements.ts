@@ -4,6 +4,8 @@
  *
  * Rules:
  *  - The same file selected twice (same SHA-256) is only read once (handled by the uploader).
+ *  - A multi-month document (H1, quarterly, annual report) arrives already split into one statement per calendar
+ *    month it lists, so a single file seeds several months.
  *  - Statements are grouped by the month they cover. Within a month, statements are added together (e.g. a checking
  *    account + a credit card), but a line that appears identically in two different statements for that month
  *    (same label, category, amount and recurrence) is counted once — that's an overlapping or re-exported statement.
@@ -14,7 +16,8 @@
  */
 
 import { statementTotals, sumMoney, type MonthActual } from "@/lib/fiscal";
-import { round2, type BusinessType, type ExpenseLine, type ExtractedLineItems, type RevenueLine } from "@/lib/schemas";
+import { isExtractedLineItems, round2, type BusinessType, type ExpenseLine, type ExtractedLineItems, type RevenueLine } from "@/lib/schemas";
+import { isStatementPeriod, type StatementPeriod } from "@/lib/statementPeriod";
 
 export interface ParsedStatement {
   /** Local id for this batch. */
@@ -29,6 +32,29 @@ export interface ParsedStatement {
   detected: string;
   /** Month the owner assigned ("" = unassigned). */
   month: string;
+  /**
+   * Set when this statement is one month of a multi-month document (an H1 / quarterly / annual report): the id
+   * shared by every month read from that one file, and the file's display name. One file → one saved document.
+   */
+  source?: { id: string; name: string };
+}
+
+/** What `/api/analyze` mode "extract" returns, validated. */
+export interface ExtractResult {
+  items: ExtractedLineItems;
+  period: StatementPeriod | null;
+  /** Two or more calendar months when the document spans several (oldest first); otherwise empty. */
+  months: { period: StatementPeriod; items: ExtractedLineItems }[];
+}
+
+export function parseExtractResponse(data: unknown): ExtractResult | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as { items?: unknown; period?: unknown; months?: unknown };
+  if (!isExtractedLineItems(d.items)) return null;
+  const months = Array.isArray(d.months)
+    ? d.months.filter((m): m is ExtractResult["months"][number] => !!m && typeof m === "object" && isStatementPeriod((m as { period?: unknown }).period) && isExtractedLineItems((m as { items?: unknown }).items))
+    : [];
+  return { items: d.items, period: isStatementPeriod(d.period) ? d.period : null, months: months.length >= 2 ? months : [] };
 }
 
 export interface BatchMonth {

@@ -18,8 +18,10 @@ import {
   PLAN_CATEGORIES,
   type AnalysisResponse,
   type BusinessType,
+  type ExpenseLine,
   type ExtractedLineItems,
   type PlanCategory,
+  type RevenueLine,
   type SavedScenario,
   type ScenarioAdjustment,
   type UserProfile,
@@ -370,6 +372,14 @@ export interface WorkspaceDocumentTotals {
   oneTimeExpenses?: number;
 }
 
+/** One calendar month inside a multi-month document (an H1 / quarterly / annual report): that month's actual lines. */
+export interface DocumentMonthSlice {
+  /** "YYYY-MM" */
+  period: string;
+  revenue: RevenueLine[];
+  expenses: ExpenseLine[];
+}
+
 export interface WorkspaceDocument {
   id: string;
   workspaceId: string;
@@ -378,9 +388,11 @@ export interface WorkspaceDocument {
   fileSize: number | null;
   contentHash: string | null;
   kind: WorkspaceDocumentKind;
-  /** "YYYY-MM" the statement covers, or null. */
+  /** "YYYY-MM" the statement covers, or null (unknown, or a multi-month document — see `months`). */
   period: string | null;
   items: ExtractedLineItems | null;
+  /** Per-month breakdown of a multi-month document (oldest first); empty for a single-month statement. */
+  months: DocumentMonthSlice[];
   totals: WorkspaceDocumentTotals;
   createdAt: string;
   updatedAt: string;
@@ -403,6 +415,33 @@ interface DocumentRow {
 
 const DOCUMENT_COLUMNS = "id,workspace_id,name,file_name,file_size,content_hash,kind,period,items,totals,created_at,updated_at";
 const finiteOr0 = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const PERIOD_RE = /^\d{4}-\d{2}$/;
+
+/** The month breakdown is kept inside the `items` jsonb (`items.months`), so older rows simply have none. */
+function monthsFromItems(items: unknown): DocumentMonthSlice[] {
+  const raw = items && typeof items === "object" ? (items as { months?: unknown }).months : null;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((m): m is DocumentMonthSlice => !!m && typeof m === "object" && typeof m.period === "string" && PERIOD_RE.test(m.period) && Array.isArray(m.revenue) && Array.isArray(m.expenses))
+    .map((m) => ({ period: m.period, revenue: m.revenue, expenses: m.expenses }))
+    .sort((a, b) => a.period.localeCompare(b.period));
+}
+
+/**
+ * The months a document covers, each with its own line items: one slice per month for a multi-month report, one
+ * slice for a statement with a month, none for a document without one.
+ */
+export function documentSlices(d: WorkspaceDocument): { period: string; items: ExtractedLineItems }[] {
+  const bt = d.items?.businessType ?? "OTHER_CUSTOM";
+  if (d.months.length) return d.months.map((m) => ({ period: m.period, items: { businessType: bt, revenue: m.revenue, expenses: m.expenses } }));
+  return d.period && d.items ? [{ period: d.period, items: d.items }] : [];
+}
+
+/** First and last month a document covers ("YYYY-MM"), or null when it has no month. */
+export function documentRange(d: WorkspaceDocument): { from: string; to: string; months: number } | null {
+  const periods = d.months.length ? d.months.map((m) => m.period) : d.period ? [d.period] : [];
+  return periods.length ? { from: periods[0], to: periods[periods.length - 1], months: periods.length } : null;
+}
 
 function toDocument(r: DocumentRow): WorkspaceDocument {
   const t = (r.totals ?? {}) as Record<string, unknown>;
@@ -415,8 +454,9 @@ function toDocument(r: DocumentRow): WorkspaceDocument {
     fileSize: r.file_size,
     contentHash: r.content_hash,
     kind: r.kind === "pasted" || r.kind === "form" ? r.kind : "statement",
-    period: r.period && /^\d{4}-\d{2}$/.test(r.period) ? r.period : null,
-    items: isExtractedLineItems(r.items) ? r.items : null,
+    period: r.period && PERIOD_RE.test(r.period) ? r.period : null,
+    items: isExtractedLineItems(r.items) ? { businessType: r.items.businessType, revenue: r.items.revenue, expenses: r.items.expenses } : null,
+    months: monthsFromItems(r.items),
     totals: { revenue: finiteOr0(t.revenue), expenses: finiteOr0(t.expenses), ...(oneTime > 0 ? { oneTimeExpenses: oneTime } : {}) },
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -442,6 +482,8 @@ export interface NewWorkspaceDocument {
   kind: WorkspaceDocumentKind;
   period: string | null;
   items: ExtractedLineItems;
+  /** Multi-month documents: each month's own lines (saved alongside the items). */
+  months?: DocumentMonthSlice[];
   totals: WorkspaceDocumentTotals;
 }
 
@@ -459,8 +501,9 @@ export async function saveDocuments(workspaceId: string, docs: NewWorkspaceDocum
     file_size: d.fileSize ?? null,
     content_hash: d.contentHash ?? null,
     kind: d.kind,
-    period: d.period,
-    items: d.items,
+    // A multi-month document has no single month; its months live in items.months.
+    period: d.months && d.months.length > 1 ? null : d.period,
+    items: d.months && d.months.length > 1 ? { ...d.items, months: d.months } : d.items,
     totals: d.totals,
   }));
   const hashed = rows.filter((r) => r.content_hash);

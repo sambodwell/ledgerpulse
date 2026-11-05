@@ -3,7 +3,8 @@
 import { useRef, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, FileSearch, Loader2, PiggyBank, Plus, Repeat1, RotateCw, Trash2, Upload, X } from "lucide-react";
-import { MONTH_NAMES, isExtractedLineItems, monthKey, splitTotals, type FinancialAnalysis } from "@/lib/schemas";
+import { MONTH_NAMES, monthKey, splitTotals, type FinancialAnalysis } from "@/lib/schemas";
+import { parseExtractResponse } from "@/lib/batchStatements";
 import {
   currentFiscalYearStart,
   exactMoney,
@@ -18,7 +19,7 @@ import {
   type GoalPace,
   type MonthActual,
 } from "@/lib/fiscal";
-import { isStatementPeriod, periodLabel, type StatementPeriod } from "@/lib/statementPeriod";
+import { periodLabel, type StatementPeriod } from "@/lib/statementPeriod";
 import { StatementMonthPicker } from "@/components/dashboard/StatementMonth";
 import { SeasonalityControls } from "@/components/dashboard/SeasonalityControls";
 import { authHeaders } from "@/lib/supabase";
@@ -103,10 +104,18 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
       fd.append("mode", "extract");
       const res = await fetch("/api/analyze", { method: "POST", body: fd, headers: await authHeaders() });
       if (!res.ok) throw new Error(await errorMessage(res));
-      const data = (await res.json()) as { items?: unknown; period?: unknown };
-      if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response.");
+      const data = parseExtractResponse(await res.json());
+      if (!data) throw new Error("Received an unexpected response.");
+      if (data.months.length >= 2) {
+        // A multi-month report: every calendar month in it is logged into its own month, whichever row was clicked.
+        update((s) => data.months.reduce((acc, m) => withLoggedActual(acc, m.period.key, statementTotals(m.items)), s));
+        const first = data.months[0].period.label;
+        const last = data.months[data.months.length - 1].period.label;
+        setImportNote({ text: `This document covers ${data.months.length} months (${first} – ${last}). Logged each month's own totals into its month.` });
+        return;
+      }
       const actual = statementTotals(data.items);
-      const period = isStatementPeriod(data.period) ? data.period : null;
+      const period = data.period;
       if (key === AUTO_IMPORT) {
         setPending({ period, month: period?.key ?? "", actual });
       } else if (period && period.key !== key) {

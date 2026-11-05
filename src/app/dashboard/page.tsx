@@ -51,7 +51,6 @@ import {
   effectiveInflationRate,
   isAnalysisResponse,
   isCpiReading,
-  isExtractedLineItems,
   isBusinessType,
   modeOf,
   monthKey,
@@ -80,6 +79,7 @@ import {
   authHeaders,
   createWorkspace,
   deleteDocument,
+  documentSlices,
   listDocuments,
   loadWorkspaceReport,
   saveDocuments,
@@ -92,8 +92,8 @@ import {
 } from "@/lib/supabase";
 import { exactMoney, normalizeTrackerState, statementTotals, withLoggedActual, type MonthActual } from "@/lib/fiscal";
 import { aggregateActuals, calibrateToActuals, resolveBasis, type ActualsAggregate, type ProjectionBasis } from "@/lib/projectionBasis";
-import { aggregateStatements, documentName, hashFile, type ParsedStatement } from "@/lib/batchStatements";
-import { isStatementPeriod, periodLabel, type StatementPeriod } from "@/lib/statementPeriod";
+import { aggregateStatements, documentName, hashFile, parseExtractResponse, type ParsedStatement } from "@/lib/batchStatements";
+import { periodLabel } from "@/lib/statementPeriod";
 import { StatementMonthPicker, statementMonthOptions } from "@/components/dashboard/StatementMonth";
 import { DocumentsHub } from "@/components/dashboard/DocumentsHub";
 import { AuditDeepDive } from "@/components/dashboard/AuditDeepDive";
@@ -222,6 +222,13 @@ export default function DashboardPage() {
   /** Last report written to / read from the database, per workspace, so unchanged reports aren't re-saved. */
   const reportSynced = useRef<Record<string, AnalysisResponse>>({});
   const [reportLoading, setReportLoading] = useState<string | null>(null);
+  /**
+   * Whether each workspace's saved report has been looked up: "ok" (loaded, or confirmed there is none) or "error".
+   * Until it is known the dashboard shows a loading state rather than guessing between the upload screen and the
+   * analysis tabs.
+   */
+  const [reportStatus, setReportStatus] = useState<Record<string, "ok" | "error">>({});
+  const markReport = useCallback((id: string, s: "ok" | "error") => setReportStatus((cur) => (cur[id] === s ? cur : { ...cur, [id]: s })), []);
   useEffect(() => {
     if (!userId || !activeWsId || reportFetched.current.has(activeWsId)) return;
     const id = activeWsId;
@@ -229,16 +236,18 @@ export default function DashboardPage() {
     setReportLoading(id);
     loadWorkspaceReport(id)
       .then((r) => {
+        markReport(id, "ok");
         if (!r) return;
         reportSynced.current[id] = r;
         setResults((cur) => (cur[id] ? cur : { ...cur, [id]: r }));
       })
       .catch((e) => {
         reportFetched.current.delete(id);
+        markReport(id, "error");
         console.warn("[report] load failed", e);
       })
       .finally(() => setReportLoading((cur) => (cur === id ? null : cur)));
-  }, [userId, activeWsId]);
+  }, [userId, activeWsId, markReport]);
   // Persist changed reports (new analysis, unlock, line-item edits), debounced.
   useEffect(() => {
     if (!userId) return;
@@ -290,15 +299,20 @@ export default function DashboardPage() {
     if (prevWsId.current === activeWsId) return;
     prevWsId.current = activeWsId;
     if (pickerSwitching.current) pickerSwitching.current = false;
-    else setUploaderEpoch((n) => n + 1);
+    else {
+      setUploaderEpoch((n) => n + 1);
+      // Another workspace: its own state decides where it lands (an "inputs open" choice made in the previous
+      // workspace must not carry over and park a workspace that has data on the upload screen).
+      setInputsOverride(null);
+      setResultsTab("overview");
+    }
   }, [activeWsId]);
 
   const [tab, setTab] = useState<InputTab>("form");
   /** Results command-center tab. */
   const [resultsTab, setResultsTab] = useState<ResultsTab>("overview");
-  /** null = automatic: inputs open until a report exists, then collapsed. */
+  /** null = automatic: see `inputsOpen` below. */
   const [inputsOverride, setInputsOverride] = useState<boolean | null>(null);
-  const inputsOpen = inputsOverride ?? !current;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [paywallBusy, setPaywallBusy] = useState<Paywall["busy"]>(null);
@@ -360,6 +374,18 @@ export default function DashboardPage() {
   /** Goal pace included in the executive PDF. */
   const goalReport: GoalReport | null = tracker.pace && tracker.status !== "loading" && !tracker.loadFailed ? { pace: tracker.pace, fyLabel: tracker.fyLabel } : null;
 
+  /*
+   * Where a workspace lands. A workspace with anything saved — a report, parsed documents, or logged actuals — opens
+   * straight on the analysis dashboard; only a workspace with nothing in it opens on the upload / onboarding inputs.
+   * While its report, documents and tracker are still loading, neither is shown (no flash of the upload screen).
+   */
+  const trackerHasActuals = tracker.status !== "loading" && !tracker.loadFailed && Object.keys(tracker.state.actuals).length > 0;
+  const docsKnown = !activeWsId || activeWsId in docsByWs || (!!docsState.error && docsState.loading === null);
+  const reportKnown = !activeWsId || !!current || !!reportStatus[activeWsId];
+  const hydrating = !!activeWsId && !current && (!reportKnown || !docsKnown || tracker.status === "loading");
+  const hasSavedData = !!current || workspaceDocs.length > 0 || (!!activeWsId && trackerHasActuals);
+  const inputsOpen = inputsOverride ?? (!hydrating && !hasSavedData);
+
   const { setUiHints, refreshProfile } = app;
   useEffect(
     () =>
@@ -416,7 +442,7 @@ export default function DashboardPage() {
 
   /** Runs the analysis and stores the result under `targetKey` (the workspace chosen in the picker). */
   const runAnalysis = useCallback(
-    async (init: RequestInit, targetKey: string): Promise<AnalysisResponse | null> => {
+    async (init: RequestInit, targetKey: string, opts: { quiet?: boolean } = {}): Promise<AnalysisResponse | null> => {
       setLoading(true);
       setError(null);
       setPaywallMsg(null);
@@ -426,10 +452,13 @@ export default function DashboardPage() {
         const data: unknown = await res.json();
         if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
         setResults((r) => ({ ...r, [targetKey]: data }));
-        // A fresh report opens on the Overview tab, with the inputs tucked away.
-        setResultsTab("overview");
         setInputsOverride(null);
-        requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+        // A fresh report opens on the Overview tab, with the inputs tucked away. A quiet (background) rebuild leaves
+        // the owner where they are.
+        if (!opts.quiet) {
+          setResultsTab("overview");
+          requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+        }
         return data;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Something went wrong.");
@@ -440,6 +469,35 @@ export default function DashboardPage() {
     },
     [post],
   );
+
+  /**
+   * A saved workspace with parsed documents but no saved report (e.g. the tab closed before the report finished
+   * saving) rebuilds its report from those documents once, in the background, so it still opens on the dashboard
+   * tabs. Only when the report lookup succeeded and found nothing — a failed lookup never triggers a rebuild.
+   */
+  const rebuildTried = useRef<Set<string>>(new Set());
+  const [rebuilding, setRebuilding] = useState<string | null>(null);
+  const rebuildFromDocuments = useCallback(
+    async (id: string) => {
+      const payload = payloadFromDocuments(docsByWs[id] ?? [], formDefaultType);
+      if (!payload) return false;
+      rebuildTried.current.add(id);
+      setRebuilding(id);
+      try {
+        return !!(await runAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, id, { quiet: true }));
+      } finally {
+        setRebuilding((cur) => (cur === id ? null : cur));
+      }
+    },
+    [docsByWs, formDefaultType, runAnalysis],
+  );
+  const canRebuild = !!activeWsId && !!payloadFromDocuments(workspaceDocs, formDefaultType);
+  useEffect(() => {
+    if (!activeWsId || current || loading || reportStatus[activeWsId] !== "ok" || !(activeWsId in docsByWs) || rebuildTried.current.has(activeWsId)) return;
+    if (!payloadFromDocuments(docsByWs[activeWsId], formDefaultType)) return;
+    const t = setTimeout(() => void rebuildFromDocuments(activeWsId), 0);
+    return () => clearTimeout(t);
+  }, [activeWsId, current, loading, reportStatus, docsByWs, formDefaultType, rebuildFromDocuments]);
 
   /**
    * Every new analysis first asks which project / business it belongs to (current workspace preselected), so
@@ -469,6 +527,7 @@ export default function DashboardPage() {
       key = target.workspace.id;
       // Brand-new workspace: it has no report yet, so nothing needs loading (and nothing is inherited).
       reportFetched.current.add(key);
+      markReport(key, "ok");
       docsFetched.current.add(key);
       setDocsByWs((cur) => ({ ...cur, [key]: [] }));
     } else if (target.kind === "existing") {
@@ -535,6 +594,7 @@ export default function DashboardPage() {
     if (!freshWorkspaceId || freshWorkspaceId !== activeWsId) return;
     clearFreshWorkspace();
     reportFetched.current.add(freshWorkspaceId);
+    markReport(freshWorkspaceId, "ok");
     docsFetched.current.add(freshWorkspaceId);
     setDocsByWs((cur) => ({ ...cur, [freshWorkspaceId]: [] }));
     setResults((r) => {
@@ -550,7 +610,7 @@ export default function DashboardPage() {
     setError(null);
     setLogNotice(null);
     requestAnimationFrame(() => document.getElementById("analysis-inputs")?.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" }));
-  }, [freshWorkspaceId, activeWsId, clearFreshWorkspace]);
+  }, [freshWorkspaceId, activeWsId, clearFreshWorkspace, markReport]);
 
   /** Logs a reviewed statement's totals into the Fiscal Year Tracker month; returns a confirmation line. */
   const logStatementMonth = (key: string, actual: MonthActual) => {
@@ -857,10 +917,16 @@ export default function DashboardPage() {
         </div>
 
         {/* Inputs collapse once a report exists, so the results tabs are one click away instead of a long scroll. */}
-        {current && (
+        {(current || (!hydrating && hasSavedData)) && (
           <div className={cn(glass, "mb-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3")}>
             <p className="text-sm text-slate-300">
-              {inputsOpen ? "Enter new numbers or upload another statement to refresh this report." : "Report ready. Run a new analysis any time — your goals and logged actuals are kept."}
+              {inputsOpen
+                ? current
+                  ? "Enter new numbers or upload another statement to refresh this report."
+                  : "Enter numbers or upload statements to add to this workspace."
+                : current
+                  ? "Report ready. Run a new analysis any time — your goals and logged actuals are kept."
+                  : "This workspace has saved data. Add statements or run a new analysis any time — your goals and logged actuals are kept."}
             </p>
             <button type="button" onClick={() => setInputsOverride(!inputsOpen)} aria-expanded={inputsOpen} aria-controls="analysis-inputs" className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
               {inputsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />} {inputsOpen ? "Hide inputs" : "New analysis / edit inputs"}
@@ -927,9 +993,9 @@ export default function DashboardPage() {
             Analyzing in memory — large statements can take a minute.
           </div>
         )}
-        {!current && reportLoading === activeWsId && activeWsId && (
+        {hydrating && (
           <div className={cn(glass, "mt-6 flex items-center gap-3 p-5 text-sm text-slate-300")} role="status">
-            <Loader2 className="h-4 w-4 animate-spin text-indigo-300" /> Loading this workspace&apos;s saved report…
+            <Loader2 className="h-4 w-4 animate-spin text-indigo-300" /> Loading this workspace&apos;s saved report, documents and actuals…
           </div>
         )}
         {logNotice && (
@@ -955,6 +1021,13 @@ export default function DashboardPage() {
           <div ref={resultsRef} className={cn("scroll-mt-6 space-y-6", inputsOpen ? "mt-10" : "mt-2")}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-xl font-semibold">Results{ws ? <span className="text-base font-normal text-slate-400"> · {ws.name}</span> : null}</h2>
+              <div className="flex flex-wrap items-center gap-2">
+              {ws && (
+                <button type="button" onClick={() => setDocsOpen(true)} className={cn(secondaryBtn, "text-slate-200")}>
+                  <FolderOpen className="h-4 w-4" /> My Documents
+                  {workspaceDocs.length > 0 && <span className="rounded-full bg-white/10 px-1.5 text-[11px] tabular-nums">{workspaceDocs.length}</span>}
+                </button>
+              )}
               {teaser ? (
                 <button onClick={() => paywall.checkout("report")} className={cn(secondaryBtn, "text-slate-300")} title="Unlock the full audit to download">
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
@@ -964,6 +1037,7 @@ export default function DashboardPage() {
                   <Download className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               )}
+              </div>
             </div>
 
             {showCallout && (
@@ -1076,7 +1150,38 @@ export default function DashboardPage() {
               className={cn(glass, "border-amber-300/20 bg-gradient-to-r from-amber-400/[0.06] via-transparent to-indigo-500/[0.06] px-6 py-6")}
             />
           </div>
-        ) : (
+        ) : !hydrating && hasSavedData && ws ? (
+          // Saved data but no report (yet): still the 4-tab dashboard. Fiscal Year & Actuals works from the logged
+          // months; the report tabs explain what's missing and rebuild it from the saved documents.
+          <div ref={resultsRef} className={cn("scroll-mt-6 space-y-6", inputsOpen ? "mt-10" : "mt-2")}>
+            <h2 className="text-xl font-semibold">
+              Results<span className="text-base font-normal text-slate-400"> · {ws.name}</span>
+            </h2>
+            <ResultsTabs value={resultsTab} onChange={setResultsTab} />
+            {(["overview", "forecast", "report"] as const).map((t) => (
+              <div key={t} role="tabpanel" id={`results-panel-${t}`} aria-labelledby={`results-tab-${t}`} hidden={resultsTab !== t}>
+                <NoReportPanel
+                  rebuilding={rebuilding === ws.id || (loading && !!canRebuild && !current)}
+                  docCount={workspaceDocs.length}
+                  loggedCount={Object.keys(tracker.state.actuals).length}
+                  reportLoadFailed={reportStatus[ws.id] === "error"}
+                  onRebuild={canRebuild && !loading ? () => void rebuildFromDocuments(ws.id) : undefined}
+                  onNewAnalysis={() => {
+                    setInputsOverride(true);
+                    requestAnimationFrame(() => jumpTo("analysis-inputs"));
+                  }}
+                  onOpenFiscal={() => setResultsTab("fiscal")}
+                  onOpenDocuments={workspaceDocs.length ? () => setDocsOpen(true) : undefined}
+                />
+              </div>
+            ))}
+            <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"}>
+              <PanelBoundary title="Fiscal Year Tracker">
+                <FiscalYearTracker tracker={tracker} analysis={null} id="fiscal-tracker" />
+              </PanelBoundary>
+            </div>
+          </div>
+        ) : hydrating ? null : (
           <section className="mt-10" aria-label="Fiscal Year Tracker">
             <PanelBoundary title="Fiscal Year Tracker">
               <FiscalYearTracker tracker={tracker} analysis={null} id="fiscal-tracker" />
@@ -1107,8 +1212,17 @@ export default function DashboardPage() {
           onLogToTracker={
             tracker.status === "loading" || tracker.loadFailed
               ? undefined
-              : (d) => (d.period ? logStatementMonth(d.period, { revenue: d.totals.revenue, expenses: d.totals.expenses, ...(d.totals.oneTimeExpenses ? { oneTimeExpenses: d.totals.oneTimeExpenses } : {}) }) : null)
+              : (d) => {
+                  if (d.months.length > 1) {
+                    // Multi-month document: each month's own totals go into that month.
+                    const entries = documentSlices(d).map((sl) => ({ key: sl.period, actual: statementTotals({ revenue: sl.items.revenue, expenses: sl.items.expenses }) }));
+                    updateTracker((s) => entries.reduce((acc, e) => withLoggedActual(acc, e.key, e.actual), s));
+                    return `Logged ${entries.length} months (${periodLabel(entries[0].key)} – ${periodLabel(entries[entries.length - 1].key)}) from “${d.name}”. Goal pace and projections updated.`;
+                  }
+                  return d.period ? logStatementMonth(d.period, { revenue: d.totals.revenue, expenses: d.totals.expenses, ...(d.totals.oneTimeExpenses ? { oneTimeExpenses: d.totals.oneTimeExpenses } : {}) }) : null;
+                }
           }
+          loggedMonths={tracker.status === "loading" || tracker.loadFailed ? undefined : new Set(Object.keys(tracker.state.actuals))}
         />
       )}
 
@@ -1522,6 +1636,71 @@ const RESULTS_TABS: { key: ResultsTab; label: string; short: string; Icon: typeo
   { key: "fiscal", label: "Fiscal Year & Actuals", short: "Fiscal Year", Icon: CalendarDays },
   { key: "report", label: "Executive Report", short: "Report", Icon: FileText },
 ];
+
+/**
+ * Report tabs of a workspace that has saved data but no report: says what's there and how to get the report —
+ * rebuilt from the saved documents (automatically on load, or on demand) or from a new analysis.
+ */
+function NoReportPanel({
+  rebuilding,
+  docCount,
+  loggedCount,
+  reportLoadFailed,
+  onRebuild,
+  onNewAnalysis,
+  onOpenFiscal,
+  onOpenDocuments,
+}: {
+  rebuilding: boolean;
+  docCount: number;
+  loggedCount: number;
+  reportLoadFailed: boolean;
+  onRebuild?: () => void;
+  onNewAnalysis: () => void;
+  onOpenFiscal: () => void;
+  onOpenDocuments?: () => void;
+}) {
+  const saved = [docCount ? `${docCount} saved document${docCount === 1 ? "" : "s"}` : "", loggedCount ? `${loggedCount} logged month${loggedCount === 1 ? "" : "s"}` : ""].filter(Boolean).join(" and ");
+  return (
+    <div className={cn(glass, "p-6")} role="status">
+      {rebuilding ? (
+        <p className="flex items-center gap-2 text-sm text-slate-200">
+          <Loader2 className="h-4 w-4 animate-spin text-indigo-300" /> Rebuilding this workspace&apos;s report from {saved || "its saved data"}…
+        </p>
+      ) : (
+        <>
+          <p className="text-sm font-medium text-slate-100">
+            {reportLoadFailed ? "Couldn't load this workspace's saved report." : "This workspace doesn't have a report yet."}
+          </p>
+          <p className="mt-1 text-sm text-slate-400">
+            {saved ? `It has ${saved}. ` : ""}
+            {onRebuild ? "Rebuild the report from the saved documents, or run a new analysis." : "Run an analysis to see the overview, forecast and executive report — logged months are already in Fiscal Year & Actuals."}
+          </p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {onRebuild && (
+              <button type="button" onClick={onRebuild} className={primaryBtn}>
+                <Repeat className="h-4 w-4" /> Rebuild report from documents
+              </button>
+            )}
+            <button type="button" onClick={onNewAnalysis} className={secondaryBtn}>
+              <Plus className="h-4 w-4" /> New analysis
+            </button>
+            {loggedCount > 0 && (
+              <button type="button" onClick={onOpenFiscal} className={secondaryBtn}>
+                <CalendarDays className="h-4 w-4" /> Fiscal Year & Actuals
+              </button>
+            )}
+            {onOpenDocuments && (
+              <button type="button" onClick={onOpenDocuments} className={secondaryBtn}>
+                <FolderOpen className="h-4 w-4" /> My Documents
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 /** Accessible tab bar (arrow keys / Home / End move between tabs). Scrolls horizontally on narrow screens. */
 function ResultsTabs({ value, onChange }: { value: ResultsTab; onChange: (t: ResultsTab) => void }) {
@@ -2390,7 +2569,8 @@ function ReviewRow({ label, value }: { label: string; value: string }) {
 // ---------------------------------------------------------------------------
 
 const ACCEPT = ".pdf,.txt,.csv,application/pdf,text/plain,text/csv";
-const MAX_BATCH_FILES = 12;
+// No cap on how many files one upload takes: a file isn't "one month" (multi-month reports are split into their
+// calendar months on extraction), and files are read one at a time, so a large batch only takes longer.
 
 /** An earlier document from this workspace covering a month in the current upload (e.g. last week's card statement). */
 type EarlierStatement = ParsedStatement & { include: boolean; savedAt: string };
@@ -2434,21 +2614,29 @@ const typeForMode = (bt: BusinessType, mode: WorkspaceMode): BusinessType => (mo
 function earlierFor(statements: ParsedStatement[], docs: WorkspaceDocument[], prev: EarlierStatement[] = []): EarlierStatement[] {
   const months = new Set(statements.map((s) => s.month).filter(Boolean));
   const hashes = new Set(statements.map((s) => s.contentHash).filter(Boolean));
+  // Multi-month documents contribute only the months that overlap this upload.
   return docs
-    .filter((d) => d.period && months.has(d.period) && d.items && !(d.contentHash && hashes.has(d.contentHash)))
-    .map((d) => ({
-      id: `doc-${d.id}`,
-      name: d.name,
-      fileName: d.fileName,
-      fileSize: d.fileSize,
-      contentHash: d.contentHash,
-      kind: d.kind === "pasted" ? "pasted" : "statement",
-      items: d.items!,
-      detected: d.period!,
-      month: d.period!,
-      savedAt: d.createdAt,
-      include: prev.find((p) => p.id === `doc-${d.id}`)?.include ?? true,
-    }));
+    .filter((d) => !(d.contentHash && hashes.has(d.contentHash)))
+    .flatMap((d) =>
+      documentSlices(d)
+        .filter((sl) => months.has(sl.period))
+        .map((sl): EarlierStatement => {
+          const id = d.months.length ? `doc-${d.id}-${sl.period}` : `doc-${d.id}`;
+          return {
+            id,
+            name: d.months.length ? `${d.name} · ${periodLabel(sl.period)}` : d.name,
+            fileName: d.fileName,
+            fileSize: d.fileSize,
+            contentHash: d.contentHash,
+            kind: d.kind === "pasted" ? "pasted" : "statement",
+            items: sl.items,
+            detected: sl.period,
+            month: sl.period,
+            savedAt: d.createdAt,
+            include: prev.find((p) => p.id === id)?.include ?? true,
+          };
+        }),
+    );
 }
 
 /** (Re)builds the review from the statements: per-month totals and, for several months, averaged line items. */
@@ -2500,21 +2688,62 @@ function rowsToItems(review: UploadReviewState, personal: boolean): ExtractedLin
   };
 }
 
+/**
+ * One saved document per uploaded file. A multi-month file is saved once, with its months (as assigned in the
+ * review) kept as a per-month breakdown; months moved onto the same month are merged.
+ */
 function docsToSave(review: UploadReviewState, personal: boolean): NewWorkspaceDocument[] {
   const single = review.statements.length === 1 && !review.earlier.some((e) => e.include);
-  return review.statements.map((s) => {
-    const items = single ? rowsToItems(review, personal) : s.items;
-    return {
-      name: s.name,
-      fileName: s.fileName,
-      fileSize: s.fileSize,
-      contentHash: s.contentHash,
-      kind: s.kind,
-      period: s.month || null,
-      items,
-      totals: statementTotals({ revenue: items.revenue, expenses: items.expenses }),
-    };
+  const groups = new Map<string, ParsedStatement[]>();
+  for (const s of review.statements) {
+    const k = s.source?.id ?? s.id;
+    groups.set(k, [...(groups.get(k) ?? []), s]);
+  }
+  return [...groups.values()].map((list) => {
+    const first = list[0];
+    const base = { name: first.source?.name ?? first.name, fileName: first.fileName, fileSize: first.fileSize, contentHash: first.contentHash, kind: first.kind };
+    const byMonth = new Map<string, { revenue: RevenueLine[]; expenses: ExpenseLine[] }>();
+    for (const s of list) {
+      const m = byMonth.get(s.month) ?? { revenue: [], expenses: [] };
+      byMonth.set(s.month, { revenue: [...m.revenue, ...s.items.revenue], expenses: [...m.expenses, ...s.items.expenses] });
+    }
+    const keyed = [...byMonth.entries()].filter(([k]) => k).sort(([a], [b]) => a.localeCompare(b));
+    if (first.source && keyed.length > 1 && keyed.length === byMonth.size) {
+      const months = keyed.map(([period, l]) => ({ period, ...l }));
+      const all = { revenue: months.flatMap((m) => m.revenue), expenses: months.flatMap((m) => m.expenses) };
+      // The lines live in `months`; the top-level lists stay empty so the row isn't stored twice.
+      return { ...base, period: null, items: { businessType: first.items.businessType, revenue: [], expenses: [] }, months, totals: statementTotals(all) };
+    }
+    const items: ExtractedLineItems = single
+      ? rowsToItems(review, personal)
+      : { businessType: first.items.businessType, revenue: list.flatMap((s) => s.items.revenue), expenses: list.flatMap((s) => s.items.expenses) };
+    return { ...base, period: keyed.length === 1 && byMonth.size === 1 ? keyed[0][0] : null, items, totals: statementTotals({ revenue: items.revenue, expenses: items.expenses }) };
   });
+}
+
+/**
+ * A workspace's saved documents → one "form" payload: the same monthly baseline an upload of those documents would
+ * produce (recurring lines averaged across every month they cover). Used to rebuild a report that is missing (e.g. the
+ * page was closed before the report finished saving) so a workspace with data never lands back on the upload screen.
+ */
+function payloadFromDocuments(docs: WorkspaceDocument[], businessType: BusinessType): FormPayload | null {
+  const statements: ParsedStatement[] = docs.flatMap((d): ParsedStatement[] => {
+    const base = { name: d.name, fileName: null, fileSize: null, contentHash: null, kind: "statement" as const };
+    const slices = documentSlices(d);
+    if (slices.length) return slices.map((sl) => ({ ...base, id: `${d.id}-${sl.period}`, items: sl.items, detected: sl.period, month: sl.period }));
+    return d.items && (d.items.revenue.length || d.items.expenses.length) ? [{ ...base, id: d.id, items: d.items, detected: "", month: "" }] : [];
+  });
+  if (!statements.length) return null;
+  const agg = aggregateStatements(statements, businessType);
+  if (!agg.revenue.length && !agg.expenses.length) return null;
+  const personal = businessType === "PERSONAL_FAMILY";
+  return {
+    mode: "form",
+    businessType,
+    origin: "statement",
+    revenue: agg.revenue.map((r) => ({ label: r.label, amount: r.amount, ...(personal ? {} : { margin: r.margin }), ...(r.oneTime ? { oneTime: true as const } : {}) })),
+    expenses: agg.expenses.map((e) => ({ label: e.label, amount: e.amount, category: e.category, ...(e.oneTime ? { oneTime: true as const } : {}) })),
+  };
 }
 
 function StatementUploader({
@@ -2550,7 +2779,7 @@ function StatementUploader({
   const busy = disabled || extracting;
   const savedHashes = useMemo(() => new Map(existingDocs.filter((d) => d.contentHash).map((d) => [d.contentHash!, d])), [existingDocs]);
 
-  /** Adds files, keeping order, skipping exact repeats of the same file and capping the batch. */
+  /** Adds files, keeping order and skipping exact repeats of the same file. */
   const addFiles = (list: FileList | File[] | null) => {
     if (!list) return;
     const key = (f: File) => `${f.name}|${f.size}|${f.lastModified}`;
@@ -2561,8 +2790,8 @@ function StatementUploader({
       seen.add(key(f));
       next.push(f);
     }
-    setExtractError(next.length > MAX_BATCH_FILES ? `Up to ${MAX_BATCH_FILES} statements at a time — the first ${MAX_BATCH_FILES} were kept.` : null);
-    setFiles(next.slice(0, MAX_BATCH_FILES));
+    setExtractError(null);
+    setFiles(next);
   };
 
   const fileInit = (f: File | null, extract: boolean): RequestInit => {
@@ -2605,16 +2834,33 @@ function StatementUploader({
         const init = fileInit(f, true);
         const res = await fetch("/api/analyze", { method: "POST", ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...headers } });
         if (!res.ok) throw new Error(await errorMessage(res));
-        const data = (await res.json()) as { items?: unknown; period?: unknown };
-        if (!isExtractedLineItems(data.items)) throw new Error("Received an unexpected response from the analysis service.");
-        const period: StatementPeriod | null = isStatementPeriod(data.period) ? data.period : null;
+        const data = parseExtractResponse(await res.json());
+        if (!data) throw new Error("Received an unexpected response from the analysis service.");
+        const id = `st-${i}-${hash?.slice(0, 8) ?? i}`;
+        const common = { fileName: f?.name ?? null, fileSize: f?.size ?? null, contentHash: hash, kind: f ? ("statement" as const) : ("pasted" as const) };
+        if (data.months.length >= 2) {
+          // One file covering several months (H1 / quarterly / annual): each calendar month in the document becomes its
+          // own statement, already assigned to that month, so one upload seeds every month it lists.
+          const name = f ? documentName(f.name) : "Pasted statement";
+          for (const m of data.months) {
+            parsed.push({
+              ...common,
+              id: `${id}-${m.period.key}`,
+              name: `${name} · ${m.period.label}`,
+              items: { ...m.items, businessType: typeForMode(m.items.businessType, mode) },
+              detected: m.period.key,
+              month: m.period.key,
+              source: { id, name },
+            });
+          }
+          notes.push(`${label}: covers ${data.months.length} months (${data.months[0].period.label} – ${data.months[data.months.length - 1].period.label}) — each month's rows were assigned to that month.`);
+          continue;
+        }
+        const period = data.period;
         parsed.push({
-          id: `st-${i}-${hash?.slice(0, 8) ?? i}`,
+          ...common,
+          id,
           name: f ? documentName(f.name) : `Pasted statement${period ? ` · ${period.label}` : ""}`,
-          fileName: f?.name ?? null,
-          fileSize: f?.size ?? null,
-          contentHash: hash,
-          kind: f ? "statement" : "pasted",
           items: { ...data.items, businessType: typeForMode(data.items.businessType, mode) },
           detected: period?.key ?? "",
           month: period?.key ?? "",
@@ -2712,7 +2958,7 @@ function StatementUploader({
               <div>
                 <Upload className="mx-auto h-8 w-8 text-slate-500" />
                 <p className="mt-2 text-sm text-slate-300">{files.length ? "Drop or click to add more statements" : "Drop statements here or click to browse"}</p>
-                <p className="mt-1 text-xs text-slate-500">Select several months at once · up to {MAX_BATCH_FILES} files, 15 MB each</p>
+                <p className="mt-1 text-xs text-slate-500">Any number of files, 15 MB each · multi-month reports (H1, quarterly, annual) are split into their months</p>
               </div>
             </div>
             {files.length > 0 && (
@@ -2865,7 +3111,11 @@ function UploadReview({
         <h2 className="text-lg font-semibold">Review parsed line items</h2>
       </div>
       <p className="mt-1 text-sm text-slate-400">
-        {review.statements.length > 1 ? `We read ${review.statements.length} statements. ` : ""}
+        {(() => {
+          const files = new Set(review.statements.map((s) => s.source?.id ?? s.id)).size;
+          if (files === review.statements.length) return review.statements.length > 1 ? `We read ${files} statements. ` : "";
+          return `We read ${files} document${files === 1 ? "" : "s"} covering ${review.statements.length} month entries. `;
+        })()}
         {multiMonth
           ? `The lines below are the monthly average across ${review.months.length} months; each month's own totals are logged separately.`
           : `We read ${revenue.length + expenses.length} line${revenue.length + expenses.length === 1 ? "" : "s"}.`}{" "}
@@ -2910,7 +3160,8 @@ function UploadReview({
                       onChange={(e) => restructure(review.statements.map((x) => (x.id === s.id ? { ...x, month: e.target.value } : x)), review.earlier)}
                       className={cn(inputCls, "w-auto py-1 pr-7 text-xs", !s.month && "border-amber-300/50")}
                     >
-                      <option value="">Pick a month…</option>
+                      {/* A month read from a multi-month document always keeps a month (it can be moved, not cleared). */}
+                      {!s.source && <option value="">Pick a month…</option>}
                       {statementMonthOptions(s.detected || null).map((k) => (
                         <option key={k} value={k}>
                           {periodLabel(k)}

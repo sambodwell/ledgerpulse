@@ -31,7 +31,7 @@ import {
   type WinnerInsight,
 } from "@/lib/schemas";
 import { isSupabaseConfigured } from "@/lib/supabase";
-import { detectStatementPeriod, periodFromModel } from "@/lib/statementPeriod";
+import { detectStatementPeriod, periodFromModel, type StatementPeriod } from "@/lib/statementPeriod";
 import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, resolveViewer, seal, unseal, type Viewer } from "@/lib/server/entitlements";
 
 /**
@@ -41,7 +41,8 @@ import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, reso
  *   - multipart/form-data: `file` (PDF or .txt/.csv) + optional `businessType`
  *   - application/json:    { mode: "text", rawText, businessType? }
  *   - multipart `mode=extract` or JSON { mode: "extract", rawText, businessType? }
- *                          → { items: ExtractedLineItems, period: StatementPeriod | null } only (no audit), so the owner can review
+ *                          → { items: ExtractedLineItems, period: StatementPeriod | null, months: { period, items }[] } only (no audit;
+ *                            `months` splits a multi-month report — H1, quarterly, annual — into its calendar months), so the owner can review
  *                            and edit the parsed lines, then submit them back as mode "form"
  *   - application/json:    { mode: "form", businessType, revenue: RevenueLine[], expenses: ExpenseLine[], origin? }
  *   - application/json:    { mode: "unlock", sealed }                 (signed-in; Pro or 1 report unlock)
@@ -532,39 +533,55 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
 // Extract only (statement → editable line items, no audit)
 // ---------------------------------------------------------------------------
 
+const REVENUE_ITEM_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["label", "amount", "margin", "oneTime"],
+  properties: {
+    ...EXTRACTION_SCHEMA.properties.itemizedRevenue.items.properties,
+    oneTime: { type: "boolean", description: "True only for a clearly non-recurring amount" },
+  },
+} as const;
+
+const EXPENSE_ITEM_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["label", "amount", "category", "oneTime"],
+  properties: {
+    label: { type: "string" },
+    amount: { type: "number", description: "Average MONTHLY amount in USD, or the full amount when oneTime" },
+    category: { type: "string" },
+    oneTime: { type: "boolean", description: "True only for a clearly non-recurring charge" },
+  },
+} as const;
+
+/** Same line shapes, but amounts are that one calendar month's actual total (never an average). */
+const monthAmount = { type: "number", description: "The exact USD total for THIS calendar month only (not an average)" } as const;
+
 const LINE_ITEMS_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["businessType", "statementMonth", "itemizedRevenue", "itemizedExpenses"],
+  required: ["businessType", "statementMonth", "itemizedRevenue", "itemizedExpenses", "months"],
   properties: {
     businessType: EXTRACTION_SCHEMA.properties.businessType,
     statementMonth: {
       type: "string",
       description: "The calendar month this statement covers as YYYY-MM (e.g. 2026-03 for a March 2026 statement or a statement period ending March 31, 2026). Empty string if it spans several months or cannot be determined.",
     },
-    itemizedRevenue: {
+    itemizedRevenue: { type: "array", items: REVENUE_ITEM_SCHEMA },
+    itemizedExpenses: { type: "array", items: EXPENSE_ITEM_SCHEMA },
+    months: {
       type: "array",
+      description:
+        "Per-calendar-month breakdown when the document covers two or more calendar months (an H1/H2, quarterly or annual report, a multi-month P&L with month columns, or a transaction list dated across several months). One entry per month, oldest first. Empty array when the document covers a single month.",
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["label", "amount", "margin", "oneTime"],
+        required: ["month", "itemizedRevenue", "itemizedExpenses"],
         properties: {
-          ...EXTRACTION_SCHEMA.properties.itemizedRevenue.items.properties,
-          oneTime: { type: "boolean", description: "True only for a clearly non-recurring amount" },
-        },
-      },
-    },
-    itemizedExpenses: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["label", "amount", "category", "oneTime"],
-        properties: {
-          label: { type: "string" },
-          amount: { type: "number", description: "Average MONTHLY amount in USD, or the full amount when oneTime" },
-          category: { type: "string" },
-          oneTime: { type: "boolean", description: "True only for a clearly non-recurring charge" },
+          month: { type: "string", description: "YYYY-MM, exactly as the document's row / column / transaction dates say (e.g. \"Jan 2026\" → 2026-01)" },
+          itemizedRevenue: { type: "array", items: { ...REVENUE_ITEM_SCHEMA, properties: { ...REVENUE_ITEM_SCHEMA.properties, amount: monthAmount } } },
+          itemizedExpenses: { type: "array", items: { ...EXPENSE_ITEM_SCHEMA, properties: { ...EXPENSE_ITEM_SCHEMA.properties, amount: monthAmount } } },
         },
       },
     },
@@ -573,28 +590,75 @@ const LINE_ITEMS_SCHEMA = {
 
 const EXTRACT_INSTRUCTIONS = `Extract only the line items; the owner will review and edit them before the audit runs.
 Mark a line "oneTime": true only when it is clearly non-recurring (a single late fee, a one-off purchase, a tax refund); give its full amount rather than a monthly average. Everything else is recurring ("oneTime": false) with an average MONTHLY amount.
-Never turn balances into lines: opening, closing, available, ledger and running balances are not transactions. The owner may upload several statements together (e.g. checking plus a credit card), so payments to the owner's own credit card, loan-to-self and transfers between the owner's own accounts are not expenses or revenue (the individual card purchases are the expenses). Amounts must be exact to the cent.`;
+Never turn balances into lines: opening, closing, available, ledger and running balances are not transactions. The owner may upload several statements together (e.g. checking plus a credit card), so payments to the owner's own credit card, loan-to-self and transfers between the owner's own accounts are not expenses or revenue (the individual card purchases are the expenses). Amounts must be exact to the cent.
 
-async function handleExtract(document: DocumentInput) {
-  const raw = await callStructured<{ businessType?: unknown; statementMonth?: unknown; itemizedRevenue?: unknown; itemizedExpenses?: unknown }>({
-    system: buildSystemPrompt(),
-    content: [...buildUserContent(document), { type: "text", text: EXTRACT_INSTRUCTIONS }],
-    schema: LINE_ITEMS_SCHEMA,
-    maxTokens: 16000,
-  });
-  const businessType: BusinessType = document.businessType ?? (isBusinessType(raw.businessType) ? raw.businessType : "OTHER_CUSTOM");
+Multi-month documents: one file can cover many months (an H1 or H2 report, a quarterly or annual P&L, a statement export spanning several months). Inspect the row labels, column headers and transaction dates. When they span two or more calendar months (e.g. columns or rows labeled "Jan 2026", "Feb 2026", …, or transactions dated in different months):
+- Fill "months" with one entry per calendar month, keyed YYYY-MM from the document's own labels or dates. Never guess a month the document doesn't show.
+- Assign every transaction / row value to the calendar month it is dated or labeled in, and total it within that month. Each month's amounts are that month's ACTUAL totals, not averages. Use the same label and category for the same line across months.
+- Skip "Total", "YTD", "Year to date", "H1"/"H2", quarter and average columns or rows: they are sums of the months, and including them would double count.
+- In that case set statementMonth to "" and leave itemizedRevenue and itemizedExpenses empty (they are derived from the months).
+When the document covers a single month, return "months" as an empty array and fill the top-level lists as usual.`;
+
+/** Upper bound on months read from one document (five years of monthly columns). */
+const MAX_DOCUMENT_MONTHS = 60;
+
+interface RawLines {
+  itemizedRevenue?: unknown;
+  itemizedExpenses?: unknown;
+}
+
+function extractedLines(raw: RawLines, businessType: BusinessType): ExtractedLineItems {
   const personal = businessType === "PERSONAL_FAMILY";
-  const items: ExtractedLineItems = {
+  return {
     businessType,
     revenue: sanitizeRevenue(raw.itemizedRevenue).map((r) => ({ ...r, amount: round2(r.amount), margin: personal ? 1 : r.margin ?? 0.5 })),
     expenses: sanitizeExpenses(raw.itemizedExpenses).map((e) => ({ ...e, amount: round2(e.amount) })),
   };
+}
+
+/** The model's per-month breakdown → valid, de-duplicated (same month listed twice is merged), oldest-first months. */
+function extractedMonths(raw: unknown, businessType: BusinessType): { period: StatementPeriod; items: ExtractedLineItems }[] {
+  if (!Array.isArray(raw)) return [];
+  const byKey = new Map<string, { period: StatementPeriod; items: ExtractedLineItems }>();
+  for (const m of raw.slice(0, MAX_DOCUMENT_MONTHS * 2)) {
+    if (!m || typeof m !== "object") continue;
+    const period = periodFromModel((m as { month?: unknown }).month);
+    if (!period) continue;
+    const items = extractedLines(m as RawLines, businessType);
+    if (!items.revenue.length && !items.expenses.length) continue;
+    const prev = byKey.get(period.key);
+    byKey.set(period.key, prev ? { period, items: { businessType, revenue: [...prev.items.revenue, ...items.revenue], expenses: [...prev.items.expenses, ...items.expenses] } } : { period, items });
+  }
+  return [...byKey.values()].sort((a, b) => a.period.key.localeCompare(b.period.key)).slice(-MAX_DOCUMENT_MONTHS);
+}
+
+async function handleExtract(document: DocumentInput) {
+  const raw = await callStructured<{ businessType?: unknown; statementMonth?: unknown; itemizedRevenue?: unknown; itemizedExpenses?: unknown; months?: unknown }>({
+    system: buildSystemPrompt(),
+    content: [...buildUserContent(document), { type: "text", text: EXTRACT_INSTRUCTIONS }],
+    schema: LINE_ITEMS_SCHEMA,
+    // Multi-month reports list every line once per month, so they need more room than a single statement.
+    maxTokens: 48000,
+  });
+  const businessType: BusinessType = document.businessType ?? (isBusinessType(raw.businessType) ? raw.businessType : "OTHER_CUSTOM");
+  const months = extractedMonths(raw.months, businessType);
+  let items = extractedLines(raw, businessType);
+
+  if (months.length >= 2) {
+    // Multi-month document: the months are authoritative. The top-level lists (if the model filled them anyway) are
+    // ignored and replaced by every month's lines, so the response always carries the full document.
+    items = { businessType, revenue: months.flatMap((m) => m.items.revenue), expenses: months.flatMap((m) => m.items.expenses) };
+    return json({ items, period: null, months });
+  }
+
+  // A single entry in "months" is just the statement's month.
+  if (months.length === 1 && !items.revenue.length && !items.expenses.length) items = months[0].items;
   if (items.revenue.length === 0 && items.expenses.length === 0) {
     throw new HttpError(422, "No transactions could be read from this document. Check that it's a readable statement.");
   }
   // Deterministic text detection first (exact statement-period headers); the model's reading covers scanned PDFs.
-  const period = (document.kind === "text" ? detectStatementPeriod(document.text) : null) ?? periodFromModel(raw.statementMonth);
-  return json({ items, period });
+  const period = (document.kind === "text" ? detectStatementPeriod(document.text) : null) ?? periodFromModel(raw.statementMonth) ?? months[0]?.period ?? null;
+  return json({ items, period, months: [] });
 }
 
 function respondWithAnalysis(full: FinancialAnalysis, viewer: Viewer) {

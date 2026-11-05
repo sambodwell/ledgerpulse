@@ -159,9 +159,7 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
           {reached ? (
             <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
               <span className="whitespace-nowrap">Goal Reached!</span>
-              <span className="text-[0.85em] font-medium opacity-90">
-                {reached === "ACTUAL" ? `${signedMoney(pace.ytd.value - pace.goal)} past your goal already` : `on track to beat it by ${signedMoney(pace.annual.variance)}`}
-              </span>
+              <span className="text-[0.85em] font-medium opacity-90">{signedMoney(pace.ytd.value - pace.goal)} past your goal in logged actuals</span>
             </span>
           ) : (
             <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
@@ -187,12 +185,8 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
         ) : (
           <>No months logged yet — this is based on your forecast. Log actuals in the Fiscal Year Tracker to track real pace. </>
         )}
-        {reached === "ACTUAL" ? (
-          <>Your logged actuals already exceed the {exactMoney(pace.goal)} goal — anything more this year is extra.</>
-        ) : reached === "PROJECTED" ? (
-          <>
-            {exactMoney(pace.remainingToGoal)} more to lock it in ({exactMoney(pace.requiredMonthly ?? 0)}/mo); your forecast puts you {exactMoney(pace.annual.variance)} past the goal.
-          </>
+        {reached ? (
+          <>Your logged actuals already meet the {exactMoney(pace.goal)} goal — anything more this year is extra.</>
         ) : pace.requiredMonthly != null && (
           <>
             {expense ? (
@@ -214,14 +208,17 @@ export function GoalPaceBanner({ pace, fyLabel, className, compact = false }: { 
 }
 
 /**
- * Revenue / net goals: "ACTUAL" once logged actuals alone pass the goal, "PROJECTED" when actuals + forecast beat it,
- * otherwise null. Expense budgets are never "reached" (staying under them is shown as "under budget").
+ * Revenue / net goals are "reached" only when the cumulative total of logged (closed) months meets or exceeds the
+ * goal. Forecast months never count: a projection that beats the goal shows as "ahead of annual target", never as
+ * reached. Compared in cents so a float sum a hair under the goal can't flip it. Expense budgets are never "reached"
+ * (staying under them is shown as "under budget").
  */
-export function goalReached(pace: GoalPace): "ACTUAL" | "PROJECTED" | null {
-  if (pace.metric === "EXPENSE" || pace.goal <= 0) return null;
-  if (pace.ytd.months > 0 && pace.ytd.value >= pace.goal) return "ACTUAL";
-  if (pace.annual.projected >= pace.goal) return "PROJECTED";
-  return null;
+export function goalReached(pace: GoalPace): boolean {
+  if (pace.metric === "EXPENSE" || !(pace.goal > 0)) return false;
+  const actual = pace.months.filter((m) => m.status === "ACTUAL");
+  if (!actual.length) return false;
+  const actualCents = actual.reduce((acc, m) => acc + Math.round(m.value * 100), 0);
+  return actualCents >= Math.round(pace.goal * 100);
 }
 
 /** Projections firm up as more months are logged: shown under the goal and projection views. */
@@ -408,18 +405,15 @@ export function goalPaceBannerHtml(pace: GoalPace, fyLabel: string, esc: (s: str
       ? `Actuals so far: <b>${exactMoney(pace.ytd.value)}</b> over ${pace.ytd.months} logged month${pace.ytd.months === 1 ? "" : "s"} vs ${exactMoney(pace.ytd.target)} goal pace (${esc(paceWordsPct(pace.ytd.variance, pace.ytd.target, pace.metric))}).`
       : "No months logged yet — based on the tracker forecast.";
   const reached = goalReached(pace);
-  const need =
-    reached === "ACTUAL"
-      ? " Logged actuals already exceed the goal."
-      : pace.requiredMonthly == null
+  const need = reached
+    ? " Logged actuals already meet the goal."
+    : pace.requiredMonthly == null
       ? ""
-      : reached === "PROJECTED"
-        ? ` ${exactMoney(pace.remainingToGoal)} more to lock it in; the forecast finishes ${exactMoney(pace.annual.variance)} past the goal.`
-        : expense
+      : expense
         ? ` ${exactMoney(Math.max(0, pace.remainingToGoal))} of budget left (up to ${exactMoney(Math.max(0, pace.requiredMonthly))}/mo).`
         : ` ${exactMoney(pace.remainingToGoal)} to go (${exactMoney(pace.requiredMonthly)}/mo needed).`;
   return `<div class="pace-banner ${good ? "pace-good" : "pace-bad"}">
-<div class="pace-head">${reached ? `Goal Reached! ${esc(signedMoney(reached === "ACTUAL" ? pace.ytd.value - pace.goal : pace.annual.variance))} ${reached === "ACTUAL" ? "past the goal" : "projected past the goal"}` : esc(annualDeltaWords(pace))}</div>
+<div class="pace-head">${reached ? `Goal Reached! ${esc(signedMoney(pace.ytd.value - pace.goal))} past the goal in logged actuals` : esc(annualDeltaWords(pace))}</div>
 <div class="muted">${esc(label)} ${expense ? "budget" : "goal"} ${exactMoney(pace.goal)} · ${esc(fyLabel)} · projected year-end ${exactMoney(pace.annual.projected)}</div>
 <div style="margin-top:4px">${ytd}${need}</div>
 </div>`;
