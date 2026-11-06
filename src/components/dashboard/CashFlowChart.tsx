@@ -8,7 +8,7 @@ import { exactMoney, type MonthActual } from "@/lib/fiscal";
 import type { WorkspaceDocument } from "@/lib/supabase";
 import { buildMonthFeed } from "@/components/dashboard/MonthlyBreakdown";
 import { actualsByCalendarMonth } from "@/components/dashboard/SeasonalityControls";
-import { StatusSwitch } from "@/components/dashboard/ForecastControls";
+import { SeasonalityHelp, StatusSwitch } from "@/components/dashboard/ForecastControls";
 import { CHART, ChartTooltip, COLOR, axisProps } from "@/components/dashboard/chartKit";
 import { InfoTip } from "@/components/InfoTip";
 import { GranularityToggle, PaceStrip } from "@/components/dashboard/GranularityToggle";
@@ -123,6 +123,7 @@ export function CashFlowChart({
       {/* Seasonality preview, with the prompt right beside the switch. */}
       <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-indigo-300/20 bg-indigo-500/[0.06] px-3 py-2">
         <StatusSwitch label="Seasonality" on={settings.seasonality} onChange={toggleSeasonality} title="Preview the projection with seasonal swings applied (the annual total stays the same)" />
+        <SeasonalityHelp className="-ml-2" />
         <p className="flex min-w-0 flex-1 items-start gap-1.5 text-[11px] leading-snug text-indigo-100/90 sm:text-xs">
           <Sparkles className="mt-0.5 h-3 w-3 shrink-0 text-indigo-300" aria-hidden /> <span>{helper}</span>
         </p>

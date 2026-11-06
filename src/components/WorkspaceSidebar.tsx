@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { BUSINESS_ONLY_TYPES, BUSINESS_TYPE_LABELS, type BusinessType, type WorkspaceMode, type WorkspaceProfile } from "@/lib/schemas";
 import type { WorkspaceDocument } from "@/lib/supabase";
-import { documentDateLabel, groupByKind } from "@/lib/documentGroups";
+import { documentDateLabel, documentTitle, groupByKind } from "@/lib/documentGroups";
 import { useApp } from "@/components/AppProvider";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { cn, glass, inputCls, primaryBtn, secondaryBtn } from "@/components/ui";
@@ -319,10 +319,10 @@ function DocumentsNav({ documents, onNavigate }: { documents?: SidebarDocuments;
                   <ul>
                     {g.docs.slice(0, 6).map((d) => (
                       <li key={d.id}>
-                        <button type="button" onClick={() => open_(d.id)} className="flex w-full items-start gap-1.5 rounded-md px-1.5 py-1 text-left hover:bg-white/5" title={d.name}>
+                        <button type="button" onClick={() => open_(d.id)} className="flex w-full items-start gap-1.5 rounded-md px-1.5 py-1 text-left hover:bg-white/5" title={d.fileName && d.fileName !== documentTitle(d) ? `${documentTitle(d)} (${d.fileName})` : documentTitle(d)}>
                           <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-indigo-300" aria-hidden />
                           <span className="min-w-0">
-                            <span className="block truncate text-xs text-slate-200">{d.name}</span>
+                            <span className="block truncate text-xs text-slate-200">{documentTitle(d)}</span>
                             <span className="block text-[10px] text-slate-500">{documentDateLabel(d)}</span>
                           </span>
                         </button>

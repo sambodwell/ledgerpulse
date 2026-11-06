@@ -6,7 +6,7 @@ import { documentRange, documentSlices, type WorkspaceDocument } from "@/lib/sup
 import { exactMoney, statementTotals } from "@/lib/fiscal";
 import { periodLabel } from "@/lib/statementPeriod";
 import { statementMonthOptions } from "@/components/dashboard/StatementMonth";
-import { DOC_KIND_GROUP_LABELS, DOC_KIND_ORDER } from "@/lib/documentGroups";
+import { DOC_KIND_GROUP_LABELS, DOC_KIND_ORDER, documentTitle } from "@/lib/documentGroups";
 import { cn, glass, inputCls, secondaryBtn } from "@/components/ui";
 
 type SortKey = "month-desc" | "month-asc" | "name" | "uploaded";
@@ -107,9 +107,9 @@ export function DocumentsHub({
     // Newest first sorts by the last month a document covers; oldest first by its first month. Undated documents go last.
     const to = (d: WorkspaceDocument) => documentRange(d)?.to ?? "";
     const from = (d: WorkspaceDocument) => documentRange(d)?.from ?? "";
-    if (sort === "month-desc") out.sort((a, b) => (!to(a) && !to(b) ? 0 : !to(a) ? 1 : !to(b) ? -1 : to(b).localeCompare(to(a))) || a.name.localeCompare(b.name));
-    if (sort === "month-asc") out.sort((a, b) => (!from(a) && !from(b) ? 0 : !from(a) ? 1 : !from(b) ? -1 : from(a).localeCompare(from(b))) || a.name.localeCompare(b.name));
-    if (sort === "name") out.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+    if (sort === "month-desc") out.sort((a, b) => (!to(a) && !to(b) ? 0 : !to(a) ? 1 : !to(b) ? -1 : to(b).localeCompare(to(a))) || documentTitle(a).localeCompare(documentTitle(b)));
+    if (sort === "month-asc") out.sort((a, b) => (!from(a) && !from(b) ? 0 : !from(a) ? 1 : !from(b) ? -1 : from(a).localeCompare(from(b))) || documentTitle(a).localeCompare(documentTitle(b)));
+    if (sort === "name") out.sort((a, b) => documentTitle(a).localeCompare(documentTitle(b), undefined, { numeric: true, sensitivity: "base" }));
     if (sort === "uploaded") out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return out;
   }, [docs, sort]);
@@ -177,10 +177,10 @@ export function DocumentsHub({
                           </form>
                         ) : (
                           <p className="flex min-w-0 items-center gap-2 font-medium text-slate-100">
-                            <span className="truncate" title={d.name}>
-                              {d.name}
+                            <span className="truncate" title={d.fileName ?? documentTitle(d)}>
+                              {documentTitle(d)}
                             </span>
-                            <button type="button" onClick={() => setEditing({ id: d.id, name: d.name })} aria-label={`Rename ${d.name}`} className="shrink-0 text-slate-500 hover:text-white">
+                            <button type="button" onClick={() => setEditing({ id: d.id, name: documentTitle(d) })} aria-label={`Rename ${documentTitle(d)}`} className="shrink-0 text-slate-500 hover:text-white">
                               <Pencil className="h-3.5 w-3.5" />
                             </button>
                           </p>
@@ -232,7 +232,7 @@ export function DocumentsHub({
                         {/* A multi-month document's months come from its own rows, so there's no single month to pick. */}
                         {!multi && (
                           <select
-                            aria-label={`Statement month for ${d.name}`}
+                            aria-label={`Statement month for ${documentTitle(d)}`}
                             value={d.period ?? ""}
                             disabled={busy === d.id}
                             onChange={(e) => void run(d.id, () => onSetMonth(d.id, e.target.value || null))}
@@ -273,7 +273,7 @@ export function DocumentsHub({
                             </button>
                           </span>
                         ) : (
-                          <button type="button" onClick={() => setConfirmDelete(d.id)} aria-label={`Delete ${d.name}`} className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-white/5 hover:text-rose-300">
+                          <button type="button" onClick={() => setConfirmDelete(d.id)} aria-label={`Delete ${documentTitle(d)}`} className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-white/5 hover:text-rose-300">
                             <Trash2 className="h-4 w-4" />
                           </button>
                         )}

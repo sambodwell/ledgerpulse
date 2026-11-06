@@ -5,6 +5,7 @@
 
 import { documentRange, type WorkspaceDocument, type WorkspaceDocumentKind } from "@/lib/supabase";
 import { periodLabel } from "@/lib/statementPeriod";
+import { generatedDocumentName, isGeneratedName } from "@/lib/batchStatements";
 
 export const DOC_KIND_ORDER: WorkspaceDocumentKind[] = ["statement", "pasted", "form"];
 export const DOC_KIND_GROUP_LABELS: Record<WorkspaceDocumentKind, string> = {
@@ -14,6 +15,17 @@ export const DOC_KIND_GROUP_LABELS: Record<WorkspaceDocumentKind, string> = {
 };
 
 const ADDED = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" });
+
+/**
+ * The name to show for a saved document. Documents saved before names were tidied can carry a raw generated file
+ * name ("Gemini code 1793995484670"); those are titled from the months they cover instead ("May 2026 Statement").
+ * A name the owner typed is always shown as is.
+ */
+export function documentTitle(d: WorkspaceDocument): string {
+  if (!isGeneratedName(d.name)) return d.name;
+  const periods = d.months.length ? d.months.map((m) => m.period) : d.period ? [d.period] : [];
+  return generatedDocumentName({ months: periods }, d.kind === "pasted" ? "Pasted statement" : d.kind === "form" ? "Guided entry" : "Statement");
+}
 
 /** Newest covered month first; documents without a month go last, newest upload first. */
 export function byDateDesc(a: WorkspaceDocument, b: WorkspaceDocument): number {

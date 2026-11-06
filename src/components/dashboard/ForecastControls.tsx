@@ -98,6 +98,7 @@ export function ForecastControls({
       </span>
       <div className="flex w-full flex-wrap items-center gap-2 border-t border-white/5 pt-2">
         <StatusSwitch label="Seasonality" on={settings.seasonality} onChange={(seasonality) => set({ seasonality })} title="Reshape months with your business type's typical seasonal curve (annual total unchanged)" detail={settings.seasonality && (settings.seasonalityStrength !== 1 || settings.seasonalCustom) ? `${Math.round(settings.seasonalityStrength * 100)}%${settings.seasonalCustom ? " custom" : ""}` : undefined} />
+        <SeasonalityHelp />
         <StatusSwitch
           label="Inflation"
           detail={settings.inflation ? `${pct(rate)}/yr` : undefined}
@@ -192,6 +193,17 @@ function RateInput({ value, onChange }: { value: number; onChange: (rate: number
  * On/off switch with an explicit ON / OFF label, colored track and knob, so its state is unmistakable at a glance.
  * Shared by the projection controls and the Fiscal Year Tracker.
  */
+export const SEASONALITY_HELP = "Adjusts your 12-month forward projections up or down using typical seasonal revenue and expense curves for your specific business type.";
+
+/** The "(?)" beside every Seasonality toggle. */
+export function SeasonalityHelp({ align = "left", className }: { align?: "left" | "right"; className?: string }) {
+  return (
+    <InfoTip label="What is Seasonality?" icon="help" align={align} className={cn("-ml-1", className)}>
+      {SEASONALITY_HELP}
+    </InfoTip>
+  );
+}
+
 export function StatusSwitch({ label, detail, on, onChange, title }: { label: string; detail?: string; on: boolean; onChange: (v: boolean) => void; title: string }) {
   return (
     <button

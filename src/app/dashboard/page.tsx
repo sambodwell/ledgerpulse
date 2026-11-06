@@ -109,7 +109,7 @@ import {
 } from "@/lib/supabase";
 import { exactMoney, normalizeTrackerState, statementTotals, withLoggedActual, type MonthActual } from "@/lib/fiscal";
 import { aggregateActuals, calibrateToActuals, resolveBasis, type ActualsAggregate, type ProjectionBasis } from "@/lib/projectionBasis";
-import { DOCUMENT_KIND_LABELS, REVIEW_FLAG_LABELS, aggregateStatements, documentName, hashFile, monthlyBaseline, parseExtractResponse, type ParsedStatement, type ReviewFlag, type StatementOverlap } from "@/lib/batchStatements";
+import { DOCUMENT_KIND_LABELS, REVIEW_FLAG_LABELS, aggregateStatements, documentName, hashFile, renameForMonth, monthlyBaseline, parseExtractResponse, type ParsedStatement, type ReviewFlag, type StatementOverlap } from "@/lib/batchStatements";
 import { buildVendorHistory, classifyLine, insightTone, matchFlags, sameVendor, type LineInsight } from "@/lib/lineInsights";
 import { periodLabel } from "@/lib/statementPeriod";
 import { StatementMonthPicker, statementMonthOptions } from "@/components/dashboard/StatementMonth";
@@ -125,7 +125,7 @@ import { PlanCard } from "@/components/PlanCard";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { CHART, COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml, signedUsd } from "@/components/dashboard/chartKit";
 import { downloadHtmlAsPdf, pdfFileName } from "@/lib/pdfDownload";
-import { ForecastControls } from "@/components/dashboard/ForecastControls";
+import { ForecastControls, SeasonalityHelp } from "@/components/dashboard/ForecastControls";
 import { ScenarioPanel, scenarioExamples } from "@/components/dashboard/ScenarioPanel";
 import { FiscalYearTracker, ImplementedToggle, toggleImplemented, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
 import { DataCompletenessNote, GoalPaceBanner, GoalTracker, goalPaceBannerHtml, goalPaceReportHtml } from "@/components/dashboard/GoalTracker";
@@ -1928,11 +1928,14 @@ function AnalysisTargetDialog({
 // Workspace settings: name & type, financial defaults (inflation master switch, …), danger zone
 // ---------------------------------------------------------------------------
 
-function SettingSwitch({ checked, onChange, label, description }: { checked: boolean; onChange: (v: boolean) => void; label: string; description: string }) {
+function SettingSwitch({ checked, onChange, label, description, help }: { checked: boolean; onChange: (v: boolean) => void; label: string; description: string; help?: ReactNode }) {
   return (
     <label className="flex cursor-pointer items-start justify-between gap-4 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
       <span className="min-w-0">
-        <span className="block text-sm font-medium text-slate-100">{label}</span>
+        <span className="flex items-center gap-1.5 text-sm font-medium text-slate-100">
+          {label}
+          {help}
+        </span>
         <span className="mt-0.5 block text-xs text-slate-400">{description}</span>
       </span>
       <input type="checkbox" role="switch" className="peer sr-only" checked={checked} onChange={(e) => onChange(e.target.checked)} />
@@ -2161,6 +2164,7 @@ function WorkspaceSettingsDialog({
               checked={forecast.seasonality}
               onChange={(v) => set({ seasonality: v })}
               label="Seasonality"
+              help={<SeasonalityHelp className="ml-0" />}
               description={forecast.seasonality ? "On: projections follow this business type's month-by-month curve (fine-tune it on the Forecast tab)." : "Off: flat inputs project flat."}
             />
 
@@ -4193,7 +4197,7 @@ function StatementUploader({
         if (data.months.length >= 2) {
           // One file covering several months (H1 / quarterly / annual): each calendar month in the document becomes its
           // own statement, already assigned to that month, so one upload seeds every month it lists.
-          const name = f ? documentName(f.name) : "Pasted statement";
+          const name = f ? documentName(f.name, { months: data.months.map((m) => m.period.key), documentKind: data.documentKind }) : "Pasted statement";
           // Each flag goes to the month it's dated in, else the month whose lines name that merchant, else the first.
           const flagMonth = (fl: ReviewFlag) =>
             data.months.find((m) => m.period.key === fl.date.slice(0, 7))?.period.key ??
@@ -4219,7 +4223,7 @@ function StatementUploader({
         parsed.push({
           ...common,
           id,
-          name: f ? documentName(f.name) : `Pasted statement${period ? ` · ${period.label}` : ""}`,
+          name: f ? documentName(f.name, { months: period ? [period.key] : [], documentKind: data.documentKind }) : `Pasted statement${period ? ` · ${period.label}` : ""}`,
           items: { ...data.items, businessType: typeForMode(data.items.businessType, mode) },
           detected: period?.key ?? "",
           month: period?.key ?? "",
@@ -4608,7 +4612,8 @@ function MonthByMonthEditor({
         </div>
       </div>
 
-      <div role="group" aria-label="Choose a month" className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
+      {/* Top / right padding leaves room for the count badges: an overflow-x container clips anything outside it. */}
+      <div role="group" aria-label="Choose a month" className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 pr-2 pt-2">
         {review.monthRows.map((m) => {
           const t = reviewTotals(m);
           const n = attention(m);
@@ -4619,7 +4624,7 @@ function MonthByMonthEditor({
               type="button"
               aria-pressed={on}
               onClick={() => setReview((r) => r && { ...r, activeMonth: m.id })}
-              title={`${nameOf(m)}: ${exactMoney(t.revenue)} in · ${exactMoney(t.expenses)} out${n ? ` · ${n} line${n === 1 ? "" : "s"} to check` : ""}${m.editable ? "" : " · saved earlier"}`}
+              title={`${nameOf(m)}: ${exactMoney(t.revenue)} in · ${exactMoney(t.expenses)} out${t.revenue === 0 ? ` · ${NO_REVENUE_NOTE}` : ""}${n ? ` · ${n} line${n === 1 ? "" : "s"} to check` : ""}${m.editable ? "" : " · saved earlier"}`}
               className={cn(
                 "relative flex min-w-[6.5rem] shrink-0 flex-col items-start rounded-lg border px-2.5 py-1.5 text-left text-xs transition",
                 on ? "border-indigo-300/60 bg-indigo-500/20 text-white" : "border-white/10 bg-white/[0.02] text-slate-300 hover:border-white/25",
@@ -4633,8 +4638,9 @@ function MonthByMonthEditor({
               <span className="tabular-nums text-[10px] text-slate-400">
                 {usdCompact.format(t.revenue)} in · {usdCompact.format(t.expenses)} out
               </span>
+              {t.revenue === 0 && <span className="text-[10px] italic text-slate-500">No revenue this period</span>}
               {n > 0 && (
-                <span className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-amber-400 px-1 text-[10px] font-semibold text-slate-950" aria-label={`${n} to check`}>
+                <span className="absolute -right-1.5 -top-1.5 grid h-4 min-w-4 place-items-center rounded-full bg-amber-400 px-1 text-[10px] font-semibold text-slate-950" aria-label={`${n} to check`}>
                   {n}
                 </span>
               )}
@@ -4650,6 +4656,7 @@ function MonthByMonthEditor({
             {exactMoney(totals.revenue)} in · {exactMoney(totals.expenses)} out
             {totals.oneTimeExpenses ? ` (${exactMoney(totals.oneTimeExpenses)} one-time)` : ""} · net {exactMoney(totals.revenue - totals.expenses)}
           </p>
+          {totals.revenue === 0 && <ZeroRevenueNote className="basis-full text-right" />}
         </div>
         {active.editable ? (
           <div className="space-y-6">
@@ -4705,6 +4712,13 @@ function MonthByMonthEditor({
       </div>
     </section>
   );
+}
+
+const NO_REVENUE_NOTE = "No revenue recorded in this statement period";
+
+/** Muted note beside a $0-revenue month, so a seasonal dip doesn't read as a parsing error. */
+function ZeroRevenueNote({ className }: { className?: string }) {
+  return <span className={cn("text-[11px] italic text-slate-500", className)}>{NO_REVENUE_NOTE}</span>;
 }
 
 function UploadReview({
@@ -4829,7 +4843,7 @@ function UploadReview({
           <StatementMonthPicker
             detected={review.statements[0].detected ? { key: review.statements[0].detected, label: periodLabel(review.statements[0].detected), source: "text", confidence: "high" } : null}
             value={review.statements[0].month}
-            onChange={(month) => restructure([{ ...review.statements[0], month }], review.earlier)}
+            onChange={(month) => restructure([{ ...review.statements[0], name: renameForMonth(review.statements[0], month), month }], review.earlier)}
           />
         ) : (
           <>
@@ -4849,7 +4863,7 @@ function UploadReview({
                     <select
                       aria-label={`Month for ${s.name}`}
                       value={s.month}
-                      onChange={(e) => restructure(review.statements.map((x) => (x.id === s.id ? { ...x, month: e.target.value } : x)), review.earlier)}
+                      onChange={(e) => restructure(review.statements.map((x) => (x.id === s.id ? { ...x, name: renameForMonth(x, e.target.value), month: e.target.value } : x)), review.earlier)}
                       className={cn(inputCls, "w-auto py-1 pr-7 text-xs", !s.month && "border-amber-300/50")}
                     >
                       {/* A month read from a multi-month document always keeps a month (it can be moved, not cleared). */}
@@ -4947,6 +4961,7 @@ function UploadReview({
                     {review.loggedKeys.includes(m.key) && <span className="ml-1 text-emerald-300">· logged ✓</span>}
                   </span>
                   <span>
+                    {m.actual.revenue === 0 && <ZeroRevenueNote className="mr-2" />}
                     {exactMoney(m.actual.revenue)} in · {exactMoney(m.actual.expenses)} out{m.actual.oneTimeExpenses ? ` (${exactMoney(m.actual.oneTimeExpenses)} one-time)` : ""}
                   </span>
                 </li>

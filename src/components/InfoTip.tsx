@@ -1,14 +1,28 @@
 "use client";
 
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { Info } from "lucide-react";
+import { CircleHelp, Info } from "lucide-react";
 import { cn } from "@/components/ui";
 
 /**
  * Small "(i)" bubble with a concise explanatory tooltip. Opens on hover and keyboard focus, toggles on tap
- * (touch screens), and closes on Escape or an outside click. `align` sets which edge the popover hangs from.
+ * (touch screens), and closes on Escape or an outside click. `align` sets which edge the popover hangs from;
+ * `icon="help"` shows a "(?)" instead, for "what does this control do?" help beside a toggle.
  */
-export function InfoTip({ label, children, align = "right", className }: { label: string; children: ReactNode; align?: "left" | "right"; className?: string }) {
+export function InfoTip({
+  label,
+  children,
+  align = "right",
+  icon = "info",
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  align?: "left" | "right";
+  icon?: "info" | "help";
+  className?: string;
+}) {
+  const Glyph = icon === "help" ? CircleHelp : Info;
   const [open, setOpen] = useState(false);
   const [pinned, setPinned] = useState(false);
   const id = useId();
@@ -57,7 +71,7 @@ export function InfoTip({ label, children, align = "right", className }: { label
         }}
         className="grid h-4 w-4 place-items-center rounded-full text-slate-500 transition hover:text-indigo-200 focus-visible:text-indigo-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-300"
       >
-        <Info className="h-3.5 w-3.5" aria-hidden />
+        <Glyph className="h-3.5 w-3.5" aria-hidden />
       </button>
       {open && (
         <span

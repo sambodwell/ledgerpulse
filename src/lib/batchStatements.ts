@@ -12,7 +12,9 @@
  *  - P&L vs. raw statements: a P&L already summarizes its month, so when a month has both a P&L and a raw credit
  *    card / bank statement, the raw transactions are sub-components of the P&L totals (the fuel card charge is inside
  *    the P&L's fuel line). They're reported as potential duplicates (`overlaps`) and left out of that month's totals
- *    until the owner confirms the statement (`confirmOverlap`).
+ *    until the owner confirms the statement (`confirmOverlap`). Pairing is by period within the upload, never by file
+ *    name: a document the parser called OTHER is classified by `effectiveDocumentKind`, and a statement with no month
+ *    yet pairs with the other side when that side covers a single month.
  *  - Each month's total becomes that month's actual for the Fiscal Year Tracker.
  *  - The forward baseline averages recurring lines across months (sum ÷ months covered), so three months of
  *    statements don't triple the monthly figures. Past one-time items are logged in their month but left out of the
@@ -268,6 +270,28 @@ function overlapOf(raw: ParsedStatement, pnl: ParsedStatement[], month: string):
   };
 }
 
+const PNL_NAME = /p\s*&\s*l|\bpnl\b|p\s+and\s+l|profit|income\s+statement|operat(?:ing|ions)\s+statement|\bp-l\b/i;
+const CARD_NAME = /card|visa|amex|american\s+express|mastercard|discover|capital\s+one/i;
+const BANK_NAME = /checking|savings|bank|account\s+activity|transactions?/i;
+
+/**
+ * The document kind used to pair P&Ls with raw statements. The parser's reading wins; a document it called OTHER
+ * (common for generic or hash-named exports) is classified from its file / display name, else from its shape: a
+ * transaction log with spend but no income reads as a raw card statement, one with both as a P&L. Saved documents
+ * (no `documentKind` recorded) stay unknown and are never paired.
+ */
+export function effectiveDocumentKind(s: Pick<ParsedStatement, "documentKind" | "fileName" | "name" | "source" | "items" | "reviewFlags">): DocumentKind | undefined {
+  if (!s.documentKind || s.documentKind !== "OTHER") return s.documentKind;
+  const name = `${s.fileName ?? ""} ${s.source?.name ?? s.name}`;
+  if (PNL_NAME.test(name)) return "PROFIT_AND_LOSS";
+  if (CARD_NAME.test(name)) return "CREDIT_CARD_STATEMENT";
+  if (BANK_NAME.test(name)) return "BANK_STATEMENT";
+  if (!s.items.revenue.length && s.items.expenses.length) return "CREDIT_CARD_STATEMENT";
+  // Summarized income + expenses with no flagged transactions (transaction logs carry flags) reads as a P&L.
+  if (s.items.revenue.length && s.items.expenses.length && !s.reviewFlags?.length) return "PROFIT_AND_LOSS";
+  return "OTHER";
+}
+
 export function aggregateStatements(statements: ParsedStatement[], fallbackType: BusinessType): BatchAggregate {
   // Group by assigned month; unassigned statements are each their own group.
   const groups = new Map<string, ParsedStatement[]>();
@@ -276,17 +300,39 @@ export function aggregateStatements(statements: ParsedStatement[], fallbackType:
     groups.set(g, [...(groups.get(g) ?? []), s]);
   }
 
+  // P&L ↔ raw pairing is by overlapping period within this upload, not by file name. A statement with no month yet
+  // overlaps the batch's other side when that side covers a single month (the only period it can belong to).
+  const kinds = new Map(statements.map((s) => [s.id, effectiveDocumentKind(s)]));
+  const isPnl = (s: ParsedStatement) => kinds.get(s.id) === "PROFIT_AND_LOSS";
+  const isRaw = (s: ParsedStatement) => isRawDocumentKind(kinds.get(s.id));
+  const onlyMonth = (pick: (s: ParsedStatement) => boolean) => {
+    const months = new Set(statements.filter((s) => s.month && pick(s)).map((s) => s.month));
+    return months.size === 1 ? [...months][0] : "";
+  };
+  const pnlMonth = onlyMonth(isPnl);
+  const rawMonth = onlyMonth(isRaw);
+  const unassignedPnl = statements.filter((s) => !s.month && isPnl(s));
+
   let duplicateLines = 0;
   const merged: BatchMonthLines[] = [];
   const overlaps: StatementOverlap[] = [];
   for (const [g, list] of groups) {
     // A P&L already summarizes the month: same-month raw card / bank lines are its sub-components, not extra spend.
-    const pnl = g.startsWith("?") ? [] : list.filter((s) => s.documentKind === "PROFIT_AND_LOSS");
+    const unassigned = g.startsWith("?");
+    const pnl = unassigned
+      ? isRaw(list[0]) && pnlMonth
+        ? statements.filter((s) => s.month === pnlMonth && isPnl(s))
+        : []
+      : [...list.filter(isPnl), ...(g === rawMonth ? unassignedPnl : [])];
+    const pairedMonth = unassigned ? pnlMonth : g;
     const counted = list.filter((s) => {
-      if (!pnl.length || !isRawDocumentKind(s.documentKind)) return true;
-      overlaps.push(overlapOf(s, pnl, g));
+      if (!pnl.length || !isRaw(s)) return true;
+      overlaps.push({ ...overlapOf(s, pnl, pairedMonth), documentKind: kinds.get(s.id) ?? "OTHER" });
       return !!s.confirmOverlap;
     });
+    // A group holding only excluded duplicates (a month-less card statement, or a card month whose P&L has no month
+    // yet) isn't a month of its own: keeping it would add an empty month to the baseline average.
+    if (!counted.length) continue;
     const rev = mergeMonth(counted.map((s) => s.items.revenue), revKey);
     const exp = mergeMonth(counted.map((s) => s.items.expenses), expKey);
     duplicateLines += rev.dupes + exp.dupes;
@@ -341,12 +387,65 @@ export async function hashFile(file: Blob): Promise<string | null> {
   }
 }
 
+/** What the parser learned about a document, used to title it when its file name says nothing. */
+export interface DocumentNameHint {
+  /** "YYYY-MM" months the document covers (one, or oldest → newest for a multi-month report). */
+  months?: string[];
+  documentKind?: DocumentKind;
+}
+
+const SHORT_MONTH = new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric", timeZone: "UTC" });
+const LONG_MONTH = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
+const monthDate = (key: string) => new Date(Date.UTC(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1));
+
+/** Hash / timestamp / id tokens: long digit runs (epoch ms), hex digests, UUID pieces. */
+const isHashToken = (t: string) => /^\d{7,}$/.test(t) || (/^[0-9a-f]{12,}$/i.test(t) && /\d/.test(t)) || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(t);
+/** Words export tools and chat apps put in file names that say nothing about the document. */
+const GENERIC_WORDS = new Set(
+  "gemini chatgpt gpt claude copilot bard ai code file files document doc docs download downloads untitled export exported scan scanned image img upload uploaded attachment data text txt new output report tmp temp print copy final draft version v statement statements".split(" "),
+);
+
+/**
+ * Whether a tidied file name is just a generated id ("gemini-code-1793995484670", "3f9a1c0e…", "Untitled document").
+ * Exported so saved documents already carrying such a name can be re-titled for display.
+ */
+export function isGeneratedName(name: string): boolean {
+  const tokens = name
+    .toLowerCase()
+    .split(/[^a-z0-9-]+|(?<=[a-z])-|-(?=[a-z])/)
+    .filter(Boolean);
+  if (!tokens.length) return true;
+  const meaningful = tokens.filter((t) => !isHashToken(t) && !GENERIC_WORDS.has(t) && !/^\d{1,2}$/.test(t));
+  return meaningful.length === 0;
+}
+
+/**
+ * The statement's name after the owner moves it to `month`: a name we generated from the old month ("May 2026 P&L")
+ * follows the new month; a name taken from the file name is kept.
+ */
+export function renameForMonth(s: Pick<ParsedStatement, "name" | "fileName" | "month" | "documentKind" | "source">, month: string): string {
+  if (!s.fileName || s.source) return s.name;
+  const hint = (m: string) => ({ months: m ? [m] : [], documentKind: s.documentKind });
+  return s.name === documentName(s.fileName, hint(s.month)) ? documentName(s.fileName, hint(month)) : s.name;
+}
+
+/** "May 2026 P&L", "Jan 2026 – Jun 2026 Credit card statement", "Bank statement" — from what the parser detected. */
+export function generatedDocumentName(hint: DocumentNameHint, fallback = "Statement"): string {
+  const months = [...new Set((hint.months ?? []).filter((k) => /^\d{4}-\d{2}$/.test(k)))].sort();
+  const kind = hint.documentKind && hint.documentKind !== "OTHER" ? DOCUMENT_KIND_LABELS[hint.documentKind] : fallback;
+  if (!months.length) return kind;
+  const when = months.length === 1 ? LONG_MONTH.format(monthDate(months[0])) : `${SHORT_MONTH.format(monthDate(months[0]))} – ${SHORT_MONTH.format(monthDate(months[months.length - 1]))}`;
+  return `${when} ${kind}`;
+}
+
 /**
  * A tidy display name from a file name: "chase_checking__March-2026 (1).pdf" → "Chase checking March 2026".
  * Underscores and word-separating dashes become spaces, browser duplicate suffixes ("(1)", " copy") are dropped and the
- * first letter is capitalized; numeric dates such as "2026-03" are kept as they are.
+ * first letter is capitalized; numeric dates such as "2026-03" are kept as they are. Hash / timestamp tokens are
+ * dropped, and a name left with nothing meaningful ("gemini-code-1793995484670.txt") is titled from the detected
+ * period and document type instead ("May 2026 P&L").
  */
-export function documentName(fileName: string): string {
+export function documentName(fileName: string, hint: DocumentNameHint = {}): string {
   const tidy = fileName
     .replace(/\.[a-z0-9]{1,5}$/i, "")
     .replace(/\s*\(\d+\)$/, "")
@@ -355,5 +454,12 @@ export function documentName(fileName: string): string {
     .replace(/(?<=[a-z])-+|-+(?=[a-z])/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return (tidy.charAt(0).toUpperCase() + tidy.slice(1)).slice(0, 160) || "Statement";
+  if (isGeneratedName(tidy)) return generatedDocumentName(hint);
+  const cleaned = tidy
+    .split(" ")
+    .filter((t) => !isHashToken(t))
+    .join(" ")
+    .replace(/[\s-]+$/, "")
+    .trim();
+  return (cleaned.charAt(0).toUpperCase() + cleaned.slice(1)).slice(0, 160) || generatedDocumentName(hint);
 }
