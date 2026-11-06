@@ -109,7 +109,7 @@ import {
 } from "@/lib/supabase";
 import { exactMoney, normalizeTrackerState, statementTotals, withLoggedActual, type MonthActual } from "@/lib/fiscal";
 import { aggregateActuals, calibrateToActuals, resolveBasis, type ActualsAggregate, type ProjectionBasis } from "@/lib/projectionBasis";
-import { DOCUMENT_KIND_LABELS, REVIEW_FLAG_LABELS, aggregateStatements, documentName, hashFile, monthlyBaseline, parseExtractResponse, type ParsedStatement, type ReviewFlag } from "@/lib/batchStatements";
+import { DOCUMENT_KIND_LABELS, REVIEW_FLAG_LABELS, aggregateStatements, documentName, hashFile, monthlyBaseline, parseExtractResponse, type ParsedStatement, type ReviewFlag, type StatementOverlap } from "@/lib/batchStatements";
 import { buildVendorHistory, classifyLine, insightTone, matchFlags, sameVendor, type LineInsight } from "@/lib/lineInsights";
 import { periodLabel } from "@/lib/statementPeriod";
 import { StatementMonthPicker, statementMonthOptions } from "@/components/dashboard/StatementMonth";
@@ -467,8 +467,19 @@ export default function DashboardPage() {
   const resultsRef = useRef<HTMLDivElement>(null);
   const ws = app.activeWorkspace;
   const formDefaultType: BusinessType = mode === "PERSONAL" ? "PERSONAL_FAMILY" : ws && ws.mode === "BUSINESS" ? ws.businessType : "REAL_ESTATE";
+  /**
+   * The business type the owner picked in the setup wizard or the statement review panel, scoped to this workspace +
+   * mode (so it never leaks into another book). Both panels read it, so they always agree.
+   */
+  const typeScope = `${wsKey}-${mode}`;
+  const [pickedType, setPickedType] = useState<{ scope: string; type: BusinessType | null } | null>(null);
+  const syncedType: BusinessType | null =
+    mode === "PERSONAL" ? null : pickedType?.scope === typeScope ? pickedType.type : ws && ws.mode === "BUSINESS" ? ws.businessType : null;
+  const pickType = useCallback((type: BusinessType | null) => setPickedType({ scope: typeScope, type }), [typeScope]);
+  /** Opens the statement uploader's "add more documents" picker (registered by the uploader). */
+  const uploadMoreRef = useRef<(() => void) | null>(null);
 
-  /** Fiscal Year Tracker state (monthly actuals, goals, savings) for the active workspace, shared by the Goal Tracker at the top. */
+  /** Fiscal Year Tracker state (monthly actuals, goals, savings) for the active workspace, shared with the Goal Tracker. */
   const tracker = useFiscalTracker({ userId: userId ?? "", workspaceId: ws?.id ?? null, businessType: formDefaultType });
   /** Goal pace included in the executive PDF. */
   const goalReport: GoalReport | null = tracker.pace && tracker.status !== "loading" && !tracker.loadFailed ? { pace: tracker.pace, fyLabel: tracker.fyLabel } : null;
@@ -532,6 +543,17 @@ export default function DashboardPage() {
   const openTab = (t: ResultsTab, id: string, focusSelector?: string) => {
     setResultsTab(t);
     requestAnimationFrame(() => jumpTo(id, focusSelector));
+  };
+  /** Shows the statement uploader (opening the inputs if they are collapsed) and scrolls to it. */
+  const revealUploader = () => {
+    setInputsOverride(true);
+    setTab("upload");
+    requestAnimationFrame(() => jumpTo("statement-uploader"));
+  };
+  /** "Upload More Documents": opens the file picker right away (inside the click) and brings the uploader / review into view. */
+  const uploadMore = () => {
+    uploadMoreRef.current?.();
+    revealUploader();
   };
 
   const post = useCallback(async (init: RequestInit) => {
@@ -1074,7 +1096,9 @@ export default function DashboardPage() {
     const rest = params.toString();
     window.history.replaceState(null, "", window.location.pathname + (rest ? `?${rest}` : ""));
     if (open === "documents") openDocuments();
+    else if (open === "upload") revealUploader();
     else if (open === "workspace-settings") setWsSettingsOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot deep link; revealUploader only calls setters
   }, [app.ready, ws, openDocuments]);
 
   const deleteActiveWorkspace = async () => {
@@ -1117,8 +1141,15 @@ export default function DashboardPage() {
     );
   }
 
+  /** Goal Tracker: rendered inside Fiscal Year & Actuals (or under the inputs before there's any data). */
+  const goalTracker = (
+    <PanelBoundary title="Goal Tracker">
+      <GoalTracker tracker={tracker} id="goal-tracker" onViewSavings={() => jumpTo("savings-tracker")} />
+    </PanelBoundary>
+  );
+
   return (
-    <AppShell documents={ws ? { docs: workspaceDocs, loading: docsState.loading === ws.id, onOpen: openDocuments } : undefined} onOpenWorkspaceSettings={ws ? () => setWsSettingsOpen(true) : undefined}>
+    <AppShell documents={ws ? { docs: workspaceDocs, loading: docsState.loading === ws.id, onOpen: openDocuments, onUploadMore: uploadMore } : undefined} onOpenWorkspaceSettings={ws ? () => setWsSettingsOpen(true) : undefined}>
     <div className="relative min-h-screen overflow-x-clip bg-slate-950 text-slate-100">
       {/* Ambient glow */}
       <div aria-hidden className="pointer-events-none fixed inset-0">
@@ -1204,13 +1235,6 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {/* Goal Tracker first: the year-end delta is the first thing an owner sees. */}
-        <div className="mb-8">
-          <PanelBoundary title="Goal Tracker">
-            <GoalTracker tracker={tracker} id="goal-tracker" onViewSavings={() => (analysis && paywall ? openTab("fiscal", "savings-tracker") : jumpTo("savings-tracker"))} />
-          </PanelBoundary>
-        </div>
-
         {/* Inputs collapse once a report exists, so the results tabs are one click away instead of a long scroll. */}
         {(current || (!hydrating && hasSavedData)) && (
           <div className={cn(glass, "mb-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3")}>
@@ -1261,10 +1285,12 @@ export default function DashboardPage() {
                   defaultType={formDefaultType}
                   disabled={loading}
                   onSubmit={(payload) => requestAnalysis({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType)}
+                  syncedType={syncedType}
+                  onTypeChange={pickType}
                 />
               </PanelBoundary>
             </div>
-            <div className={cn("min-w-0", tab !== "upload" && "hidden lg:block")}>
+            <div id="statement-uploader" className={cn("min-w-0 scroll-mt-6", tab !== "upload" && "hidden lg:block")}>
               <PanelBoundary title="Statement upload">
                 {/* Not keyed by workspace: picking a workspace for the report must not throw away the parsed lines under review. */}
                 {/* Reset (via uploaderEpoch) for a brand-new workspace or a menu switch, so no parsed numbers carry over. */}
@@ -1277,6 +1303,9 @@ export default function DashboardPage() {
                   onLogActuals={logStatementMonth}
                   existingDocs={workspaceDocs}
                   onBalanceDetected={setDetectedCash}
+                  syncedType={syncedType}
+                  onTypeChange={pickType}
+                  uploadMoreRef={uploadMoreRef}
                 />
               </PanelBoundary>
             </div>
@@ -1324,9 +1353,14 @@ export default function DashboardPage() {
 
         {analysis && paywall ? (
           <div ref={resultsRef} className={cn("scroll-mt-6 space-y-6", inputsOpen ? "mt-10" : "mt-2")}>
+            {/* Primary navigation first: Overview is the landing view; the Goal Tracker lives under Fiscal Year & Actuals. */}
+            <ResultsTabs value={resultsTab} onChange={setResultsTab} />
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-xl font-semibold">Results{ws ? <span className="text-base font-normal text-slate-400"> · {ws.name}</span> : null}</h2>
               <div className="flex flex-wrap items-center gap-2">
+              <button type="button" onClick={uploadMore} className={cn(secondaryBtn, "text-slate-200")}>
+                <Upload className="h-4 w-4" /> Upload More Documents
+              </button>
               {ws && (
                 <button type="button" onClick={() => openDocuments()} className={cn(secondaryBtn, "text-slate-200")}>
                   <FolderOpen className="h-4 w-4" /> Documents
@@ -1350,7 +1384,7 @@ export default function DashboardPage() {
               <ReportCallout
                 hasGoal={!!tracker.pace}
                 loggedCount={tracker.summary.loggedCount}
-                onSetGoal={() => jumpTo("goal-tracker", "input")}
+                onSetGoal={() => openTab("fiscal", "goal-tracker", "input")}
                 onLogActuals={() => openTab("fiscal", "fiscal-tracker", "tbody input")}
                 onDismiss={dismissCallout}
               />
@@ -1358,14 +1392,12 @@ export default function DashboardPage() {
 
             {teaser && <TeaserBanner paywall={paywall} />}
 
-            <ResultsTabs value={resultsTab} onChange={setResultsTab} />
-
             <div role="tabpanel" id="results-panel-overview" aria-labelledby="results-tab-overview" hidden={resultsTab !== "overview"} className="space-y-6">
               {tracker.pace && (
                 <div className="flex flex-col gap-2">
                   <GoalPaceBanner pace={tracker.pace} fyLabel={tracker.fyLabel} compact />
-                  <button type="button" onClick={() => jumpTo("goal-tracker")} className="self-end text-xs text-indigo-300 hover:text-indigo-200">
-                    Adjust goal ↑
+                  <button type="button" onClick={() => openTab("fiscal", "goal-tracker")} className="self-end text-xs text-indigo-300 hover:text-indigo-200">
+                    Adjust goal →
                   </button>
                 </div>
               )}
@@ -1506,7 +1538,8 @@ export default function DashboardPage() {
               </PanelBoundary>
             </div>
 
-            <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"}>
+            <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"} className="space-y-6">
+              {goalTracker}
               <PanelBoundary title="Fiscal Year Tracker">
                 <FiscalYearTracker tracker={tracker} analysis={teaser ? null : rawAnalysis} id="fiscal-tracker" />
               </PanelBoundary>
@@ -1522,7 +1555,7 @@ export default function DashboardPage() {
                     onDownload={() => void downloadReport()}
                     downloading={reportDownloading}
                     hasGoal={!!goalReport}
-                    onSetGoal={() => jumpTo("goal-tracker", "input")}
+                    onSetGoal={() => openTab("fiscal", "goal-tracker", "input")}
                   />
                 )}
               </PanelBoundary>
@@ -1541,13 +1574,18 @@ export default function DashboardPage() {
           // Saved data but no report (yet): still the 4-tab dashboard. Fiscal Year & Actuals works from the logged
           // months; the report tabs explain what's missing and rebuild it from the saved documents.
           <div ref={resultsRef} className={cn("scroll-mt-6 space-y-6", inputsOpen ? "mt-10" : "mt-2")}>
+            <ResultsTabs value={resultsTab} onChange={setResultsTab} />
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-xl font-semibold">
                 Results<span className="text-base font-normal text-slate-400"> · {ws.name}</span>
               </h2>
-              {versions.length > 0 && <ReportHistory versions={versions} activeId={null} onRestore={restoreVersion} noneShowing />}
+              <div className="flex flex-wrap items-center gap-2">
+                <button type="button" onClick={uploadMore} className={cn(secondaryBtn, "text-slate-200")}>
+                  <Upload className="h-4 w-4" /> Upload More Documents
+                </button>
+                {versions.length > 0 && <ReportHistory versions={versions} activeId={null} onRestore={restoreVersion} noneShowing />}
+              </div>
             </div>
-            <ResultsTabs value={resultsTab} onChange={setResultsTab} />
             {(["overview", "forecast", "report"] as const).map((t) => (
               <div key={t} role="tabpanel" id={`results-panel-${t}`} aria-labelledby={`results-tab-${t}`} hidden={resultsTab !== t} className="space-y-6">
                 <NoReportPanel
@@ -1580,14 +1618,16 @@ export default function DashboardPage() {
                 )}
               </div>
             ))}
-            <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"}>
+            <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"} className="space-y-6">
+              {goalTracker}
               <PanelBoundary title="Fiscal Year Tracker">
                 <FiscalYearTracker tracker={tracker} analysis={null} id="fiscal-tracker" />
               </PanelBoundary>
             </div>
           </div>
         ) : hydrating ? null : (
-          <section className="mt-10" aria-label="Fiscal Year Tracker">
+          <section className="mt-10 space-y-6" aria-label="Goals and Fiscal Year Tracker">
+            {goalTracker}
             <PanelBoundary title="Fiscal Year Tracker">
               <FiscalYearTracker tracker={tracker} analysis={null} id="fiscal-tracker" />
             </PanelBoundary>
@@ -2897,12 +2937,18 @@ function GuidedForm({
   defaultType,
   disabled,
   onSubmit,
+  syncedType,
+  onTypeChange,
 }: {
   draftKey: string;
   mode: WorkspaceMode;
   defaultType: BusinessType;
   disabled: boolean;
   onSubmit: (p: FormPayload) => Promise<boolean>;
+  /** The business type chosen anywhere on the page (this wizard, the statement review, the workspace); null = none yet. */
+  syncedType: BusinessType | null;
+  /** Reports a business type picked here so the statement upload / review panel stays on the same type. */
+  onTypeChange: (bt: BusinessType) => void;
 }) {
   const personal = mode === "PERSONAL";
   const copy = MODE_COPY[mode];
@@ -2925,16 +2971,17 @@ function GuidedForm({
 
   const startOver = () => {
     clearDraft(storageKey);
-    const rows = templateRows(defaultType);
+    const type = syncedType && !personal ? syncedType : defaultType;
+    const rows = templateRows(type);
     touched.current = false;
     setStep(0);
-    setBusinessType(defaultType);
+    setBusinessType(type);
     setRevenue(rows.revenue);
     setExpenses(rows.expenses);
     setRestored(false);
   };
 
-  const chooseType = (bt: BusinessType) => {
+  const applyType = (bt: BusinessType) => {
     setBusinessType(bt);
     // Re-seed templates only while no amounts have been entered.
     if ([...revenue, ...expenses].every((r) => !r.amount)) {
@@ -2943,6 +2990,23 @@ function GuidedForm({
       setExpenses(rows.expenses);
     }
   };
+  const chooseType = (bt: BusinessType) => {
+    applyType(bt);
+    if (!personal) onTypeChange(bt);
+  };
+  // A type picked in the statement review panel flows back here, so the two never disagree.
+  const [seenSync, setSeenSync] = useState(syncedType);
+  if (seenSync !== syncedType) {
+    setSeenSync(syncedType);
+    if (!personal && syncedType && syncedType !== businessType) applyType(syncedType);
+  }
+  // A restored draft's type was an explicit choice: share it with the upload panel once on load.
+  const sharedDraftType = useRef(false);
+  useEffect(() => {
+    if (sharedDraftType.current) return;
+    sharedDraftType.current = true;
+    if (initial && !personal && !syncedType) onTypeChange(initial.businessType);
+  }, [initial, personal, syncedType, onTypeChange]);
 
   const custom = businessType === "OTHER_CUSTOM";
   const validRevenue = validRevenueRows(revenue);
@@ -3655,6 +3719,8 @@ interface UploadReviewState {
   months: { key: string; actual: MonthActual; statementIds: string[] }[];
   duplicateLines: number;
   excludedOneTime: number;
+  /** Raw card / bank statements that share a month with a P&L: potential duplicates, excluded unless confirmed. */
+  overlaps: StatementOverlap[];
   /** Log each month's totals into the Fiscal Year Tracker when the report is generated. */
   logToTracker: boolean;
   /** Months already logged from this review via "Log now" (prevents double logging). */
@@ -3784,7 +3850,15 @@ function historyFor(statements: ParsedStatement[], docs: WorkspaceDocument[]): E
  * (Re)builds the review from the statements: per-month totals, and line items that are that month's own rows for a
  * single month, or one itemized set per month (plus the averaged forward baseline) for several months.
  */
-function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[], history: EarlierStatement[], mode: WorkspaceMode, prev?: UploadReviewState): UploadReviewState {
+function buildReview(
+  statements: ParsedStatement[],
+  earlier: EarlierStatement[],
+  history: EarlierStatement[],
+  mode: WorkspaceMode,
+  prev?: UploadReviewState,
+  /** The business type the owner already chose (wizard / workspace / uploader); wins over the parser's guess. */
+  preferredType?: BusinessType,
+): UploadReviewState {
   const personal = mode === "PERSONAL";
   const cumulative = prev?.cumulative ?? true;
   // Recurrence is checked against every month the owner has, even saved months left out of this report.
@@ -3810,7 +3884,7 @@ function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[],
     (editable.find((m) => [...m.revenue, ...m.expenses].some((r) => insightTone(r.insight))) ?? editable[0] ?? monthRows[0])?.id ??
     "";
   return {
-    businessType: prev?.businessType ?? typeForMode(agg.businessType, mode),
+    businessType: prev?.businessType ?? typeForMode(preferredType ?? agg.businessType, mode),
     revenue: rows.revenue,
     expenses: rows.expenses,
     monthRows,
@@ -3822,6 +3896,7 @@ function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[],
     months: agg.months,
     duplicateLines: agg.duplicateLines,
     excludedOneTime: agg.excludedOneTime,
+    overlaps: agg.overlaps,
     logToTracker: prev?.logToTracker ?? agg.months.some((m) => m.key && m.statementIds.some((id) => !isHistoryId(id))),
     loggedKeys: prev?.loggedKeys ?? [],
     rebuilt: !!prev,
@@ -3912,7 +3987,11 @@ function docsToSave(review: UploadReviewState, personal: boolean): NewWorkspaceD
   // The on-screen rows are this one statement's own lines only when nothing else is folded into them.
   const single = review.statements.length === 1 && !review.earlier.some((e) => e.include) && !(review.cumulative && review.history.length);
   const groups = new Map<string, ParsedStatement[]>();
+  // A raw card / bank statement left out as a P&L duplicate isn't saved either: a later rebuild from My Documents
+  // would otherwise add its charges on top of the P&L that already contains them.
+  const excluded = new Set(review.overlaps.filter((o) => !o.confirmed).map((o) => o.statementId));
   for (const s of review.statements) {
+    if (excluded.has(s.id)) continue;
     const k = s.source?.id ?? s.id;
     groups.set(k, [...(groups.get(k) ?? []), s]);
   }
@@ -3990,6 +4069,9 @@ function StatementUploader({
   onLogActuals,
   existingDocs,
   onBalanceDetected,
+  syncedType,
+  onTypeChange,
+  uploadMoreRef,
 }: {
   mode: WorkspaceMode;
   disabled: boolean;
@@ -4000,19 +4082,41 @@ function StatementUploader({
   existingDocs: WorkspaceDocument[];
   /** The latest bank-statement closing balance read in this batch (offered as cash on hand for the runway). */
   onBalanceDetected?: (b: { amount: number; period: string | null }) => void;
+  /**
+   * The business type already chosen (setup wizard, review dropdown or the workspace itself); null = detect it. Shared
+   * with the wizard so both panels always show — and submit — the same type.
+   */
+  syncedType: BusinessType | null;
+  onTypeChange: (bt: BusinessType | null) => void;
+  /** Set to a function that opens the "add more documents" file picker (used by the sidebar's Upload button). */
+  uploadMoreRef?: { current: (() => void) | null };
 }) {
   const personal = mode === "PERSONAL";
   const [files, setFiles] = useState<File[]>([]);
   const [pasted, setPasted] = useState("");
   const [input, setInput] = useState<"file" | "paste">("file");
-  const [businessType, setBusinessType] = useState<BusinessType | "">(personal ? "PERSONAL_FAMILY" : "");
+  // Business type is owned by the dashboard (kept in sync with the wizard); personal books are always household.
+  const businessType: BusinessType | "" = personal ? "PERSONAL_FAMILY" : syncedType ?? "";
   const [dragOver, setDragOver] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number; name: string } | null>(null);
   const [extractError, setExtractError] = useState<string | null>(null);
   const [batchNotes, setBatchNotes] = useState<string[]>([]);
-  const [review, setReview] = useState<UploadReviewState | null>(null);
+  const [rawReview, setReview] = useState<UploadReviewState | null>(null);
+  // The review always shows the shared business type, so a choice made in the wizard (or here) never snaps back to
+  // whatever the parser guessed.
+  const review = rawReview && !personal && syncedType && rawReview.businessType !== syncedType ? { ...rawReview, businessType: syncedType } : rawReview;
   const inputRef = useRef<HTMLInputElement>(null);
+  const moreRef = useRef<HTMLInputElement>(null);
+  /** Distinguishes statement ids across incremental uploads into the same review. */
+  const batchSeq = useRef(0);
+  useEffect(() => {
+    if (!uploadMoreRef) return;
+    uploadMoreRef.current = () => moreRef.current?.click();
+    return () => {
+      uploadMoreRef.current = null;
+    };
+  }, [uploadMoreRef]);
 
   const ready = input === "file" ? files.length > 0 : pasted.trim().length > 0;
   const busy = disabled || extracting;
@@ -4048,14 +4152,17 @@ function StatementUploader({
   };
 
   /** Reads each statement in turn (one request at a time keeps large batches inside rate limits), then aggregates. */
-  const extract = async (opts: { direct?: boolean } = {}) => {
+  const extract = async (opts: { direct?: boolean; more?: File[] } = {}) => {
+    // `more`: files added from inside the review — read them and fold them into the statements already under review.
+    const adding = opts.more && rawReview ? rawReview : null;
     setExtracting(true);
     setExtractError(null);
-    setBatchNotes([]);
-    const sources: (File | null)[] = input === "file" ? files : [null];
+    if (!adding) setBatchNotes([]);
+    const sources: (File | null)[] = opts.more ?? (input === "file" ? files : [null]);
+    const seq = ++batchSeq.current;
     const parsed: ParsedStatement[] = [];
     const notes: string[] = [];
-    const seen = new Set<string>();
+    const seen = new Set<string>(adding ? adding.statements.map((s) => s.contentHash).filter((h): h is string => !!h) : []);
     let balance: { amount: number; period: string | null } | null = null;
     const headers = await authHeaders();
     for (let i = 0; i < sources.length; i++) {
@@ -4065,7 +4172,7 @@ function StatementUploader({
       try {
         const hash = await hashFile(f ?? new Blob([pasted], { type: "text/plain" }));
         if (hash && seen.has(hash)) {
-          notes.push(`${label}: same file as another in this batch — read once.`);
+          notes.push(adding ? `${label}: already in this review — skipped.` : `${label}: same file as another in this batch — read once.`);
           continue;
         }
         if (hash) seen.add(hash);
@@ -4081,8 +4188,8 @@ function StatementUploader({
           if (!balance || (at ?? "") >= (balance.period ?? "")) balance = { amount: data.endingBalance, period: at };
         }
         if (data.reviewFlags.length) notes.push(`${label}: ${data.reviewFlags.length} transaction${data.reviewFlags.length === 1 ? "" : "s"} flagged for review (${DOCUMENT_KIND_LABELS[data.documentKind].toLowerCase()}).`);
-        const id = `st-${i}-${hash?.slice(0, 8) ?? i}`;
-        const common = { fileName: f?.name ?? null, fileSize: f?.size ?? null, contentHash: hash, kind: f ? ("statement" as const) : ("pasted" as const) };
+        const id = `st-${seq}-${i}-${hash?.slice(0, 8) ?? i}`;
+        const common = { fileName: f?.name ?? null, fileSize: f?.size ?? null, contentHash: hash, kind: f ? ("statement" as const) : ("pasted" as const), documentKind: data.documentKind };
         if (data.months.length >= 2) {
           // One file covering several months (H1 / quarterly / annual): each calendar month in the document becomes its
           // own statement, already assigned to that month, so one upload seeds every month it lists.
@@ -4124,13 +4231,25 @@ function StatementUploader({
     }
     setProgress(null);
     setExtracting(false);
-    setBatchNotes(notes);
     if (balance) onBalanceDetected?.(balance);
+    if (adding) {
+      // Incremental upload: keep the review (month assignments, chosen type, logging choice) and add the new months.
+      setBatchNotes((prev) => [...prev, ...notes]);
+      if (!parsed.length) return;
+      setFiles((cur) => [...cur, ...(opts.more ?? []).filter((f) => !cur.includes(f))]);
+      setReview((r) => {
+        if (!r) return r;
+        const all = [...r.statements, ...parsed];
+        return buildReview(all, earlierFor(all, existingDocs, r.earlier), historyFor(all, existingDocs), mode, { ...r, statements: all, loggedKeys: [] });
+      });
+      return;
+    }
+    setBatchNotes(notes);
     if (!parsed.length) {
       setExtractError(notes.join(" ") || "Couldn't read the statement.");
       return;
     }
-    const built = buildReview(parsed, earlierFor(parsed, existingDocs), historyFor(parsed, existingDocs), mode);
+    const built = buildReview(parsed, earlierFor(parsed, existingDocs), historyFor(parsed, existingDocs), mode, undefined, syncedType ?? undefined);
     if (opts.direct && validRevenueRows(built.revenue).length > 0) {
       // "Skip review" in a workspace with earlier months: generate straight away, cumulatively.
       const { payload, extras } = reviewSubmission(built, personal);
@@ -4140,20 +4259,49 @@ function StatementUploader({
     setReview(built);
   };
 
+  /** "Upload More Documents": inside a review the new files are read and folded in; otherwise they join the file list. */
+  const moreInput = (
+    <input
+      ref={moreRef}
+      type="file"
+      accept={ACCEPT}
+      multiple
+      hidden
+      aria-hidden
+      tabIndex={-1}
+      onChange={(e) => {
+        const list = e.target.files ? Array.from(e.target.files) : [];
+        e.target.value = "";
+        if (!list.length) return;
+        if (rawReview) void extract({ more: list });
+        else {
+          setInput("file");
+          addFiles(list);
+        }
+      }}
+    />
+  );
+
   if (review) {
     return (
-      <UploadReview
-        mode={mode}
-        review={review}
-        setReview={setReview}
-        notes={batchNotes}
-        existingDocs={existingDocs}
-        disabled={disabled}
-        onBack={() => setReview(null)}
-        trackerReady={trackerReady}
-        onLogActuals={onLogActuals}
-        onGenerate={(payload, extras) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType, extras)}
-      />
+      <>
+        {moreInput}
+        <UploadReview
+          mode={mode}
+          review={review}
+          setReview={setReview}
+          notes={batchNotes}
+          existingDocs={existingDocs}
+          disabled={disabled}
+          onBack={() => setReview(null)}
+          trackerReady={trackerReady}
+          onLogActuals={onLogActuals}
+          onTypeChange={onTypeChange}
+          onUploadMore={() => moreRef.current?.click()}
+          uploadingMore={extracting ? (progress ? (progress.total > 1 ? `Reading ${progress.done + 1} of ${progress.total}…` : `Reading ${progress.name}…`) : "Reading…") : null}
+          onGenerate={(payload, extras) => onSubmit({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, payload.businessType, extras)}
+        />
+      </>
     );
   }
 
@@ -4171,6 +4319,7 @@ function StatementUploader({
 
   return (
     <div className={cn(glass, "flex h-full flex-col p-6")}>
+      {moreInput}
       <div className="flex items-center gap-2">
         <Upload className="h-5 w-5 text-indigo-300" />
         <h2 className="text-lg font-semibold">{personal ? "Upload Bank / Card Statements" : "Upload Bank / P&L Statements"}</h2>
@@ -4262,7 +4411,7 @@ function StatementUploader({
       {!personal && (
         <label className="mt-4 block text-sm">
           <span className="text-slate-400">Business type (optional)</span>
-          <select value={businessType} onChange={(e) => setBusinessType(e.target.value as BusinessType | "")} className={cn(inputCls, "mt-1")}>
+          <select value={businessType} onChange={(e) => onTypeChange((e.target.value as BusinessType | "") || null)} className={cn(inputCls, "mt-1")}>
             <option value="">Detect automatically</option>
             {BUSINESS_ONLY_TYPES.map((bt) => (
               <option key={bt} value={bt}>
@@ -4298,6 +4447,78 @@ function StatementUploader({
           {hasHistory ? "Skip review — analyze together with earlier months" : "Skip review and analyze directly"}
         </button>
       )}
+    </div>
+  );
+}
+
+/**
+ * P&L vs. raw statement guard: a month with both a P&L and a credit card / bank statement would otherwise count the
+ * card's charges twice (once itemized, once inside the P&L totals). Lists each overlapping statement's lines with the
+ * P&L line they likely roll into; they stay out of the totals until the owner confirms they're extra.
+ */
+function OverlapGuard({ overlaps, onConfirm }: { overlaps: StatementOverlap[]; onConfirm: (statementId: string, confirmed: boolean) => void }) {
+  const [open, setOpen] = useState<string | null>(null);
+  if (!overlaps.length) return null;
+  const excluded = overlaps.filter((o) => !o.confirmed);
+  return (
+    <div role="status" className="mt-3 rounded-xl border border-rose-300/30 bg-rose-500/[0.06] px-3 py-2.5 text-xs">
+      <p className="flex items-start gap-1.5 font-medium text-rose-100">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+        <span>
+          Potential duplicates: {overlaps.length === 1 ? "a raw statement covers" : `${overlaps.length} raw statements cover`} the same month as a P&amp;L
+          {excluded.length ? ` — ${excluded.length === 1 ? "its" : "their"} lines are left out of the monthly totals so expenses aren't counted twice.` : "."}
+        </span>
+      </p>
+      <ul className="mt-2 space-y-2">
+        {overlaps.map((o) => {
+          const matched = o.lines.filter((l) => l.matchedPnlLine).length;
+          return (
+            <li key={o.statementId} className="rounded-lg border border-white/10 bg-slate-900/40 px-2.5 py-2">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="min-w-0 flex-1 text-slate-200">
+                  <span className="font-medium">{o.statementName}</span>{" "}
+                  <span className="text-slate-400">
+                    · {DOCUMENT_KIND_LABELS[o.documentKind]} · {periodLabel(o.month)} · overlaps {o.pnlNames.join(", ")}
+                  </span>
+                </span>
+                <span className={cn("tabular-nums", o.confirmed ? "text-slate-300" : "text-slate-500 line-through")}>{exactMoney(o.expenses)} out</span>
+              </div>
+              <p className="mt-1 text-slate-400">
+                {o.lines.length} line{o.lines.length === 1 ? "" : "s"}
+                {matched ? `, ${matched} matching a P&L line` : ""} —{" "}
+                {o.confirmed ? <span className="text-amber-200">counted on top of the P&amp;L (you confirmed)</span> : <span>excluded from totals</span>}
+              </p>
+              <div className="mt-1.5 flex flex-wrap items-center gap-3">
+                <button type="button" onClick={() => setOpen((x) => (x === o.statementId ? null : o.statementId))} aria-expanded={open === o.statementId} className="text-indigo-300 hover:text-indigo-200">
+                  {open === o.statementId ? "Hide lines" : "View overlapping lines"}
+                </button>
+                <label className="inline-flex cursor-pointer items-center gap-1.5 text-slate-300">
+                  <input type="checkbox" className="h-3.5 w-3.5 accent-rose-400" checked={o.confirmed} onChange={(e) => onConfirm(o.statementId, e.target.checked)} />
+                  These charges are not in the P&amp;L — count them too
+                </label>
+              </div>
+              {open === o.statementId && (
+                <ul className="mt-2 divide-y divide-white/5 tabular-nums">
+                  {o.lines.map((l, i) => (
+                    <li key={`${l.label}-${i}`} className="flex flex-wrap items-baseline justify-between gap-x-3 py-1">
+                      <span className="min-w-0 text-slate-300">
+                        {l.label}
+                        {l.category && <span className="text-slate-500"> · {l.category}</span>}
+                        {l.matchedPnlLine ? <span className="text-rose-200"> · likely in P&amp;L &ldquo;{l.matchedPnlLine}&rdquo;</span> : <span className="text-slate-500"> · no matching P&amp;L line</span>}
+                      </span>
+                      <span className="text-slate-200">
+                        {l.side === "revenue" ? "+" : ""}
+                        {exactMoney(l.amount)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      {excluded.length > 0 && <p className="mt-2 text-[11px] text-slate-500">Excluded statements aren&apos;t saved to My Documents either, so a later rebuild can&apos;t double count them.</p>}
     </div>
   );
 }
@@ -4497,6 +4718,9 @@ function UploadReview({
   onGenerate,
   trackerReady,
   onLogActuals,
+  onTypeChange,
+  onUploadMore,
+  uploadingMore,
 }: {
   mode: WorkspaceMode;
   review: UploadReviewState;
@@ -4508,6 +4732,12 @@ function UploadReview({
   onGenerate: (payload: FormPayload, extras: AnalysisExtras) => Promise<boolean>;
   trackerReady: boolean;
   onLogActuals: (key: string, actual: MonthActual) => string;
+  /** Keeps the setup wizard on the same business type as this dropdown. */
+  onTypeChange: (bt: BusinessType) => void;
+  /** Opens the file picker to add more statements (other months) to this review. */
+  onUploadMore: () => void;
+  /** Progress text while added statements are being read; null when idle. */
+  uploadingMore: string | null;
 }) {
   const personal = mode === "PERSONAL";
   const copy = MODE_COPY[mode];
@@ -4565,9 +4795,12 @@ function UploadReview({
 
   return (
     <div className={cn(glass, "flex h-full flex-col p-6")}>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <ClipboardList className="h-5 w-5 text-indigo-300" />
-        <h2 className="text-lg font-semibold">Review parsed line items</h2>
+        <h2 className="flex-1 text-lg font-semibold">Review parsed line items</h2>
+        <button type="button" onClick={onUploadMore} disabled={disabled || !!uploadingMore} className={cn(primaryBtn, "px-3 py-1.5 text-xs")} title="Add statements for other months (or another account) to this review">
+          {uploadingMore ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />} {uploadingMore ?? "Upload More Documents"}
+        </button>
       </div>
       <p className="mt-1 text-sm text-slate-400">
         {(() => {
@@ -4688,6 +4921,11 @@ function UploadReview({
           </div>
         )}
 
+        <OverlapGuard
+          overlaps={review.overlaps}
+          onConfirm={(id, confirmOverlap) => restructure(review.statements.map((x) => (x.id === id ? { ...x, confirmOverlap } : x)), review.earlier)}
+        />
+
         <ReviewFlagsList statements={review.statements} />
 
         {(review.duplicateLines > 0 || review.excludedOneTime > 0 || review.rebuilt) && (
@@ -4747,7 +4985,15 @@ function UploadReview({
       {!personal && (
         <label className="mt-4 block text-sm">
           <span className="text-slate-400">Business type</span>
-          <select value={businessType} onChange={(e) => setReview((r) => r && { ...r, businessType: e.target.value as BusinessType })} className={cn(inputCls, "mt-1")}>
+          <select
+            value={businessType}
+            onChange={(e) => {
+              const bt = e.target.value as BusinessType;
+              setReview((r) => r && { ...r, businessType: bt });
+              onTypeChange(bt);
+            }}
+            className={cn(inputCls, "mt-1")}
+          >
             {BUSINESS_ONLY_TYPES.map((bt) => (
               <option key={bt} value={bt}>
                 {BUSINESS_TYPE_LABELS[bt]}

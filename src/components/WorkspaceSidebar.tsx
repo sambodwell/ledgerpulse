@@ -16,6 +16,7 @@ import {
   Menu,
   Plus,
   Settings2,
+  Upload,
   X,
 } from "lucide-react";
 import { BUSINESS_ONLY_TYPES, BUSINESS_TYPE_LABELS, type BusinessType, type WorkspaceMode, type WorkspaceProfile } from "@/lib/schemas";
@@ -31,6 +32,8 @@ export interface SidebarDocuments {
   loading: boolean;
   /** Opens the Documents manager (optionally scrolled to one document). */
   onOpen: (docId?: string) => void;
+  /** Opens the statement uploader's file picker to add more months (shown as "Upload More Documents"). */
+  onUploadMore?: () => void;
 }
 
 interface SidebarProps {
@@ -276,14 +279,19 @@ function DocumentsNav({ documents, onNavigate }: { documents?: SidebarDocuments;
   const [open, setOpen] = useState(false);
   const listId = useId();
   if (!documents) {
-    // Pages without the documents loaded (Settings) open the manager on the dashboard.
+    // Pages without the documents loaded (Settings) open the manager / uploader on the dashboard.
     return (
-      <NavLink href="/dashboard?open=documents" Icon={FolderOpen} onClick={onNavigate}>
-        Documents
-      </NavLink>
+      <>
+        <NavLink href="/dashboard?open=documents" Icon={FolderOpen} onClick={onNavigate}>
+          Documents
+        </NavLink>
+        <Link href="/dashboard?open=upload" onClick={onNavigate} className={uploadMoreCls}>
+          <Upload className="h-4 w-4" /> Upload More Documents
+        </Link>
+      </>
     );
   }
-  const { docs, loading, onOpen } = documents;
+  const { docs, loading, onOpen, onUploadMore } = documents;
   const groups = groupByKind(docs);
   const open_ = (id?: string) => {
     onNavigate?.();
@@ -335,9 +343,26 @@ function DocumentsNav({ documents, onNavigate }: { documents?: SidebarDocuments;
           </button>
         </div>
       )}
+      {onUploadMore && (
+        // Always visible (not inside the dropdown): adding the next month's statements shouldn't need a hunt.
+        <button
+          type="button"
+          onClick={() => {
+            // The picker opens inside this click (browsers only allow it from a user gesture), then the drawer closes.
+            onUploadMore();
+            onNavigate?.();
+          }}
+          className={uploadMoreCls}
+        >
+          <Upload className="h-4 w-4" /> Upload More Documents
+        </button>
+      )}
     </div>
   );
 }
+
+const uploadMoreCls =
+  "mt-1 flex w-full items-center justify-center gap-2 rounded-lg border border-indigo-300/40 bg-indigo-500/15 px-3 py-2 text-sm font-medium text-indigo-100 transition hover:bg-indigo-500/25";
 
 /**
  * "Create New Workspace": pick Business or Personal first (that choice is permanent for the book), name it, and — for a

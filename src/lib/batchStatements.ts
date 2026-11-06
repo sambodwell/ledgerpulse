@@ -9,6 +9,10 @@
  *  - Statements are grouped by the month they cover. Within a month, statements are added together (e.g. a checking
  *    account + a credit card), but a line that appears identically in two different statements for that month
  *    (same label, category, amount and recurrence) is counted once — that's an overlapping or re-exported statement.
+ *  - P&L vs. raw statements: a P&L already summarizes its month, so when a month has both a P&L and a raw credit
+ *    card / bank statement, the raw transactions are sub-components of the P&L totals (the fuel card charge is inside
+ *    the P&L's fuel line). They're reported as potential duplicates (`overlaps`) and left out of that month's totals
+ *    until the owner confirms the statement (`confirmOverlap`).
  *  - Each month's total becomes that month's actual for the Fiscal Year Tracker.
  *  - The forward baseline averages recurring lines across months (sum ÷ months covered), so three months of
  *    statements don't triple the monthly figures. Past one-time items are logged in their month but left out of the
@@ -39,6 +43,13 @@ export interface ParsedStatement {
   source?: { id: string; name: string };
   /** Raw transactions the parser asked the owner to double-check (unrecognized merchants, duplicates, unusual charges). */
   reviewFlags?: ReviewFlag[];
+  /** What the parser recognized the document as (absent for saved documents, which don't record it). */
+  documentKind?: DocumentKind;
+  /**
+   * A raw card / bank statement in a month that also has a P&L: the owner confirmed its lines are *not* already in
+   * the P&L, so they count. Unset = they're treated as potential duplicates and left out of the month's totals.
+   */
+  confirmOverlap?: boolean;
 }
 
 /** What the parser recognized the document as. */
@@ -60,6 +71,26 @@ export const DOCUMENT_KIND_LABELS: Record<DocumentKind, string> = {
   PROFIT_AND_LOSS: "P&L",
   OTHER: "Document",
 };
+
+/** Transaction-level documents whose lines a same-month P&L already summarizes. */
+export const RAW_DOCUMENT_KINDS: readonly DocumentKind[] = ["CREDIT_CARD_STATEMENT", "BANK_STATEMENT"];
+export const isRawDocumentKind = (k: DocumentKind | undefined): boolean => !!k && RAW_DOCUMENT_KINDS.includes(k);
+
+/** One raw statement whose lines overlap a P&L for the same month. */
+export interface StatementOverlap {
+  month: string;
+  statementId: string;
+  statementName: string;
+  documentKind: DocumentKind;
+  /** The P&L statement(s) for that month. */
+  pnlNames: string[];
+  /** True when the owner confirmed these lines count on top of the P&L. */
+  confirmed: boolean;
+  /** Each raw line with the P&L line it most likely rolls up into. */
+  lines: { side: "revenue" | "expense"; label: string; category: string | null; amount: number; matchedPnlLine: string | null }[];
+  revenue: number;
+  expenses: number;
+}
 
 export interface ReviewFlag {
   kind: ReviewFlagKind;
@@ -145,6 +176,8 @@ export interface BatchAggregate {
   duplicateLines: number;
   /** Past one-time lines left out of the forward baseline (they're still in that month's actual). */
   excludedOneTime: number;
+  /** Raw card / bank statements sharing a month with a P&L (left out of the totals unless confirmed). */
+  overlaps: StatementOverlap[];
 }
 
 const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
@@ -192,6 +225,49 @@ function averageLines<T extends { amount: number; label: string; oneTime?: boole
   });
 }
 
+const words = (s: string) => new Set(norm(s).split(/[^a-z0-9]+/).filter((w) => w.length > 2));
+const similar = (a: string, b: string) => {
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) return false;
+  if (na.includes(nb) || nb.includes(na)) return true;
+  const wb = words(b);
+  return [...words(a)].some((w) => wb.has(w));
+};
+
+/** A raw statement's lines, each matched to the P&L line it most likely rolls up into (same category, else a similar label). */
+function overlapOf(raw: ParsedStatement, pnl: ParsedStatement[], month: string): StatementOverlap {
+  const pRev = pnl.flatMap((p) => p.items.revenue);
+  const pExp = pnl.flatMap((p) => p.items.expenses);
+  const lines: StatementOverlap["lines"] = [
+    ...raw.items.revenue.map((r) => ({
+      side: "revenue" as const,
+      label: r.label,
+      category: null,
+      amount: r.amount,
+      matchedPnlLine: (pRev.find((p) => similar(p.label, r.label)) ?? pRev[0])?.label ?? null,
+    })),
+    ...raw.items.expenses.map((e) => ({
+      side: "expense" as const,
+      label: e.label,
+      category: e.category,
+      amount: e.amount,
+      matchedPnlLine: (pExp.find((p) => norm(p.category) === norm(e.category)) ?? pExp.find((p) => similar(p.label, e.label) || similar(p.category, e.label)))?.label ?? null,
+    })),
+  ];
+  return {
+    month,
+    statementId: raw.id,
+    statementName: raw.name,
+    documentKind: raw.documentKind ?? "OTHER",
+    pnlNames: pnl.map((p) => p.name),
+    confirmed: !!raw.confirmOverlap,
+    lines,
+    revenue: sumMoney(raw.items.revenue, (l) => l.amount),
+    expenses: sumMoney(raw.items.expenses, (l) => l.amount),
+  };
+}
+
 export function aggregateStatements(statements: ParsedStatement[], fallbackType: BusinessType): BatchAggregate {
   // Group by assigned month; unassigned statements are each their own group.
   const groups = new Map<string, ParsedStatement[]>();
@@ -202,9 +278,17 @@ export function aggregateStatements(statements: ParsedStatement[], fallbackType:
 
   let duplicateLines = 0;
   const merged: BatchMonthLines[] = [];
+  const overlaps: StatementOverlap[] = [];
   for (const [g, list] of groups) {
-    const rev = mergeMonth(list.map((s) => s.items.revenue), revKey);
-    const exp = mergeMonth(list.map((s) => s.items.expenses), expKey);
+    // A P&L already summarizes the month: same-month raw card / bank lines are its sub-components, not extra spend.
+    const pnl = g.startsWith("?") ? [] : list.filter((s) => s.documentKind === "PROFIT_AND_LOSS");
+    const counted = list.filter((s) => {
+      if (!pnl.length || !isRawDocumentKind(s.documentKind)) return true;
+      overlaps.push(overlapOf(s, pnl, g));
+      return !!s.confirmOverlap;
+    });
+    const rev = mergeMonth(counted.map((s) => s.items.revenue), revKey);
+    const exp = mergeMonth(counted.map((s) => s.items.expenses), expKey);
     duplicateLines += rev.dupes + exp.dupes;
     merged.push({ key: g.startsWith("?") ? "" : g, statementIds: list.map((s) => s.id), revenue: rev.lines, expenses: exp.lines });
   }
@@ -218,7 +302,7 @@ export function aggregateStatements(statements: ParsedStatement[], fallbackType:
   const businessType = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? fallbackType;
 
   const baseline = monthlyBaseline(merged);
-  return { businessType, ...baseline, months, monthLines: merged, monthCount: merged.length, duplicateLines };
+  return { businessType, ...baseline, months, monthLines: merged, monthCount: merged.length, duplicateLines, overlaps };
 }
 
 /**
