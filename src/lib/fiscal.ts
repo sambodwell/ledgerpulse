@@ -230,7 +230,12 @@ export function summarizeFiscalYear(s: FiscalTrackerState, now = new Date()): Fi
   const dates = Array.from({ length: 12 }, (_, i) => new Date(Date.UTC(s.fyStartYear, s.fyStartMonth + i, 1)));
   const keys = dates.map(monthKey);
 
-  const loggedKeys = keys.filter((k) => s.actuals[k]);
+  // The trailing window is the most recent logged months up to this fiscal year's end — so actuals logged earlier
+  // (the end of last fiscal year, say) still drive the forecast when nothing is logged in this year yet.
+  const fyEnd = keys[keys.length - 1];
+  const loggedKeys = Object.keys(s.actuals)
+    .filter((k) => /^\d{4}-\d{2}$/.test(k) && k <= fyEnd)
+    .sort();
   const trailingKeys = loggedKeys.slice(-Math.max(1, s.trailingWindow));
   // One-time expenses are left out so a single repair or purchase doesn't inflate every forecast month.
   const trailing = trailingKeys.length
@@ -247,7 +252,9 @@ export function summarizeFiscalYear(s: FiscalTrackerState, now = new Date()): Fi
     const rs = s.seasonality ? season.revenue[idx] : 1;
     const es = s.seasonality ? season.expenses[idx] : 1;
     const plan = { revenue: round2(s.baseline.revenue * rs), expenses: round2(s.baseline.expenses * es) };
-    const forecast = s.forecastMode === "TRAILING" && trailing ? trailing : plan;
+    // An empty plan (no baseline was ever set) would forecast $0: logged actuals are the better estimate then.
+    const noPlan = s.baseline.revenue === 0 && s.baseline.expenses === 0;
+    const forecast = trailing && (s.forecastMode === "TRAILING" || noPlan) ? trailing : plan;
     const actual = s.actuals[key] ?? null;
     const status: MonthStatus = actual ? "ACTUAL" : key <= currentKey ? "OPEN" : "FUTURE";
     return {

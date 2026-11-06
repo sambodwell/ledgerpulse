@@ -10,6 +10,7 @@ import {
   Bookmark,
   Briefcase,
   CheckCircle2,
+  CircleHelp,
   ChevronDown,
   ChevronUp,
   ClipboardList,
@@ -61,6 +62,7 @@ import {
   isBusinessType,
   modeOf,
   monthKey,
+  parseMonthKey,
   normalizeForecastSettings,
   projectBaseline,
   projectionOptions,
@@ -107,7 +109,8 @@ import {
 } from "@/lib/supabase";
 import { exactMoney, normalizeTrackerState, statementTotals, withLoggedActual, type MonthActual } from "@/lib/fiscal";
 import { aggregateActuals, calibrateToActuals, resolveBasis, type ActualsAggregate, type ProjectionBasis } from "@/lib/projectionBasis";
-import { DOCUMENT_KIND_LABELS, REVIEW_FLAG_LABELS, aggregateStatements, documentName, hashFile, parseExtractResponse, type ParsedStatement } from "@/lib/batchStatements";
+import { DOCUMENT_KIND_LABELS, REVIEW_FLAG_LABELS, aggregateStatements, documentName, hashFile, monthlyBaseline, parseExtractResponse, type ParsedStatement, type ReviewFlag } from "@/lib/batchStatements";
+import { buildVendorHistory, classifyLine, insightTone, matchFlags, sameVendor, type LineInsight } from "@/lib/lineInsights";
 import { periodLabel } from "@/lib/statementPeriod";
 import { StatementMonthPicker, statementMonthOptions } from "@/components/dashboard/StatementMonth";
 import { DocumentsHub } from "@/components/dashboard/DocumentsHub";
@@ -622,11 +625,14 @@ export default function DashboardPage() {
   const canRebuild = !!rebuildSource;
   useEffect(() => {
     if (!activeWsId || current || loading || reportStatus[activeWsId] !== "ok" || !(activeWsId in docsByWs) || rebuildTried.current.has(activeWsId)) return;
-    // Automatic rebuilds only from documents; a report from logged actuals alone is the owner's call (button).
-    if (!payloadFromDocuments(docsByWs[activeWsId], formDefaultType)) return;
+    // Saved documents first; otherwise even one or two logged months (from any point in the year) build the report, so
+    // the overview, forecast and executive report never sit empty while the workspace has data. Logged months are only
+    // used once this workspace's own tracker has loaded.
+    const fromDocs = !!payloadFromDocuments(docsByWs[activeWsId], formDefaultType);
+    if (!fromDocs && !(tracker.workspaceId === activeWsId && trackerActuals && payloadFromActuals(trackerActuals, formDefaultType))) return;
     const t = setTimeout(() => void rebuildFromDocuments(activeWsId), 0);
     return () => clearTimeout(t);
-  }, [activeWsId, current, loading, reportStatus, docsByWs, formDefaultType, rebuildFromDocuments]);
+  }, [activeWsId, current, loading, reportStatus, docsByWs, formDefaultType, rebuildFromDocuments, tracker.workspaceId, trackerActuals]);
 
   /** "Re-analyze all N months": one fresh report across every saved document, kept as a new version. */
   const reanalyzeAll = async () => {
@@ -2739,6 +2745,8 @@ interface FormRevenue {
   oneTime: boolean;
   /** Recurring lines only: percent (1–99) of the first projected month this line covers; "" = full month. */
   partial: string;
+  /** Statement review only: parser flags and cross-month recurrence for this line (highlighted inline). */
+  insight?: LineInsight;
 }
 interface FormExpense {
   id: number;
@@ -2755,6 +2763,8 @@ interface FormExpense {
   pct: string;
   /** Revenue line label the percent applies to; "" = all recurring revenue. */
   pctOf: string;
+  /** Statement review only: parser flags and cross-month recurrence for this line (highlighted inline). */
+  insight?: LineInsight;
 }
 
 type FormPayload = {
@@ -3107,10 +3117,12 @@ function RevenueRowsEditor({
       rows={rows}
       onAdd={() => setRows((r) => [...r, blankRevenue()])}
       onRemove={(id) => setRows((r) => r.filter((x) => x.id !== id))}
+      rowClassName={(row) => insightRowClass(row.insight)}
       render={(row, removeButton) => {
         const update = (patch: Partial<FormRevenue>) => setRows((r) => r.map((x) => (x.id === row.id ? { ...x, ...patch } : x)));
         return (
           <>
+            {row.insight && <RowInsightNotice insight={row.insight} onChange={(insight) => update({ insight })} />}
             <div className="flex items-center gap-2">
               <div className="min-w-0 flex-1">
                 <TextInput aria-label={copy.revenueLines} value={row.label} placeholder={custom ? "e.g. Catering orders" : "Describe the source"} onChange={(v) => update({ label: v })} />
@@ -3129,7 +3141,7 @@ function RevenueRowsEditor({
                   </span>
                 </div>
               )}
-              <RecurrenceControl oneTime={row.oneTime} partial={row.partial} onChange={update} />
+              <RecurrenceControl oneTime={row.oneTime} partial={row.partial} onChange={(p) => update({ ...p, ...settleRecurrence(row.insight) })} />
             </div>
           </>
         );
@@ -3169,11 +3181,13 @@ function ExpenseRowsEditor({
         rows={rows}
         onAdd={() => setRows((r) => [...r, blankExpense()])}
         onRemove={(id) => setRows((r) => r.filter((x) => x.id !== id))}
+        rowClassName={(row) => insightRowClass(row.insight)}
         render={(row, removeButton) => {
           const update = (patch: Partial<FormExpense>) => setRows((r) => r.map((x) => (x.id === row.id ? { ...x, ...patch } : x)));
           const help = personal ? CATEGORY_HELP[row.category] : undefined;
           return (
             <>
+              {row.insight && <RowInsightNotice insight={row.insight} onChange={(insight) => update({ insight })} />}
               <div className="flex items-center gap-2">
                 {custom ? (
                   <input aria-label="Category" list={datalistId} value={row.category} placeholder="Your category" title={row.category || undefined} onChange={(ev) => update({ category: ev.target.value })} className={cn(inputCls, "min-w-0 flex-1")} />
@@ -3205,7 +3219,7 @@ function ExpenseRowsEditor({
                   </div>
                 )}
                 <AmountModeToggle pctMode={row.pctMode} onChange={(pctMode) => update(pctMode ? { pctMode, oneTime: false, partial: "" } : { pctMode, amount: effectiveExpenses([row], revenue)[0].amount })} />
-                {!row.pctMode && <RecurrenceControl oneTime={row.oneTime} partial={row.partial} onChange={update} />}
+                {!row.pctMode && <RecurrenceControl oneTime={row.oneTime} partial={row.partial} onChange={(p) => update({ ...p, ...settleRecurrence(row.insight) })} />}
               </div>
               {help && (
                 <p className="flex items-start gap-1.5 text-xs text-slate-400">
@@ -3389,6 +3403,122 @@ function ReviewSummary({ mode, businessType, revenue, expenses }: { mode: Worksp
 
 const prefersReducedMotion = () => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
+// ---------------------------------------------------------------------------
+// Inline line-item insights (statement review): flagged transactions and recurrence to confirm
+// ---------------------------------------------------------------------------
+
+/** Card styling for a line that needs a look; undefined = the default card. */
+function insightRowClass(i: LineInsight | undefined): string | undefined {
+  switch (insightTone(i)) {
+    case "duplicate":
+      return "border-rose-400/60 border-l-4 border-l-rose-400 bg-rose-500/[0.07] shadow-[0_0_0_1px_rgba(251,113,133,0.15)]";
+    case "flag":
+      return "border-amber-400/60 border-l-4 border-l-amber-400 bg-amber-400/[0.07] shadow-[0_0_0_1px_rgba(251,191,36,0.15)]";
+    case "recurrence":
+      return "border-sky-400/50 border-l-4 border-l-sky-400 bg-sky-400/[0.05]";
+    default:
+      return undefined;
+  }
+}
+
+/** Picking recurring / one-time on a line settles its "does this repeat?" prompt. */
+const settleRecurrence = (i: LineInsight | undefined): { insight?: LineInsight } => (i?.recurrence && i.recurrence.status !== "confirmed" ? { insight: { ...i, recurrenceReviewed: true } } : {});
+
+const FLAG_TONE: Record<ReviewFlag["kind"], string> = {
+  UNRECOGNIZED_MERCHANT: "border-amber-300/50 bg-amber-400/15 text-amber-100",
+  DUPLICATE_TRANSACTION: "border-rose-300/50 bg-rose-500/15 text-rose-100",
+  UNUSUAL_CHARGE: "border-orange-300/50 bg-orange-400/15 text-orange-100",
+};
+
+/** The flag / recurrence banner at the top of a line's card. */
+function RowInsightNotice({ insight, onChange }: { insight: LineInsight; onChange: (i: LineInsight) => void }) {
+  const flagsOpen = insight.flags.length > 0 && !insight.flagsReviewed;
+  const rec = insight.recurrence;
+  const recOpen = !!rec && rec.status !== "confirmed" && !insight.recurrenceReviewed;
+  return (
+    <div className="space-y-1.5">
+      {insight.flags.length > 0 &&
+        (flagsOpen ? (
+          <div role="note" className="rounded-lg border border-white/10 bg-slate-950/40 px-2.5 py-2 text-xs">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-300" aria-hidden />
+              {[...new Set(insight.flags.map((f) => f.kind))].map((k) => (
+                <span key={k} className={cn("rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide", FLAG_TONE[k])}>
+                  {REVIEW_FLAG_LABELS[k]}
+                </span>
+              ))}
+              <button
+                type="button"
+                onClick={() => onChange({ ...insight, flagsReviewed: true })}
+                className="ml-auto inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-slate-300 hover:bg-white/5 hover:text-white"
+              >
+                <CheckCircle2 className="h-3 w-3" aria-hidden /> Looks fine
+              </button>
+            </div>
+            <ul className="mt-1.5 space-y-1">
+              {insight.flags.map((f, i) => (
+                <li key={`${f.kind}-${f.date}-${f.transactionId}-${i}`} className="flex flex-wrap items-baseline gap-x-2 text-slate-300">
+                  <span className="text-slate-100">{f.merchant}</span>
+                  <span className="tabular-nums">{exactMoney(f.amount)}</span>
+                  {f.date && <span className="text-slate-500">{f.date}</span>}
+                  {f.transactionId && <span className="font-mono text-[10px] text-slate-500">#{f.transactionId}</span>}
+                  {f.note && <span className="basis-full text-slate-400">{f.note}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p className="flex items-center gap-1.5 text-[11px] text-slate-500">
+            <CheckCircle2 className="h-3 w-3 text-emerald-400/80" aria-hidden /> {insight.flags.length === 1 ? "Flag" : `${insight.flags.length} flags`} checked
+            <button type="button" onClick={() => onChange({ ...insight, flagsReviewed: false })} className="text-indigo-300 hover:text-indigo-200">
+              show
+            </button>
+          </p>
+        ))}
+      {rec &&
+        (recOpen ? (
+          <p role="note" className="flex items-start gap-1.5 rounded-lg border border-sky-300/30 bg-sky-500/10 px-2.5 py-1.5 text-xs text-sky-100">
+            <CircleHelp className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sky-300" aria-hidden />
+            <span className="flex-1">
+              <span className="font-semibold">{rec.status === "new" ? "New this month" : "Recurring or one-time?"}</span> {rec.note}
+            </span>
+            <button type="button" onClick={() => onChange({ ...insight, recurrenceReviewed: true })} className="shrink-0 text-[11px] text-sky-200 underline-offset-2 hover:underline">
+              Keep as is
+            </button>
+          </p>
+        ) : rec.status === "confirmed" ? (
+          <p className="inline-flex items-center gap-1 rounded-full border border-emerald-300/25 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-200" title={rec.note}>
+            <BadgeCheck className="h-3 w-3" aria-hidden /> {rec.note}
+          </p>
+        ) : null)}
+    </div>
+  );
+}
+
+/** "2 flagged · 1 to confirm" for a list header. */
+function InsightCounts({ rows }: { rows: { insight?: LineInsight }[] }) {
+  const flagged = rows.filter((r) => {
+    const t = insightTone(r.insight);
+    return t === "flag" || t === "duplicate";
+  }).length;
+  const confirm = rows.filter((r) => insightTone(r.insight) === "recurrence").length;
+  if (!flagged && !confirm) return null;
+  return (
+    <span className="ml-2 inline-flex flex-wrap gap-1.5 align-middle text-[11px] font-normal">
+      {flagged > 0 && (
+        <span className="inline-flex items-center gap-1 rounded-full border border-amber-300/40 bg-amber-400/10 px-2 py-0.5 text-amber-100">
+          <AlertTriangle className="h-3 w-3" aria-hidden /> {flagged} flagged
+        </span>
+      )}
+      {confirm > 0 && (
+        <span className="inline-flex items-center gap-1 rounded-full border border-sky-300/40 bg-sky-400/10 px-2 py-0.5 text-sky-100">
+          <CircleHelp className="h-3 w-3" aria-hidden /> {confirm} to confirm
+        </span>
+      )}
+    </span>
+  );
+}
+
 function RowEditor<T extends { id: number }>(props: {
   hint: string;
   columns: string[];
@@ -3397,6 +3527,8 @@ function RowEditor<T extends { id: number }>(props: {
   onRemove: (id: number) => void;
   /** Rendered inside a stacked card per line, so long labels (e.g. category names) get full width. */
   render: (row: T, removeButton: ReactNode) => ReactNode;
+  /** Replaces the card's default border / background (e.g. to highlight a flagged line). */
+  rowClassName?: (row: T) => string | undefined;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
   const scrollToNew = useRef(false);
@@ -3434,7 +3566,7 @@ function RowEditor<T extends { id: number }>(props: {
       {/* Fixed-height, self-contained scroll area: stable gutter (no width jump when the scrollbar appears) and no scroll chaining into the page. */}
       <div ref={listRef} className="max-h-[26rem] space-y-3 overflow-y-auto overscroll-contain scroll-py-2 rounded-xl pr-1 [scrollbar-gutter:stable]">
         {props.rows.map((row) => (
-          <div key={row.id} className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
+          <div key={row.id} className={cn("space-y-2 rounded-xl border p-3 transition-colors", props.rowClassName?.(row) ?? "border-white/10 bg-white/[0.02]")}>
             {props.render(row, remove(row.id))}
           </div>
         ))}
@@ -3488,10 +3620,30 @@ const ACCEPT = ".pdf,.txt,.csv,application/pdf,text/plain,text/csv";
 /** An earlier document from this workspace covering a month in the current upload (e.g. last week's card statement). */
 type EarlierStatement = ParsedStatement & { include: boolean; savedAt: string };
 
-interface UploadReviewState {
-  businessType: BusinessType;
+/** One calendar month's own itemized rows in a multi-month review (never blended with other months). */
+interface MonthRows {
+  /** Stable id: the month key, or "?<statement id>" for a statement without a month. */
+  id: string;
+  key: string;
+  statementIds: string[];
+  /** false = the month comes only from documents already saved in the workspace (edited in My Documents, not here). */
+  editable: boolean;
   revenue: FormRevenue[];
   expenses: FormExpense[];
+}
+
+interface UploadReviewState {
+  businessType: BusinessType;
+  /**
+   * Single month: that month's editable rows. Several months: the forward baseline averaged from `monthRows` when the
+   * review was built (the live baseline is recomputed from the edited months — see `reviewBaseline`).
+   */
+  revenue: FormRevenue[];
+  expenses: FormExpense[];
+  /** Two or more months: each month's itemized rows, oldest first; empty for a single month. */
+  monthRows: MonthRows[];
+  /** Month shown in the month-by-month editor (a `MonthRows.id`). */
+  activeMonth: string;
   /** Statements read in this upload (one or many). */
   statements: ParsedStatement[];
   /** Saved documents for the same months, folded into those months' totals when included. */
@@ -3511,17 +3663,56 @@ interface UploadReviewState {
   rebuilt: boolean;
 }
 
-/** Parsed lines → editable form rows. Amounts are shown with cents; margins as percents. */
-function itemsToRows(items: { revenue: RevenueLine[]; expenses: ExpenseLine[] }, personal: boolean) {
-  return {
-    revenue: items.revenue.map((r) => ({
-      ...blankRevenue(r.label),
-      amount: r.amount.toFixed(2),
-      margin: personal || !Number.isFinite(r.margin) ? "" : String(Math.round(r.margin * 100)),
-      oneTime: r.oneTime === true,
-    })),
-    expenses: items.expenses.map((e) => ({ ...blankExpense(e.category), label: e.label, amount: e.amount.toFixed(2), oneTime: e.oneTime === true })),
+/** Parsed lines → editable form rows. Amounts are shown with cents; margins as percents. `insightOf` attaches flags / recurrence. */
+function itemsToRows(items: { revenue: RevenueLine[]; expenses: ExpenseLine[] }, personal: boolean, insightOf?: (line: RevenueLine | ExpenseLine) => LineInsight | undefined) {
+  const withInsight = (line: RevenueLine | ExpenseLine) => {
+    const insight = insightOf?.(line);
+    return insight ? { insight } : {};
   };
+  return {
+    revenue: items.revenue.map(
+      (r): FormRevenue => ({
+        ...blankRevenue(r.label),
+        amount: r.amount.toFixed(2),
+        margin: personal || !Number.isFinite(r.margin) ? "" : String(Math.round(r.margin * 100)),
+        oneTime: r.oneTime === true,
+        ...withInsight(r),
+      }),
+    ),
+    expenses: items.expenses.map((e): FormExpense => ({ ...blankExpense(e.category), label: e.label, amount: e.amount.toFixed(2), oneTime: e.oneTime === true, ...withInsight(e) })),
+  };
+}
+
+/**
+ * This upload's statements with recurrence cross-checked against every other month the owner has (the rest of this
+ * upload plus every saved document), and the parser's review flags matched to their lines. The insights are keyed by
+ * the returned line objects, which the batch aggregation passes through unchanged into each month's lines.
+ */
+function classifyStatements(statements: ParsedStatement[], reference: ParsedStatement[]): { statements: ParsedStatement[]; insights: Map<RevenueLine | ExpenseLine, LineInsight> } {
+  const history = buildVendorHistory(reference.map((s) => ({ month: s.month, revenue: s.items.revenue, expenses: s.items.expenses })));
+  const insights = new Map<RevenueLine | ExpenseLine, LineInsight>();
+  const classified = statements.map((s): ParsedStatement => {
+    const { byLine } = matchFlags(s.reviewFlags ?? [], [...s.items.revenue, ...s.items.expenses]);
+    const adjust = <L extends RevenueLine | ExpenseLine>(l: L, side: "revenue" | "expense", flags: ReviewFlag[]): L => {
+      const c = classifyLine(l, side, s.month, history);
+      const { uncertain: _u, oneTime: _o, ...rest } = l;
+      void _u;
+      void _o;
+      const line = (c.oneTime ? { ...rest, oneTime: true } : rest) as L;
+      if (flags.length || c.recurrence) insights.set(line, { flags, ...(c.recurrence ? { recurrence: c.recurrence } : {}) });
+      return line;
+    };
+    const nRev = s.items.revenue.length;
+    return {
+      ...s,
+      items: {
+        ...s.items,
+        revenue: s.items.revenue.map((r, i) => adjust(r, "revenue", byLine.get(i) ?? [])),
+        expenses: s.items.expenses.map((e, i) => adjust(e, "expense", byLine.get(nRev + i) ?? [])),
+      },
+    };
+  });
+  return { statements: classified, insights };
 }
 
 /** A business workspace always gets a business analysis, even if the statement looked personal. */
@@ -3589,17 +3780,41 @@ function historyFor(statements: ParsedStatement[], docs: WorkspaceDocument[]): E
     );
 }
 
-/** (Re)builds the review from the statements: per-month totals and, for several months, averaged line items. */
+/**
+ * (Re)builds the review from the statements: per-month totals, and line items that are that month's own rows for a
+ * single month, or one itemized set per month (plus the averaged forward baseline) for several months.
+ */
 function buildReview(statements: ParsedStatement[], earlier: EarlierStatement[], history: EarlierStatement[], mode: WorkspaceMode, prev?: UploadReviewState): UploadReviewState {
   const personal = mode === "PERSONAL";
   const cumulative = prev?.cumulative ?? true;
-  const included = [...statements, ...earlier.filter((e) => e.include), ...(cumulative ? history : [])];
+  // Recurrence is checked against every month the owner has, even saved months left out of this report.
+  const { statements: classified, insights } = classifyStatements(statements, [...statements, ...earlier, ...history]);
+  const included = [...classified, ...earlier.filter((e) => e.include), ...(cumulative ? history : [])];
   const agg = aggregateStatements(included, statements[0]?.items.businessType ?? "OTHER_CUSTOM");
-  const rows = itemsToRows(agg, personal);
+  const insightOf = (l: RevenueLine | ExpenseLine) => insights.get(l);
+  const rows = itemsToRows(agg, personal, insightOf);
+  const monthRows: MonthRows[] =
+    agg.monthLines.length > 1
+      ? agg.monthLines.map((m) => ({
+          id: m.key || `?${m.statementIds[0]}`,
+          key: m.key,
+          statementIds: m.statementIds,
+          editable: m.statementIds.some((id) => !isHistoryId(id)),
+          ...itemsToRows(m, personal, insightOf),
+        }))
+      : [];
+  const editable = monthRows.filter((m) => m.editable);
+  // Open on the same month as before a rebuild, else the first month of this upload that needs a look.
+  const activeMonth =
+    (prev && monthRows.some((m) => m.id === prev.activeMonth) ? prev.activeMonth : undefined) ??
+    (editable.find((m) => [...m.revenue, ...m.expenses].some((r) => insightTone(r.insight))) ?? editable[0] ?? monthRows[0])?.id ??
+    "";
   return {
     businessType: prev?.businessType ?? typeForMode(agg.businessType, mode),
     revenue: rows.revenue,
     expenses: rows.expenses,
+    monthRows,
+    activeMonth,
     statements,
     earlier,
     history,
@@ -3621,15 +3836,47 @@ function reviewTotals(review: Pick<UploadReviewState, "revenue" | "expenses">): 
   });
 }
 
-/**
- * What each month logs. A single month uses the reviewed (edited) rows; several months use each month's parsed
- * lines, since the rows on screen are the averaged baseline.
- */
+/** What each month logs: that month's own reviewed (edited) rows, exact to the cent. */
 function monthActuals(review: UploadReviewState): { key: string; actual: MonthActual }[] {
   // Months that come only from earlier saved documents (cumulative mode) are already in the workspace: never re-logged.
+  if (review.monthRows.length) return review.monthRows.filter((m) => m.key && m.editable).map((m) => ({ key: m.key, actual: reviewTotals(m) }));
   const keyed = review.months.filter((m) => m.key && m.statementIds.some((id) => !isHistoryId(id)));
   if (review.months.length === 1 && keyed.length === 1) return [{ key: keyed[0].key, actual: reviewTotals(review) }];
   return keyed.map((m) => ({ key: m.key, actual: m.actual }));
+}
+
+/** Form rows → line items (the shape saved documents and the batch aggregation use). */
+function rowsToLines(rows: Pick<UploadReviewState, "revenue" | "expenses">, personal: boolean): { revenue: RevenueLine[]; expenses: ExpenseLine[] } {
+  const lines = toPayloadLines(rows.revenue, rows.expenses, personal);
+  return {
+    revenue: lines.revenue.map((r) => ({ ...r, margin: personal ? 1 : r.margin ?? 0.5 })),
+    expenses: lines.expenses.map((e) => ({ ...e, category: e.category === "Uncategorized" ? "Other" : e.category })) as ExpenseLine[],
+  };
+}
+
+/**
+ * The forward baseline the report runs on. Several months: recurring lines averaged across every month's *edited*
+ * rows (one-time lines stay in their own month); a single month: its rows as they are.
+ */
+function reviewBaseline(review: UploadReviewState, personal: boolean): Pick<FormPayload, "revenue" | "expenses"> {
+  if (!review.monthRows.length) return toPayloadLines(review.revenue, review.expenses, personal);
+  const months = review.monthRows.map((m) => toPayloadLines(m.revenue, m.expenses, personal));
+  // Margins: the amount-weighted average of the months that state one; blank everywhere = estimated by the analysis.
+  // Categories stay as typed ("Uncategorized" is auto-classified by the analysis).
+  const marginOf = (label: string) => {
+    const key = label.trim().toLowerCase();
+    const given = months.flatMap((m) => m.revenue).filter((r) => !r.oneTime && r.label.trim().toLowerCase() === key && r.margin != null);
+    const total = given.reduce((a, r) => a + r.amount, 0);
+    return given.length && total > 0 ? Math.round((given.reduce((a, r) => a + r.margin! * r.amount, 0) / total) * 1000) / 1000 : undefined;
+  };
+  const base = monthlyBaseline(months.map((m) => ({ revenue: m.revenue.map((r) => ({ ...r, margin: 0 })), expenses: m.expenses })));
+  return {
+    revenue: base.revenue.map((r) => {
+      const margin = personal ? undefined : marginOf(r.label);
+      return { label: r.label, amount: r.amount, ...(margin != null ? { margin } : {}) };
+    }),
+    expenses: base.expenses.map((e) => ({ label: e.label, amount: e.amount, category: e.category })),
+  };
 }
 
 /** Months the review's line items cover: this upload and (cumulatively) earlier ones. */
@@ -3640,19 +3887,21 @@ function reviewSubmission(review: UploadReviewState, personal: boolean): { paylo
   // Months are logged into whichever workspace the report goes to, once that workspace has loaded.
   const log = review.logToTracker ? monthActuals(review).filter((m) => !review.loggedKeys.includes(m.key) && (m.actual.revenue > 0 || m.actual.expenses > 0)) : [];
   return {
-    payload: { mode: "form", businessType: review.businessType, origin: "statement", ...toPayloadLines(review.revenue, review.expenses, personal) },
+    payload: { mode: "form", businessType: review.businessType, origin: "statement", ...reviewBaseline(review, personal) },
     extras: { log, docs: docsToSave(review, personal), months: reviewMonthKeys(review) },
   };
 }
 
 /** Rows → line items (for saving a single reviewed statement as edited). */
 function rowsToItems(review: UploadReviewState, personal: boolean): ExtractedLineItems {
-  const lines = toPayloadLines(review.revenue, review.expenses, personal);
-  return {
-    businessType: review.businessType,
-    revenue: lines.revenue.map((r) => ({ ...r, margin: personal ? 1 : r.margin ?? 0.5 })),
-    expenses: lines.expenses.map((e) => ({ ...e, category: e.category === "Uncategorized" ? "Other" : e.category })) as ExpenseLine[],
-  };
+  return { businessType: review.businessType, ...rowsToLines(review, personal) };
+}
+
+/** A statement's lines as the owner edited them: its month's rows, when that month holds only this statement. */
+function editedLines(review: UploadReviewState, s: ParsedStatement, personal: boolean): { revenue: RevenueLine[]; expenses: ExpenseLine[] } {
+  const m = review.monthRows.find((x) => x.editable && x.statementIds.length === 1 && x.statementIds[0] === s.id);
+  // Several statements merged into one month (e.g. checking + card) can't be split back apart: those keep their parsed lines.
+  return m ? rowsToLines(m, personal) : { revenue: s.items.revenue, expenses: s.items.expenses };
 }
 
 /**
@@ -3673,7 +3922,8 @@ function docsToSave(review: UploadReviewState, personal: boolean): NewWorkspaceD
     const byMonth = new Map<string, { revenue: RevenueLine[]; expenses: ExpenseLine[] }>();
     for (const s of list) {
       const m = byMonth.get(s.month) ?? { revenue: [], expenses: [] };
-      byMonth.set(s.month, { revenue: [...m.revenue, ...s.items.revenue], expenses: [...m.expenses, ...s.items.expenses] });
+      const own = editedLines(review, s, personal);
+      byMonth.set(s.month, { revenue: [...m.revenue, ...own.revenue], expenses: [...m.expenses, ...own.expenses] });
     }
     const keyed = [...byMonth.entries()].filter(([k]) => k).sort(([a], [b]) => a.localeCompare(b));
     if (first.source && keyed.length > 1 && keyed.length === byMonth.size) {
@@ -3684,7 +3934,7 @@ function docsToSave(review: UploadReviewState, personal: boolean): NewWorkspaceD
     }
     const items: ExtractedLineItems = single
       ? rowsToItems(review, personal)
-      : { businessType: first.items.businessType, revenue: list.flatMap((s) => s.items.revenue), expenses: list.flatMap((s) => s.items.expenses) };
+      : { businessType: first.items.businessType, revenue: [...byMonth.values()].flatMap((m) => m.revenue), expenses: [...byMonth.values()].flatMap((m) => m.expenses) };
     return { ...base, period: keyed.length === 1 && byMonth.size === 1 ? keyed[0][0] : null, items, totals: statementTotals({ revenue: items.revenue, expenses: items.expenses }) };
   });
 }
@@ -3837,7 +4087,13 @@ function StatementUploader({
           // One file covering several months (H1 / quarterly / annual): each calendar month in the document becomes its
           // own statement, already assigned to that month, so one upload seeds every month it lists.
           const name = f ? documentName(f.name) : "Pasted statement";
+          // Each flag goes to the month it's dated in, else the month whose lines name that merchant, else the first.
+          const flagMonth = (fl: ReviewFlag) =>
+            data.months.find((m) => m.period.key === fl.date.slice(0, 7))?.period.key ??
+            data.months.find((m) => [...m.items.revenue, ...m.items.expenses].some((l) => sameVendor(fl.lineLabel || fl.merchant, l.label)))?.period.key ??
+            data.months[0].period.key;
           for (const m of data.months) {
+            const flags = data.reviewFlags.filter((fl) => flagMonth(fl) === m.period.key);
             parsed.push({
               ...common,
               id: `${id}-${m.period.key}`,
@@ -3846,7 +4102,7 @@ function StatementUploader({
               detected: m.period.key,
               month: m.period.key,
               source: { id, name },
-              ...(m === data.months[0] && data.reviewFlags.length ? { reviewFlags: data.reviewFlags } : {}),
+              ...(flags.length ? { reviewFlags: flags } : {}),
             });
           }
           notes.push(`${label}: covers ${data.months.length} months (${data.months[0].period.label} – ${data.months[data.months.length - 1].period.label}) — each month's rows were assigned to that month.`);
@@ -4075,8 +4331,158 @@ function ReviewFlagsList({ statements }: { statements: ParsedStatement[] }) {
           ))}
         </ul>
       )}
-      <p className="mt-2 text-[11px] text-slate-500">Flagged charges are still included in the line items below — remove or edit them if they shouldn&apos;t count.</p>
+      <p className="mt-2 text-[11px] text-slate-500">
+        Each flagged charge is also highlighted on its line below{statements.length > 1 ? " (in its month)" : ""}. Flagged charges still count — remove or edit them if they shouldn&apos;t, or mark them &ldquo;Looks fine&rdquo;.
+      </p>
     </div>
+  );
+}
+
+const MONTH_CHIP = new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric", timeZone: "UTC" });
+const chipLabel = (key: string) => {
+  const d = parseMonthKey(key);
+  return d ? MONTH_CHIP.format(d) : "No month";
+};
+
+/**
+ * Multi-month review: one tab per calendar month, each with that month's own itemized revenue and expense lines
+ * (actual amounts, never averaged), so January and September can be inspected and edited independently.
+ */
+function MonthByMonthEditor({
+  review,
+  setReview,
+  mode,
+}: {
+  review: UploadReviewState;
+  setReview: (fn: (r: UploadReviewState | null) => UploadReviewState | null) => void;
+  mode: WorkspaceMode;
+}) {
+  const copy = MODE_COPY[mode];
+  const active = review.monthRows.find((m) => m.id === review.activeMonth) ?? review.monthRows[0];
+  if (!active) return null;
+  const update = (fn: (m: MonthRows) => MonthRows) => setReview((r) => r && { ...r, monthRows: r.monthRows.map((m) => (m.id === active.id ? fn(m) : m)), rebuilt: false });
+  const nameOf = (m: MonthRows) => (m.key ? periodLabel(m.key) : `No month yet · ${review.statements.find((s) => s.id === m.statementIds[0])?.name ?? "statement"}`);
+  const attention = (m: MonthRows) => [...m.revenue, ...m.expenses].filter((r) => insightTone(r.insight)).length;
+  const totals = reviewTotals(active);
+  const idx = review.monthRows.indexOf(active);
+  const go = (i: number) => {
+    const m = review.monthRows[i];
+    if (m) setReview((r) => r && { ...r, activeMonth: m.id });
+  };
+
+  return (
+    <section aria-label="Line items by month" className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-2">
+        <div>
+          <h3 className="text-sm font-medium text-slate-200">Line items by month</h3>
+          <p className="text-xs text-slate-400">Each month shows its own actual amounts. Edits apply to that month only.</p>
+        </div>
+        <div className="flex items-center gap-1">
+          <button type="button" onClick={() => go(idx - 1)} disabled={idx <= 0} aria-label="Previous month" className="grid h-7 w-7 place-items-center rounded-lg border border-white/10 text-slate-300 hover:bg-white/5 disabled:opacity-30">
+            <ArrowLeft className="h-3.5 w-3.5" />
+          </button>
+          <button type="button" onClick={() => go(idx + 1)} disabled={idx >= review.monthRows.length - 1} aria-label="Next month" className="grid h-7 w-7 place-items-center rounded-lg border border-white/10 text-slate-300 hover:bg-white/5 disabled:opacity-30">
+            <ArrowRight className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+
+      <div role="group" aria-label="Choose a month" className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
+        {review.monthRows.map((m) => {
+          const t = reviewTotals(m);
+          const n = attention(m);
+          const on = m.id === active.id;
+          return (
+            <button
+              key={m.id}
+              type="button"
+              aria-pressed={on}
+              onClick={() => setReview((r) => r && { ...r, activeMonth: m.id })}
+              title={`${nameOf(m)}: ${exactMoney(t.revenue)} in · ${exactMoney(t.expenses)} out${n ? ` · ${n} line${n === 1 ? "" : "s"} to check` : ""}${m.editable ? "" : " · saved earlier"}`}
+              className={cn(
+                "relative flex min-w-[6.5rem] shrink-0 flex-col items-start rounded-lg border px-2.5 py-1.5 text-left text-xs transition",
+                on ? "border-indigo-300/60 bg-indigo-500/20 text-white" : "border-white/10 bg-white/[0.02] text-slate-300 hover:border-white/25",
+                !m.editable && !on && "opacity-70",
+              )}
+            >
+              <span className="flex items-center gap-1 font-medium">
+                {chipLabel(m.key)}
+                {!m.editable && <History className="h-3 w-3 text-slate-400" aria-label="saved earlier" />}
+              </span>
+              <span className="tabular-nums text-[10px] text-slate-400">
+                {usdCompact.format(t.revenue)} in · {usdCompact.format(t.expenses)} out
+              </span>
+              {n > 0 && (
+                <span className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-amber-400 px-1 text-[10px] font-semibold text-slate-950" aria-label={`${n} to check`}>
+                  {n}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="rounded-xl border border-white/10 bg-slate-900/30 p-3 sm:p-4">
+        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+          <p className="text-sm font-semibold text-slate-100">{nameOf(active)}</p>
+          <p className="text-xs tabular-nums text-slate-400">
+            {exactMoney(totals.revenue)} in · {exactMoney(totals.expenses)} out
+            {totals.oneTimeExpenses ? ` (${exactMoney(totals.oneTimeExpenses)} one-time)` : ""} · net {exactMoney(totals.revenue - totals.expenses)}
+          </p>
+        </div>
+        {active.editable ? (
+          <div className="space-y-6">
+            <section aria-label={`${copy.revenue}, ${nameOf(active)}`}>
+              <h4 className="mb-2 text-sm font-medium text-slate-200">
+                {copy.revenue}
+                <InsightCounts rows={active.revenue} />
+              </h4>
+              <RevenueRowsEditor
+                rows={active.revenue}
+                setRows={(fn) => update((m) => ({ ...m, revenue: fn(m.revenue) }))}
+                mode={mode}
+                custom={review.businessType === "OTHER_CUSTOM"}
+                hint="This month's actual amounts. Mark anything that won't repeat as one-time — it's logged in this month but left out of the forecast."
+              />
+            </section>
+            <section aria-label={`${copy.expenses}, ${nameOf(active)}`}>
+              <h4 className="mb-2 text-sm font-medium text-slate-200">
+                {copy.expenses}
+                <InsightCounts rows={active.expenses} />
+              </h4>
+              <ExpenseRowsEditor
+                rows={active.expenses}
+                setRows={(fn) => update((m) => ({ ...m, expenses: fn(m.expenses) }))}
+                revenue={active.revenue}
+                mode={mode}
+                businessType={review.businessType}
+                hint="Change a category if it was misread; a blank category is auto-classified."
+              />
+            </section>
+          </div>
+        ) : (
+          <div className="text-xs">
+            <p className="mb-2 flex items-start gap-1.5 text-slate-400">
+              <Info className="mt-0.5 h-3 w-3 shrink-0" /> Already saved in this workspace — included in the forecast average. Edit it from My Documents.
+            </p>
+            <ul className="divide-y divide-white/5 tabular-nums">
+              {[
+                ...validRevenueRows(active.revenue).map((r) => ({ id: r.id, label: r.label, sub: copy.revenue, amount: r.amount, oneTime: r.oneTime })),
+                ...validExpenseRows(active.expenses).map((e) => ({ id: e.id, label: expenseLabel(e), sub: e.category || "Uncategorized", amount: e.amount, oneTime: e.oneTime })),
+              ].map((l) => (
+                <li key={l.id} className="flex items-baseline justify-between gap-3 py-1.5">
+                  <span className="min-w-0 truncate text-slate-300">
+                    {l.label} <span className="text-slate-500">· {l.sub}</span>
+                    {l.oneTime && <span className="ml-1.5 rounded bg-amber-400/15 px-1 text-[10px] uppercase text-amber-200">one-time</span>}
+                  </span>
+                  <span className="shrink-0 text-slate-200">{exactMoney(Number(l.amount))}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -4106,8 +4512,16 @@ function UploadReview({
   const personal = mode === "PERSONAL";
   const copy = MODE_COPY[mode];
   const { businessType, revenue, expenses } = review;
-  const validRevenue = validRevenueRows(revenue);
-  const validExpenses = validExpenseRows(effectiveExpenses(expenses, revenue));
+  const multiMonth = review.monthRows.length > 0;
+  // Several months: the summary shows the live forward baseline, averaged from each month's edited rows.
+  const baselineRows = useMemo(() => {
+    if (!review.monthRows.length) return null;
+    const b = reviewBaseline(review, personal);
+    return itemsToRows({ revenue: b.revenue.map((r) => ({ ...r, margin: r.margin ?? Number.NaN })), expenses: b.expenses }, personal);
+  }, [review, personal]);
+  const summaryRows = baselineRows ?? { revenue, expenses };
+  const validRevenue = validRevenueRows(summaryRows.revenue);
+  const validExpenses = validExpenseRows(effectiveExpenses(summaryRows.expenses, summaryRows.revenue));
   const setRevenue = (fn: (rows: FormRevenue[]) => FormRevenue[]) => setReview((r) => r && { ...r, revenue: fn(r.revenue), rebuilt: false });
   const setExpenses = (fn: (rows: FormExpense[]) => FormExpense[]) => setReview((r) => r && { ...r, expenses: fn(r.expenses), rebuilt: false });
   const [logNote, setLogNote] = useState<string | null>(null);
@@ -4116,7 +4530,6 @@ function UploadReview({
   const pendingLog = toLog.filter((m) => !review.loggedKeys.includes(m.key));
   const unassigned = review.statements.filter((s) => !s.month).length;
   const canLog = trackerReady && pendingLog.some((m) => m.actual.revenue > 0 || m.actual.expenses > 0);
-  const multiMonth = review.months.length > 1;
 
   /** Re-assign a statement's month (or include / exclude an earlier document) and rebuild. */
   const restructure = (statements: ParsedStatement[], earlierPrev: EarlierStatement[]) => {
@@ -4163,9 +4576,9 @@ function UploadReview({
           return `We read ${files} document${files === 1 ? "" : "s"} covering ${review.statements.length} month entries. `;
         })()}
         {multiMonth
-          ? `The lines below are the monthly average across ${review.months.length} months${review.cumulative && historyMonths.length ? ` (${historyMonths.length} of them already saved in this workspace)` : ""}; each new month's own totals are logged separately.`
+          ? `Line items are itemized month by month across ${review.monthRows.length} months${review.cumulative && historyMonths.length ? ` (${historyMonths.length} of them already saved in this workspace)` : ""} — pick a month to inspect and edit it on its own. The forecast uses the average of the recurring lines; one-time items stay in their month.`
           : `We read ${revenue.length + expenses.length} line${revenue.length + expenses.length === 1 ? "" : "s"}.`}{" "}
-        Fix amounts or categories, delete anything that doesn&apos;t belong, add what&apos;s missing — then generate the report.
+        Fix amounts or categories, delete anything that doesn&apos;t belong, add what&apos;s missing — then generate the report. Highlighted lines need a look.
       </p>
       {notes.length > 0 && (
         <ul className="mt-3 space-y-1 rounded-lg border border-amber-300/25 bg-amber-400/[0.06] px-3 py-2 text-xs text-amber-100">
@@ -4345,22 +4758,51 @@ function UploadReview({
       )}
 
       <div className="mt-5 flex-1 space-y-6">
-        <section aria-label={copy.revenue}>
-          <h3 className="mb-2 text-sm font-medium text-slate-200">
-            {copy.revenue}
-            {multiMonth && <span className="font-normal text-slate-500"> · monthly average</span>}
-          </h3>
-          <RevenueRowsEditor rows={revenue} setRows={setRevenue} mode={mode} custom={businessType === "OTHER_CUSTOM"} hint="Recurring lines are average monthly amounts; one-time lines are the full single amount." />
-        </section>
-        <section aria-label={copy.expenses}>
-          <h3 className="mb-2 text-sm font-medium text-slate-200">
-            {copy.expenses}
-            {multiMonth && <span className="font-normal text-slate-500"> · monthly average</span>}
-          </h3>
-          <ExpenseRowsEditor rows={expenses} setRows={setExpenses} revenue={revenue} mode={mode} businessType={businessType} hint="Change a category if it was misread; a blank category is auto-classified." />
-        </section>
+        {multiMonth ? (
+          <MonthByMonthEditor review={review} setReview={setReview} mode={mode} />
+        ) : (
+          <>
+            <section aria-label={copy.revenue}>
+              <h3 className="mb-2 text-sm font-medium text-slate-200">
+                {copy.revenue}
+                <InsightCounts rows={revenue} />
+              </h3>
+              <RevenueRowsEditor rows={revenue} setRows={setRevenue} mode={mode} custom={businessType === "OTHER_CUSTOM"} hint="Recurring lines are monthly amounts; one-time lines are the full single amount." />
+            </section>
+            <section aria-label={copy.expenses}>
+              <h3 className="mb-2 text-sm font-medium text-slate-200">
+                {copy.expenses}
+                <InsightCounts rows={expenses} />
+              </h3>
+              <ExpenseRowsEditor rows={expenses} setRows={setExpenses} revenue={revenue} mode={mode} businessType={businessType} hint="Change a category if it was misread; a blank category is auto-classified." />
+            </section>
+          </>
+        )}
         <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+          {baselineRows && (
+            <div className="mb-3">
+              <p className="text-sm font-medium text-slate-200">Forecast baseline · average of {review.monthRows.length} months</p>
+              <p className="mt-0.5 text-xs text-slate-400">
+                Recurring lines averaged across every month above (a line missing from a month counts as $0 there); one-time lines are logged in their own month only. Updates as you edit.
+              </p>
+            </div>
+          )}
           <ReviewSummary mode={mode} businessType={businessType} revenue={validRevenue} expenses={validExpenses} />
+          {baselineRows && validRevenue.length + validExpenses.length > 0 && (
+            <details className="mt-3 text-xs">
+              <summary className="cursor-pointer select-none text-indigo-300 hover:text-indigo-200">View the averaged baseline lines</summary>
+              <ul className="mt-2 divide-y divide-white/5 tabular-nums">
+                {[...validRevenue.map((r) => ({ id: r.id, label: r.label, sub: copy.revenue, amount: r.amount })), ...validExpenses.map((e) => ({ id: e.id, label: expenseLabel(e), sub: e.category || "Uncategorized", amount: e.amount }))].map((l) => (
+                  <li key={l.id} className="flex items-baseline justify-between gap-3 py-1">
+                    <span className="min-w-0 truncate text-slate-300">
+                      {l.label} <span className="text-slate-500">· {l.sub}</span>
+                    </span>
+                    <span className="shrink-0 text-slate-200">{exactMoney(Number(l.amount))}/mo</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
         </div>
       </div>
 

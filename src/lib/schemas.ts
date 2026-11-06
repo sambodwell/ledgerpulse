@@ -40,6 +40,8 @@ export interface RevenueLine {
   oneTime?: boolean;
   /** Recurring lines only: share (0–1, exclusive) of the first projected month this line applies — e.g. 0.5 for a contract that starts mid-month. */
   firstMonthShare?: number;
+  /** Parsed lines only: the parser couldn't tell whether this repeats (shown for review; never sent to the analysis). */
+  uncertain?: boolean;
 }
 
 /**
@@ -64,6 +66,8 @@ export interface ExpenseLine {
   oneTime?: boolean;
   /** Recurring lines only: share (0–1, exclusive) of the first projected month this line applies — e.g. 0.5 for rent that starts mid-month. */
   firstMonthShare?: number;
+  /** Parsed lines only: the parser couldn't tell whether this repeats (shown for review; never sent to the analysis). */
+  uncertain?: boolean;
 }
 
 /** A valid partial-first-month share, or undefined for a full month. */

@@ -536,25 +536,34 @@ function assemble(extraction: ModelExtraction, input: AnalysisInput): FinancialA
 // Extract only (statement → editable line items, no audit)
 // ---------------------------------------------------------------------------
 
+/** How a parsed line repeats. UNCERTAIN lines are highlighted for the owner to confirm. */
+const RECURRENCE = {
+  type: "string",
+  enum: ["RECURRING", "ONE_TIME", "UNCERTAIN"],
+  description:
+    "RECURRING = billed / paid on a schedule (subscriptions, rent, payroll, utilities, insurance, loan payments, retainers, regular platform payouts). ONE_TIME = a single event (project milestone or deposit invoice, equipment or one-off purchase, repair, refund, late fee, tax payment or refund). UNCERTAIN = can't tell from this document alone (a client paid once this period, a variable vendor bought from once). Do not default to RECURRING.",
+} as const;
+
 const REVENUE_ITEM_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["label", "amount", "margin", "oneTime"],
+  required: ["label", "amount", "margin", "recurrence"],
   properties: {
     ...EXTRACTION_SCHEMA.properties.itemizedRevenue.items.properties,
-    oneTime: { type: "boolean", description: "True only for a clearly non-recurring amount" },
+    amount: { type: "number", description: "Average MONTHLY amount in USD when RECURRING; the full amount when ONE_TIME or UNCERTAIN" },
+    recurrence: RECURRENCE,
   },
 } as const;
 
 const EXPENSE_ITEM_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["label", "amount", "category", "oneTime"],
+  required: ["label", "amount", "category", "recurrence"],
   properties: {
     label: { type: "string" },
-    amount: { type: "number", description: "Average MONTHLY amount in USD, or the full amount when oneTime" },
+    amount: { type: "number", description: "Average MONTHLY amount in USD when RECURRING; the full amount when ONE_TIME or UNCERTAIN" },
     category: { type: "string" },
-    oneTime: { type: "boolean", description: "True only for a clearly non-recurring charge" },
+    recurrence: RECURRENCE,
   },
 } as const;
 
@@ -584,10 +593,14 @@ const LINE_ITEMS_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["kind", "merchant", "amount", "date", "transactionId", "note"],
+        required: ["kind", "merchant", "lineLabel", "amount", "date", "transactionId", "note"],
         properties: {
           kind: { type: "string", enum: [...REVIEW_FLAG_KINDS] },
           merchant: { type: "string", description: "Merchant / payee exactly as printed" },
+          lineLabel: {
+            type: "string",
+            description: "The exact label of the itemizedRevenue / itemizedExpenses line (or month line) this transaction was grouped into, copied character for character; empty string if none",
+          },
           amount: { type: "number", description: "Transaction amount in USD (positive)" },
           date: { type: "string", description: "YYYY-MM-DD, or empty string if not shown" },
           transactionId: { type: "string", description: "Reference / transaction ID as printed (for duplicates, list both IDs separated by a comma), or empty string" },
@@ -620,7 +633,11 @@ const LINE_ITEMS_SCHEMA = {
 } as const;
 
 const EXTRACT_INSTRUCTIONS = `Extract only the line items; the owner will review and edit them before the audit runs.
-Mark a line "oneTime": true only when it is clearly non-recurring (a single late fee, a one-off purchase, a tax refund); give its full amount rather than a monthly average. Everything else is recurring ("oneTime": false) with an average MONTHLY amount.
+Classify every line's "recurrence" from the evidence in the document, never by default:
+- RECURRING: the same payee on a schedule — subscriptions / SaaS, rent or mortgage, payroll, utilities, insurance, loan payments, retainers, and regular marketplace or card-processor payouts. A line that appears in two or more months of the document with similar amounts is RECURRING. Give its average MONTHLY amount.
+- ONE_TIME: a single event — project milestone, deposit, phase or final invoices; equipment, furniture or other one-off purchases; repairs; refunds and reversals; late fees and penalties; tax payments and refunds; legal or setup fees. Give its full amount.
+- UNCERTAIN: you can't tell from this document alone — e.g. a client who paid once this period, a variable supplier (hardware store, materials, fuel, meals, travel) seen once, or an invoice that may or may not repeat. Give its full amount for this period; the owner will be asked to confirm it.
+Variable operating costs that clearly happen every month (fuel for a fleet, materials a contractor buys weekly) are RECURRING with their average monthly amount even though the amount varies.
 Never turn balances into lines: opening, closing, available, ledger and running balances are not transactions. The owner may upload several statements together (e.g. checking plus a credit card), so payments to the owner's own credit card, loan-to-self and transfers between the owner's own accounts are not expenses or revenue (the individual card purchases are the expenses). Amounts must be exact to the cent.
 
 Multi-month documents: one file can cover many months (an H1 or H2 report, a quarterly or annual P&L, a statement export spanning several months). Inspect the row labels, column headers and transaction dates. When they span two or more calendar months (e.g. columns or rows labeled "Jan 2026", "Feb 2026", …, or transactions dated in different months):
@@ -636,10 +653,10 @@ Raw bank and credit card statements (checking / savings transaction logs, Chase 
   1. Revenue — customer deposits, card-processor and marketplace payouts (Stripe, Square, Shopify, PayPal, Amazon, Etsy), invoice payments received. Never count transfers in from the owner's own accounts, loan proceeds or refunds as revenue.
   2. Recurring Software — subscriptions and SaaS billed on a schedule: use the template's software category ("Software & SaaS", "Software & Dispatch", or "Subscriptions" for households).
   3. COGS — inventory, wholesale, materials, parts and other direct job / product costs: use "Cost of Goods Sold" or the template's materials category ("Supplies & Materials").
-  4. One-Time Expenses — a charge that clearly won't repeat (a single equipment purchase, a late fee, a one-off repair): mark "oneTime": true with its full amount.
+  4. One-Time Expenses — a charge that clearly won't repeat (a single equipment purchase, a late fee, a one-off repair): recurrence ONE_TIME with its full amount.
   Every other recurring operating cost goes in the closest template category. Bank fees, interest and finance charges are their own lines.
 - Payments to the card itself ("Payment Thank You", "AUTOPAY PAYMENT"), transfers between the owner's accounts and balance lines are never expenses.
-- reviewFlags: flag (a) UNRECOGNIZED_MERCHANT — a descriptor you can't identify as a known business or that looks like a possible unauthorized charge; (b) DUPLICATE_TRANSACTION — two or more charges with the same merchant and amount on the same or adjacent days, or a repeated transaction / reference ID; (c) UNUSUAL_CHARGE — a charge far larger than that merchant's normal amount. Include the transaction ID(s) when printed. Flagged charges are still included in the line items; flags are for the owner to check, not exclusions.
+- reviewFlags: flag (a) UNRECOGNIZED_MERCHANT — a descriptor you can't identify as a known business or that looks like a possible unauthorized charge; (b) DUPLICATE_TRANSACTION — two or more charges with the same merchant and amount on the same or adjacent days, or a repeated transaction / reference ID; (c) UNUSUAL_CHARGE — a charge far larger than that merchant's normal amount. Include the transaction ID(s) when printed, and set "lineLabel" to the label of the line the transaction was grouped into. Flagged charges are still included in the line items; flags are for the owner to check, not exclusions.
 - endingBalance: for a BANK_STATEMENT, the closing balance for the latest period; otherwise null.`;
 
 /** Upper bound on months read from one document (five years of monthly columns). */
@@ -650,12 +667,35 @@ interface RawLines {
   itemizedExpenses?: unknown;
 }
 
+type Recurrence = "RECURRING" | "ONE_TIME" | "UNCERTAIN";
+const recurrenceOf = (l: Record<string, unknown>): Recurrence =>
+  l.recurrence === "ONE_TIME" || l.recurrence === "UNCERTAIN" || l.recurrence === "RECURRING" ? l.recurrence : l.oneTime === true ? "ONE_TIME" : "RECURRING";
+
+/**
+ * The model's lines with `recurrence` mapped onto `oneTime`. UNCERTAIN lines stay conservative until the owner (or
+ * another month's statement) confirms them: unproven revenue isn't projected forward (one-time), while an unproven cost
+ * stays in the monthly baseline (recurring). Either way the line carries `uncertain: true` for the review screen.
+ */
+function withRecurrence(value: unknown, side: "revenue" | "expense") {
+  return arr<Record<string, unknown>>(value)
+    .filter((l) => l && typeof l === "object")
+    .map((l) => {
+      const rec = recurrenceOf(l);
+      return { ...l, oneTime: rec === "ONE_TIME" || (rec === "UNCERTAIN" && side === "revenue"), uncertain: rec === "UNCERTAIN" };
+    });
+}
+
 function extractedLines(raw: RawLines, businessType: BusinessType): ExtractedLineItems {
   const personal = businessType === "PERSONAL_FAMILY";
+  const rev = withRecurrence(raw.itemizedRevenue, "revenue");
+  const exp = withRecurrence(raw.itemizedExpenses, "expense");
+  const unsure = (list: Record<string, unknown>[]) => new Set(list.filter((l) => l.uncertain).map((l) => String(l.label ?? "").trim().slice(0, 120)));
+  const unsureRev = unsure(rev);
+  const unsureExp = unsure(exp);
   return {
     businessType,
-    revenue: sanitizeRevenue(raw.itemizedRevenue).map((r) => ({ ...r, amount: round2(r.amount), margin: personal ? 1 : r.margin ?? 0.5 })),
-    expenses: sanitizeExpenses(raw.itemizedExpenses).map((e) => ({ ...e, amount: round2(e.amount) })),
+    revenue: sanitizeRevenue(rev).map((r) => ({ ...r, amount: round2(r.amount), margin: personal ? 1 : r.margin ?? 0.5, ...(unsureRev.has(r.label) ? { uncertain: true as const } : {}) })),
+    expenses: sanitizeExpenses(exp).map((e) => ({ ...e, amount: round2(e.amount), ...(unsureExp.has(e.label) ? { uncertain: true as const } : {}) })),
   };
 }
 
@@ -682,8 +722,9 @@ function reviewFlags(raw: unknown): ReviewFlag[] {
     .map((f) => ({
       kind: f.kind as ReviewFlag["kind"],
       merchant: str(f.merchant).trim().slice(0, 120),
+      lineLabel: str(f.lineLabel).trim().slice(0, 120),
       amount: round2(Math.abs(num(f.amount))),
-      date: /^d{4}-d{2}-d{2}$/.test(str(f.date)) ? str(f.date) : "",
+      date: /^\d{4}-\d{2}-\d{2}$/.test(str(f.date)) ? str(f.date) : "",
       transactionId: str(f.transactionId).trim().slice(0, 120),
       note: str(f.note).trim().slice(0, 240),
     }))

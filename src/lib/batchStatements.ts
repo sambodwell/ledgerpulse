@@ -64,6 +64,8 @@ export const DOCUMENT_KIND_LABELS: Record<DocumentKind, string> = {
 export interface ReviewFlag {
   kind: ReviewFlagKind;
   merchant: string;
+  /** Label of the parsed line the transaction was grouped into ("" / absent = unknown; matched by merchant name instead). */
+  lineLabel?: string;
   amount: number;
   /** "YYYY-MM-DD" or "". */
   date: string;
@@ -102,7 +104,14 @@ export function parseExtractResponse(data: unknown): ExtractResult | null {
     months: months.length >= 2 ? months : [],
     documentKind: (DOCUMENT_KINDS as readonly unknown[]).includes(d.documentKind) ? (d.documentKind as DocumentKind) : "OTHER",
     endingBalance: typeof d.endingBalance === "number" && Number.isFinite(d.endingBalance) ? d.endingBalance : null,
-    reviewFlags: Array.isArray(d.reviewFlags) ? d.reviewFlags.filter(isReviewFlag).map((f) => ({ ...f, date: typeof f.date === "string" ? f.date : "", transactionId: typeof f.transactionId === "string" ? f.transactionId : "" })) : [],
+    reviewFlags: Array.isArray(d.reviewFlags)
+      ? d.reviewFlags.filter(isReviewFlag).map((f) => ({
+          ...f,
+          date: typeof f.date === "string" ? f.date : "",
+          transactionId: typeof f.transactionId === "string" ? f.transactionId : "",
+          lineLabel: typeof f.lineLabel === "string" ? f.lineLabel : "",
+        }))
+      : [],
   };
 }
 
@@ -113,11 +122,23 @@ export interface BatchMonth {
   actual: MonthActual;
 }
 
+/** One month's merged lines (statements for the same month added together, overlapping lines counted once). */
+export interface BatchMonthLines {
+  /** "YYYY-MM", or "" for a statement without a month. */
+  key: string;
+  statementIds: string[];
+  revenue: RevenueLine[];
+  expenses: ExpenseLine[];
+}
+
 export interface BatchAggregate {
   businessType: BusinessType;
+  /** The forward baseline: one month's lines as parsed, or recurring lines averaged across several months. */
   revenue: RevenueLine[];
   expenses: ExpenseLine[];
   months: BatchMonth[];
+  /** Each month's own itemized lines, oldest first (same order as `months`). */
+  monthLines: BatchMonthLines[];
   /** Distinct month groups averaged into the baseline. */
   monthCount: number;
   /** Identical lines found in two statements for the same month and counted once. */
@@ -180,29 +201,35 @@ export function aggregateStatements(statements: ParsedStatement[], fallbackType:
   }
 
   let duplicateLines = 0;
-  const merged: { key: string; ids: string[]; revenue: RevenueLine[]; expenses: ExpenseLine[] }[] = [];
+  const merged: BatchMonthLines[] = [];
   for (const [g, list] of groups) {
     const rev = mergeMonth(list.map((s) => s.items.revenue), revKey);
     const exp = mergeMonth(list.map((s) => s.items.expenses), expKey);
     duplicateLines += rev.dupes + exp.dupes;
-    merged.push({ key: g.startsWith("?") ? "" : g, ids: list.map((s) => s.id), revenue: rev.lines, expenses: exp.lines });
+    merged.push({ key: g.startsWith("?") ? "" : g, statementIds: list.map((s) => s.id), revenue: rev.lines, expenses: exp.lines });
   }
   merged.sort((a, b) => (a.key || "9999").localeCompare(b.key || "9999"));
 
-  const months: BatchMonth[] = merged.map((m) => ({ key: m.key, statementIds: m.ids, actual: statementTotals({ revenue: m.revenue, expenses: m.expenses }) }));
+  const months: BatchMonth[] = merged.map((m) => ({ key: m.key, statementIds: m.statementIds, actual: statementTotals({ revenue: m.revenue, expenses: m.expenses }) }));
 
   // Most common detected business type wins.
   const counts = new Map<BusinessType, number>();
   for (const s of statements) counts.set(s.items.businessType, (counts.get(s.items.businessType) ?? 0) + 1);
   const businessType = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? fallbackType;
 
-  if (merged.length <= 1) {
-    const only = merged[0];
-    return { businessType, revenue: only?.revenue ?? [], expenses: only?.expenses ?? [], months, monthCount: merged.length, duplicateLines, excludedOneTime: 0 };
-  }
+  const baseline = monthlyBaseline(merged);
+  return { businessType, ...baseline, months, monthLines: merged, monthCount: merged.length, duplicateLines };
+}
 
+/**
+ * Several months' itemized lines → the forward monthly baseline. One month is kept exactly as given; for two or more,
+ * recurring lines are averaged per label over every month (sum ÷ months, so a line missing from a month pulls its
+ * average down) and past one-time lines are left out (they're still in their own month's actual).
+ */
+export function monthlyBaseline(months: { revenue: RevenueLine[]; expenses: ExpenseLine[] }[]): { revenue: RevenueLine[]; expenses: ExpenseLine[]; excludedOneTime: number } {
+  if (months.length <= 1) return { revenue: months[0]?.revenue ?? [], expenses: months[0]?.expenses ?? [], excludedOneTime: 0 };
   const revenue = averageLines(
-    merged.map((m) => m.revenue),
+    months.map((m) => m.revenue),
     revKey,
     (first, all, avg) => {
       const total = all.reduce((acc, l) => acc + l.amount, 0);
@@ -211,12 +238,12 @@ export function aggregateStatements(statements: ParsedStatement[], fallbackType:
     },
   );
   const expenses = averageLines(
-    merged.map((m) => m.expenses),
+    months.map((m) => m.expenses),
     expKey,
     (first, _all, avg) => ({ label: first.label, amount: avg, category: first.category }),
   );
-  const excludedOneTime = merged.reduce((acc, m) => acc + m.revenue.filter((r) => r.oneTime).length + m.expenses.filter((e) => e.oneTime).length, 0);
-  return { businessType, revenue, expenses, months, monthCount: merged.length, duplicateLines, excludedOneTime };
+  const excludedOneTime = months.reduce((acc, m) => acc + m.revenue.filter((r) => r.oneTime).length + m.expenses.filter((e) => e.oneTime).length, 0);
+  return { revenue, expenses, excludedOneTime };
 }
 
 /** SHA-256 of a file's bytes, hex. Null when Web Crypto isn't available (e.g. an insecure origin). */
