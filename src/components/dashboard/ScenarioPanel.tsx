@@ -26,6 +26,7 @@ import { authHeaders, listScenarios, saveScenario } from "@/lib/supabase";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { CHART, ChartTooltip, COLOR, Stat, axisProps, esc, impactColor, monthTick, printHtml, scenarioSvg, signedUsd } from "@/components/dashboard/chartKit";
 import { cn, errorMessage, glass, inputCls, pct, secondaryBtn, usd, usdCompact } from "@/components/ui";
+import { downloadHtmlAsPdf, pdfFileName } from "@/lib/pdfDownload";
 
 const MAX_PROMPT = 1000;
 
@@ -334,7 +335,14 @@ export function ScenarioPanel({
                 c={activeComputed}
                 long={long}
                 firstNegative={firstNegative}
-                onDownload={() => printHtml(scenarioReportHtml({ analysis, entry: active, plan: active.plan!, c: activeComputed, start }))}
+                onDownload={() => {
+                  const html = scenarioReportHtml({ analysis, entry: active, plan: active.plan!, c: activeComputed, start });
+                  // Direct .pdf download; the print dialog is only a fallback if the PDF can't be built.
+                  return downloadHtmlAsPdf(html, pdfFileName("LedgerPulse Scenario", String(active.n), new Date().toISOString().slice(0, 10))).catch((e) => {
+                    console.warn("[scenario] pdf failed, falling back to print", e);
+                    printHtml(html);
+                  });
+                }}
               />
 
               {activeComputed.result.beyondHorizon.length > 0 && (
@@ -394,8 +402,9 @@ function ScenarioResultView({
   c: Computed;
   long: boolean;
   firstNegative: string | null;
-  onDownload: () => void;
+  onDownload: () => Promise<void>;
 }) {
+  const [downloading, setDownloading] = useState(false);
   const { result } = c;
   const lineColor = impactColor(result.delta);
   const m = result.months;
@@ -405,11 +414,19 @@ function ScenarioResultView({
         <p className="min-w-0 flex-1 text-sm text-slate-300">
           <span className="text-slate-500">Scenario {entry.n}:</span> {plan.explanation || entry.prompt}
         </p>
-        <button type="button" onClick={onDownload} className={cn(secondaryBtn, "shrink-0 py-1.5 text-xs")}>
-          <Download className="h-3.5 w-3.5" /> Download Chart / Summary PDF
+        <button
+          type="button"
+          disabled={downloading}
+          onClick={() => {
+            setDownloading(true);
+            void onDownload().finally(() => setDownloading(false));
+          }}
+          className={cn(secondaryBtn, "shrink-0 py-1.5 text-xs")}
+        >
+          {downloading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />} {downloading ? "Preparing PDF…" : "Download Chart / Summary PDF"}
         </button>
       </div>
-      <div className="mt-3 grid grid-cols-3 gap-3 text-sm">
+      <div className="mt-3 grid grid-cols-1 gap-3 text-sm sm:grid-cols-3">
         <Stat label={`Baseline ${m}-mo net`} value={usd.format(result.baselineAnnualNet)} />
         <Stat label={`Adjusted ${m}-mo net`} value={usd.format(result.adjustedAnnualNet)} tone={result.adjustedAnnualNet < 0 ? "bad" : undefined} />
         <Stat label={result.delta >= 0 ? "Net gain" : "Net loss"} value={signedUsd(result.delta)} tone={result.delta >= 0 ? "good" : "bad"} />

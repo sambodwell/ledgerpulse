@@ -250,14 +250,43 @@ export async function createWorkspace(input: { name: string; businessType: Busin
 }
 
 export async function updateWorkspace(id: string, patch: { name?: string; businessType?: BusinessType }) {
+  const c = requireClient();
   const row: Record<string, string> = {};
-  if (patch.name !== undefined) row.name = patch.name.trim().slice(0, 80);
-  if (patch.businessType) {
-    row.business_type = patch.businessType;
-    row.mode = modeOf(patch.businessType);
+  if (patch.name !== undefined) {
+    row.name = patch.name.trim().slice(0, 80);
+    if (!row.name) throw new Error("Give the workspace a name.");
   }
-  const { error } = await requireClient().from("workspaces").update(row).eq("id", id);
+  if (patch.businessType) {
+    // A workspace is one book of one kind: a business can change its business type, but never become a personal
+    // budget (or the reverse) — its report, tracker and documents would then show up under the other mode.
+    const { data: cur, error: readError } = await c.from("workspaces").select("mode").eq("id", id).single<{ mode: string }>();
+    if (readError) throw new Error(readError.message);
+    if (cur.mode !== modeOf(patch.businessType)) {
+      throw new Error(cur.mode === "PERSONAL" ? "A personal workspace can't be turned into a business one. Create a new business workspace instead." : "A business workspace can't be turned into a personal one. Create a new personal workspace instead.");
+    }
+    row.business_type = patch.businessType;
+  }
+  const { error } = await c.from("workspaces").update(row).eq("id", id);
   if (error) throw new Error(error.message);
+}
+
+/**
+ * Per-workspace financial defaults (`workspaces.settings`, migration 0006). Both calls tolerate a database without the
+ * column yet: load returns null and save is a no-op warning, so the device copy keeps working.
+ */
+export async function loadWorkspaceSettings(id: string): Promise<Record<string, unknown> | null> {
+  const { data, error } = await requireClient().from("workspaces").select("settings").eq("id", id).maybeSingle<{ settings: unknown }>();
+  if (error) {
+    if (error.code === "42703") return null; // column missing: migration 0006 not applied
+    throw new Error(error.message);
+  }
+  const s = data?.settings;
+  return s && typeof s === "object" && !Array.isArray(s) ? (s as Record<string, unknown>) : null;
+}
+
+export async function saveWorkspaceSettings(id: string, settings: Record<string, unknown>): Promise<void> {
+  const { error } = await requireClient().from("workspaces").update({ settings }).eq("id", id);
+  if (error && error.code !== "42703" && error.code !== "PGRST204") throw new Error(error.message);
 }
 
 export async function deleteWorkspace(id: string) {
@@ -506,16 +535,43 @@ export async function saveDocuments(workspaceId: string, docs: NewWorkspaceDocum
     items: d.months && d.months.length > 1 ? { ...d.items, months: d.months } : d.items,
     totals: d.totals,
   }));
-  const hashed = rows.filter((r) => r.content_hash);
+  // The same file selected twice in one batch is saved once (the later entry wins), so the upsert can't hit itself.
+  const byHash = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) if (r.content_hash) byHash.set(r.content_hash, r);
+  const hashed = [...byHash.values()];
   const plain = rows.filter((r) => !r.content_hash);
   const out: WorkspaceDocument[] = [];
   if (hashed.length) {
     const { data, error } = await c.from("workspace_documents").upsert(hashed, { onConflict: "workspace_id,content_hash" }).select(DOCUMENT_COLUMNS);
-    if (error) throw new Error(error.message);
-    out.push(...(data as DocumentRow[]).map(toDocument));
+    if (!error) out.push(...(data as DocumentRow[]).map(toDocument));
+    // 42P10: the database still has the old partial unique index (migration 0006 not applied), which ON CONFLICT
+    // can't target. Dedupe by hand instead of dropping the documents: update the files already saved, insert the rest.
+    else if (error.code === "42P10") out.push(...(await saveHashedWithoutUpsert(c, workspaceId, hashed)));
+    else throw new Error(error.message);
   }
   if (plain.length) {
     const { data, error } = await c.from("workspace_documents").insert(plain).select(DOCUMENT_COLUMNS);
+    if (error) throw new Error(error.message);
+    out.push(...(data as DocumentRow[]).map(toDocument));
+  }
+  return out;
+}
+
+/** Upsert fallback: same result (one row per file per workspace) without relying on an ON CONFLICT target. */
+async function saveHashedWithoutUpsert(c: SupabaseClient, workspaceId: string, rows: { content_hash: string | null }[]): Promise<WorkspaceDocument[]> {
+  const hashes = rows.map((r) => r.content_hash!);
+  const { data: existing, error: findError } = await c.from("workspace_documents").select("id,content_hash").eq("workspace_id", workspaceId).in("content_hash", hashes);
+  if (findError) throw new Error(findError.message);
+  const idByHash = new Map((existing as { id: string; content_hash: string }[]).map((r) => [r.content_hash, r.id]));
+  const out: WorkspaceDocument[] = [];
+  const fresh = rows.filter((r) => !idByHash.has(r.content_hash!));
+  for (const r of rows.filter((x) => idByHash.has(x.content_hash!))) {
+    const { data, error } = await c.from("workspace_documents").update(r).eq("id", idByHash.get(r.content_hash!)!).select(DOCUMENT_COLUMNS).single<DocumentRow>();
+    if (error) throw new Error(error.message);
+    out.push(toDocument(data));
+  }
+  if (fresh.length) {
+    const { data, error } = await c.from("workspace_documents").insert(fresh).select(DOCUMENT_COLUMNS);
     if (error) throw new Error(error.message);
     out.push(...(data as DocumentRow[]).map(toDocument));
   }

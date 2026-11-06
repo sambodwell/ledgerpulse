@@ -30,12 +30,14 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
       </head>
-      <body className="flex min-h-full flex-col bg-slate-950 text-slate-100">
+      {/* overflow-x-clip: nothing can push the page wider than a phone screen (unlike overflow-hidden it keeps sticky bars working). */}
+      <body className="flex min-h-full flex-col overflow-x-clip bg-slate-950 text-slate-100">
         <AppProvider>
           <WorkspaceProvider>
             <div className="flex-1">{children}</div>
             <Footer />
             <ChatAssistant />
+            {/* Every route gets a theme switch; pages with the sidebar show it there and this one steps aside. */}
             <ThemeToggle />
           </WorkspaceProvider>
         </AppProvider>

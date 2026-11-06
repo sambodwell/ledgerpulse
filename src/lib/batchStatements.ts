@@ -230,5 +230,19 @@ export async function hashFile(file: Blob): Promise<string | null> {
   }
 }
 
-/** "march-2026-checking.pdf" → "march-2026-checking". */
-export const documentName = (fileName: string) => fileName.replace(/\.[a-z0-9]{1,5}$/i, "").trim().slice(0, 160) || "Statement";
+/**
+ * A tidy display name from a file name: "chase_checking__March-2026 (1).pdf" → "Chase checking March 2026".
+ * Underscores and word-separating dashes become spaces, browser duplicate suffixes ("(1)", " copy") are dropped and the
+ * first letter is capitalized; numeric dates such as "2026-03" are kept as they are.
+ */
+export function documentName(fileName: string): string {
+  const tidy = fileName
+    .replace(/\.[a-z0-9]{1,5}$/i, "")
+    .replace(/\s*\(\d+\)$/, "")
+    .replace(/[\s_-]+copy$/i, "")
+    .replace(/_+/g, " ")
+    .replace(/(?<=[a-z])-+|-+(?=[a-z])/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (tidy.charAt(0).toUpperCase() + tidy.slice(1)).slice(0, 160) || "Statement";
+}

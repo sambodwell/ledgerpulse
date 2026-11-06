@@ -331,8 +331,8 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
           )}
 
           {/* Monthly actuals */}
-          <div className="mt-6 grid gap-6 xl:grid-cols-5">
-            <div className="min-w-0 xl:col-span-3">
+          <div className="mt-6 grid gap-6 2xl:grid-cols-5">
+            <div className="min-w-0 2xl:col-span-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h3 className="text-sm font-medium text-slate-300">
                   Monthly actuals <span className="text-xs font-normal text-slate-500">· {summary.loggedCount} of 12 logged · exact to the cent</span>
@@ -397,12 +397,14 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
                 </span>
               </p>
               {/*
-                Sticky header: the inputs below are positioned (relative wrappers for the $ prefix), so without its own
-                stacking layer and an opaque fill the header would be painted under the scrolling rows.
+                All twelve months fit without an inner vertical scroll (it used to cap at 30rem and scroll a couple of
+                rows, leaving dead space). The table takes the full card width up to 2xl screens, and only scrolls
+                sideways on narrow (phone) screens. The header keeps its own stacking layer + opaque fill so positioned
+                inputs (the $ prefix wrappers) never paint over it.
               */}
-              <div className="relative mt-2 max-h-[30rem] overflow-auto overscroll-contain rounded-lg border border-white/5 [scrollbar-gutter:stable]">
-                <table className="w-full min-w-[44rem] text-sm tabular-nums">
-                  <thead className="sticky top-0 z-20 bg-slate-900 text-left text-[11px] uppercase text-slate-400 shadow-[0_1px_0_rgba(255,255,255,0.08)]">
+              <div className="relative mt-2 overflow-x-auto overscroll-x-contain rounded-lg border border-white/5">
+                <table className="w-full min-w-[40rem] text-sm tabular-nums">
+                  <thead className="relative z-20 bg-slate-900 text-left text-[11px] uppercase text-slate-400 shadow-[0_1px_0_rgba(255,255,255,0.08)]">
                     <tr>
                       <th className="bg-slate-900 py-2 pl-2 font-medium">Month</th>
                       <th className="bg-slate-900 py-2 font-medium">Revenue</th>
@@ -517,7 +519,7 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
                       );
                     })}
                   </tbody>
-                  <tfoot className="sticky bottom-0 z-20 border-t border-white/10 bg-slate-900 text-sm font-medium">
+                  <tfoot className="relative z-20 border-t border-white/10 bg-slate-900 text-sm font-medium">
                     <tr>
                       <td className="py-2 pl-2 text-slate-300">Projected FY</td>
                       <td className="py-2 pl-3">{exactMoney(summary.projectedTotal.revenue)}</td>
@@ -535,7 +537,7 @@ export function FiscalYearTracker({ tracker, analysis, id }: { tracker: FiscalTr
               </p>
             </div>
 
-            <div className="min-w-0 space-y-4 xl:col-span-2">
+            <div className="min-w-0 space-y-4 2xl:col-span-2">
               <div>
                 <h3 className="text-sm font-medium text-slate-300">Monthly net · actual vs forecast</h3>
                 <div className="mt-2 h-48">

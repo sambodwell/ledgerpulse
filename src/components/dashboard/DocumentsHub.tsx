@@ -1,14 +1,18 @@
 "use client";
 
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, CalendarPlus, CalendarRange, Check, CheckCircle2, FileText, FolderOpen, Loader2, Pencil, Trash2, X } from "lucide-react";
 import { documentRange, documentSlices, type WorkspaceDocument } from "@/lib/supabase";
 import { exactMoney, statementTotals } from "@/lib/fiscal";
 import { periodLabel } from "@/lib/statementPeriod";
 import { statementMonthOptions } from "@/components/dashboard/StatementMonth";
+import { DOC_KIND_GROUP_LABELS, DOC_KIND_ORDER } from "@/lib/documentGroups";
 import { cn, glass, inputCls, secondaryBtn } from "@/components/ui";
 
 type SortKey = "month-desc" | "month-asc" | "name" | "uploaded";
+type GroupKey = "kind" | "year" | "none";
+
+const GROUP_LABEL: Record<GroupKey, string> = { kind: "Document type", year: "Year", none: "No grouping" };
 
 const SORT_LABEL: Record<SortKey, string> = {
   "month-desc": "Month (newest first)",
@@ -51,6 +55,7 @@ function rangeLabel(d: WorkspaceDocument): string | null {
  */
 export function DocumentsHub({
   workspaceName,
+  focusId,
   docs,
   loading,
   error,
@@ -62,6 +67,8 @@ export function DocumentsHub({
   loggedMonths,
 }: {
   workspaceName: string;
+  /** Document to scroll to and highlight (picked from the sidebar's Documents menu). */
+  focusId?: string | null;
   docs: WorkspaceDocument[];
   loading: boolean;
   error: string | null;
@@ -76,6 +83,13 @@ export function DocumentsHub({
 }) {
   const titleId = useId();
   const [sort, setSort] = useState<SortKey>("month-desc");
+  const [groupBy, setGroupBy] = useState<GroupKey>("kind");
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!focusId || loading) return;
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-doc-id="${CSS.escape(focusId)}"]`);
+    el?.scrollIntoView({ block: "center" });
+  }, [focusId, loading]);
   const [editing, setEditing] = useState<{ id: string; name: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -100,6 +114,19 @@ export function DocumentsHub({
     return out;
   }, [docs, sort]);
 
+  const grouped = useMemo((): { key: string; label: string; docs: WorkspaceDocument[] }[] => {
+    if (groupBy === "none") return [{ key: "all", label: "", docs: sorted }];
+    if (groupBy === "kind") return DOC_KIND_ORDER.map((k) => ({ key: k, label: DOC_KIND_GROUP_LABELS[k], docs: sorted.filter((d) => d.kind === k) })).filter((g) => g.docs.length);
+    const years = new Map<string, WorkspaceDocument[]>();
+    for (const d of sorted) {
+      const y = documentRange(d)?.to.slice(0, 4) ?? "Undated";
+      years.set(y, [...(years.get(y) ?? []), d]);
+    }
+    return [...years.entries()]
+      .sort(([a], [b]) => (a === "Undated" ? 1 : b === "Undated" ? -1 : b.localeCompare(a)))
+      .map(([k, list]) => ({ key: k, label: k === "Undated" ? "No statement month" : k, docs: list }));
+  }, [sorted, groupBy]);
+
   const run = async (id: string, fn: () => Promise<void>) => {
     setBusy(id);
     setRowError(null);
@@ -114,72 +141,14 @@ export function DocumentsHub({
     }
   };
 
-  const months = new Set(docs.flatMap((d) => documentSlices(d).map((s) => s.period))).size;
-  const needsMonth = docs.filter((d) => parseStatus(d, loggedMonths).key === "needs-month").length;
-
-  return (
-    <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-slate-950/70 p-4 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
-      <section role="dialog" aria-modal="true" aria-labelledby={titleId} className={cn(glass, "flex max-h-[90vh] w-full max-w-3xl flex-col bg-slate-900/95")}>
-        <header className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
-          <div className="min-w-0">
-            <h2 id={titleId} className="flex items-center gap-2 text-lg font-semibold">
-              <FolderOpen className="h-5 w-5 text-indigo-300" /> My Documents
-            </h2>
-            <p className="mt-0.5 truncate text-sm text-slate-400">
-              {workspaceName} · {docs.length} document{docs.length === 1 ? "" : "s"}
-              {months ? ` across ${months} month${months === 1 ? "" : "s"}` : ""}
-              {needsMonth ? ` · ${needsMonth} need${needsMonth === 1 ? "s" : ""} a month` : ""}
-            </p>
-          </div>
-          <button type="button" onClick={onClose} disabled={!!busy} aria-label="Close" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-white">
-            <X className="h-4 w-4" />
-          </button>
-        </header>
-
-        <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
-          <label className="flex items-center gap-2 text-xs text-slate-400">
-            Sort by
-            <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)} className={cn(inputCls, "w-auto py-1.5 pr-8 text-xs")}>
-              {(Object.keys(SORT_LABEL) as SortKey[]).map((k) => (
-                <option key={k} value={k}>
-                  {SORT_LABEL[k]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="text-[11px] text-slate-500">Only parsed results are kept — never the original file.</p>
-        </div>
-
-        {(error || rowError) && (
-          <p role="alert" className="mx-5 mt-3 rounded-lg border border-rose-300/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
-            {rowError ?? error}
-          </p>
-        )}
-        {note && (
-          <p role="status" className="mx-5 mt-3 flex items-start gap-1.5 rounded-lg border border-emerald-300/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100">
-            <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {note}
-          </p>
-        )}
-
-        <div className="mt-3 min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5">
-          {loading ? (
-            <p className="flex items-center gap-2 py-8 text-sm text-slate-400">
-              <Loader2 className="h-4 w-4 animate-spin" /> Loading documents…
-            </p>
-          ) : sorted.length === 0 ? (
-            <p className="rounded-xl border border-dashed border-white/15 px-4 py-8 text-center text-sm text-slate-400">
-              No documents in this workspace yet. Statements and reports you upload here appear in this list with their parse status and the months they cover.
-            </p>
-          ) : (
-            <ul className="space-y-2">
-              {sorted.map((d) => {
+  const renderDoc = (d: WorkspaceDocument): ReactNode => {
                 const isEditing = editing?.id === d.id;
                 const lines = lineCount(d);
                 const status = parseStatus(d, loggedMonths);
                 const range = rangeLabel(d);
                 const multi = d.months.length > 1;
                 return (
-                  <li key={d.id} className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
+                  <li key={d.id} data-doc-id={d.id} className={cn("scroll-mt-4 rounded-xl border bg-white/[0.02] p-3", d.id === focusId ? "border-indigo-400/60 ring-1 ring-indigo-400/40" : "border-white/10")}>
                     <div className="flex flex-wrap items-start gap-3">
                       <FileText className="mt-0.5 h-5 w-5 shrink-0 text-indigo-300" aria-hidden />
                       <div className="min-w-0 flex-1">
@@ -312,8 +281,89 @@ export function DocumentsHub({
                     </div>
                   </li>
                 );
-              })}
-            </ul>
+};
+
+  const months = new Set(docs.flatMap((d) => documentSlices(d).map((s) => s.period))).size;
+  const needsMonth = docs.filter((d) => parseStatus(d, loggedMonths).key === "needs-month").length;
+
+  return (
+    <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-slate-950/70 p-4 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
+      <section role="dialog" aria-modal="true" aria-labelledby={titleId} className={cn(glass, "flex max-h-[90vh] w-full max-w-3xl flex-col bg-slate-900/95")}>
+        <header className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
+          <div className="min-w-0">
+            <h2 id={titleId} className="flex items-center gap-2 text-lg font-semibold">
+              <FolderOpen className="h-5 w-5 text-indigo-300" /> Documents
+            </h2>
+            <p className="mt-0.5 truncate text-sm text-slate-400">
+              {workspaceName} · {docs.length} document{docs.length === 1 ? "" : "s"}
+              {months ? ` across ${months} month${months === 1 ? "" : "s"}` : ""}
+              {needsMonth ? ` · ${needsMonth} need${needsMonth === 1 ? "s" : ""} a month` : ""}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} disabled={!!busy} aria-label="Close" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-white">
+            <X className="h-4 w-4" />
+          </button>
+        </header>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
+          <div className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-xs text-slate-400">
+            Group by
+            <select value={groupBy} onChange={(e) => setGroupBy(e.target.value as GroupKey)} className={cn(inputCls, "w-auto py-1.5 pr-8 text-xs")}>
+              {(Object.keys(GROUP_LABEL) as GroupKey[]).map((k) => (
+                <option key={k} value={k}>
+                  {GROUP_LABEL[k]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-400">
+            Sort by
+            <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)} className={cn(inputCls, "w-auto py-1.5 pr-8 text-xs")}>
+              {(Object.keys(SORT_LABEL) as SortKey[]).map((k) => (
+                <option key={k} value={k}>
+                  {SORT_LABEL[k]}
+                </option>
+              ))}
+            </select>
+          </label>
+          </div>
+          <p className="text-[11px] text-slate-500">Saved to this workspace. Only parsed results are kept, never the original file.</p>
+        </div>
+
+        {(error || rowError) && (
+          <p role="alert" className="mx-5 mt-3 rounded-lg border border-rose-300/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
+            {rowError ?? error}
+          </p>
+        )}
+        {note && (
+          <p role="status" className="mx-5 mt-3 flex items-start gap-1.5 rounded-lg border border-emerald-300/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100">
+            <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {note}
+          </p>
+        )}
+
+        <div ref={listRef} className="mt-3 min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5">
+          {loading ? (
+            <p className="flex items-center gap-2 py-8 text-sm text-slate-400">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading documents…
+            </p>
+          ) : sorted.length === 0 ? (
+            <p className="rounded-xl border border-dashed border-white/15 px-4 py-8 text-center text-sm text-slate-400">
+              No documents in this workspace yet. Statements and reports you upload here appear in this list with their parse status and the months they cover.
+            </p>
+          ) : (
+            <div className="space-y-5">
+              {grouped.map((g) => (
+                <section key={g.key} aria-label={g.label || undefined}>
+                  {g.label && (
+                    <h3 className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                      {g.label} <span className="rounded-full bg-white/10 px-1.5 font-normal tabular-nums text-slate-400">{g.docs.length}</span>
+                    </h3>
+                  )}
+                  <ul className="space-y-2">{g.docs.map(renderDoc)}</ul>
+                </section>
+              ))}
+            </div>
           )}
         </div>
         <p className="border-t border-white/10 px-5 py-3 text-[11px] text-slate-500">

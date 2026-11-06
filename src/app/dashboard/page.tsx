@@ -15,6 +15,8 @@ import {
   ClipboardList,
   Download,
   FileText,
+  Lightbulb,
+  TrendingUp,
   FolderOpen,
   History,
   Home,
@@ -49,7 +51,9 @@ import {
   CATEGORY_LINE_HINTS,
   CATEGORY_TEMPLATES,
   DEFAULT_FORECAST,
+  HORIZON_OPTIONS,
   MODE_COPY,
+  MONTH_NAMES,
   PRICING,
   effectiveInflationRate,
   isAnalysisResponse,
@@ -87,10 +91,12 @@ import {
   listReportVersions,
   loadReportVersion,
   loadWorkspaceReport,
+  loadWorkspaceSettings,
   saveDocuments,
   saveFiscalTracker,
   saveReportVersion,
   saveWorkspaceReport,
+  saveWorkspaceSettings,
   updateDocument,
   updateDocumentItems,
   updateWorkspace,
@@ -110,10 +116,12 @@ import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
 import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
-import { ProfileMenu } from "@/components/ProfileMenu";
+import { ProfileMenu, creditsLabel } from "@/components/ProfileMenu";
+import { AppShell } from "@/components/WorkspaceSidebar";
 import { PlanCard } from "@/components/PlanCard";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { CHART, COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml, signedUsd } from "@/components/dashboard/chartKit";
+import { downloadHtmlAsPdf, pdfFileName } from "@/lib/pdfDownload";
 import { ForecastControls } from "@/components/dashboard/ForecastControls";
 import { ScenarioPanel, scenarioExamples } from "@/components/dashboard/ScenarioPanel";
 import { FiscalYearTracker, ImplementedToggle, toggleImplemented, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
@@ -121,7 +129,7 @@ import { DataCompletenessNote, GoalPaceBanner, GoalTracker, goalPaceBannerHtml, 
 import { clearLocalTracker, clearUnsyncedTracker, readLocalTracker, useFiscalTracker } from "@/components/dashboard/useFiscalTracker";
 import { InfoTip } from "@/components/InfoTip";
 import { FeedbackWidget } from "@/components/dashboard/FeedbackWidget";
-import { MoneyInput } from "@/components/dashboard/MoneyInput";
+import { MoneyInput, MoneyNumberInput } from "@/components/dashboard/MoneyInput";
 import { ExpenseShareCard } from "@/components/dashboard/ExpenseShare";
 import { CashFlowChart } from "@/components/dashboard/CashFlowChart";
 import { MonthlyBreakdown, type LineRef } from "@/components/dashboard/MonthlyBreakdown";
@@ -131,7 +139,7 @@ import { BenchmarkGauges, benchmarksReportHtml } from "@/components/dashboard/Be
 import { VendorCreepAlerts, useVendorCreep } from "@/components/dashboard/VendorCreepAlerts";
 import { useWorkspacePref } from "@/components/dashboard/useWorkspacePref";
 import { GranularityToggle, PaceStrip } from "@/components/dashboard/GranularityToggle";
-import { GRANULARITY_LABELS, GRANULARITY_UNIT, isGranularity, labelToKey, paceOf, toPeriods, type Granularity } from "@/lib/granularity";
+import { GRANULARITIES, GRANULARITY_LABELS, GRANULARITY_UNIT, isGranularity, labelToKey, paceOf, toPeriods, type Granularity } from "@/lib/granularity";
 import { defaultBenchmarkProfile, evaluateBenchmarks, isBenchmarkProfile, type BenchmarkProfile } from "@/lib/benchmarks";
 import { creepHeadline, type VendorCreep } from "@/lib/vendorCreep";
 import { cn, errorMessage, glass, inputCls, pct, primaryBtn, secondaryBtn, usd, usdCompact } from "@/components/ui";
@@ -201,7 +209,8 @@ export default function DashboardPage() {
   const app = useApp();
   const router = useRouter();
   const wsKey = app.activeWorkspace?.id ?? "guest";
-  const { mode, setActiveWorkspace } = useWorkspace();
+  // Locked to the active workspace's type: a saved workspace is one book (see WorkspaceContext).
+  const { mode, setActiveWorkspace, locked: modeLocked } = useWorkspace();
   const setMode = (m: WorkspaceMode) => setActiveWorkspace(fromMode(m));
 
   // Gate: financial inputs require an account (the API enforces this too).
@@ -363,6 +372,17 @@ export default function DashboardPage() {
   }, [userId, activeWsId, loadDocs]);
   const workspaceDocs = activeWsId ? docsByWs[activeWsId] ?? [] : [];
   const [docsOpen, setDocsOpen] = useState(false);
+  /** Document to scroll to when the manager opens from the sidebar's Documents menu. */
+  const [docsFocus, setDocsFocus] = useState<string | null>(null);
+  const openDocuments = useCallback(
+    (docId?: string) => {
+      setDocsFocus(docId ?? null);
+      setDocsOpen(true);
+      if (activeWsId && !docsFetched.current.has(activeWsId)) void loadDocs(activeWsId);
+    },
+    [activeWsId, loadDocs],
+  );
+  const [wsSettingsOpen, setWsSettingsOpen] = useState(false);
 
   /**
    * Bumped whenever the statement uploader must start clean: a brand-new workspace, or switching to another
@@ -914,10 +934,16 @@ export default function DashboardPage() {
     [wsKey],
   );
   const copy = MODE_COPY[mode];
-  const downloadReport = () => {
-    if (!analysis || teaser) return;
-    printExecutiveReport(analysis, forecast, goalReport, inflationLabel, reportExtras);
-    onReportDownloaded();
+  const [reportDownloading, setReportDownloading] = useState(false);
+  const downloadReport = async () => {
+    if (!analysis || teaser || reportDownloading) return;
+    setReportDownloading(true);
+    try {
+      await downloadExecutiveReport(analysis, forecast, goalReport, inflationLabel, reportExtras, ws?.name ?? null);
+      onReportDownloaded();
+    } finally {
+      setReportDownloading(false);
+    }
   };
 
   const versions = activeWsId ? versionsByWs[activeWsId] ?? [] : [];
@@ -947,6 +973,77 @@ export default function DashboardPage() {
   });
   /** Monthly / Weekly / Daily increment shared by the Overview cash-flow chart and the Forecast projection (per workspace, this device). */
   const [granularity, setGranularity] = useWorkspacePref<Granularity>(userId ? `lp:granularity:${userId}:${wsKey}` : null, "MONTHLY", (v) => (isGranularity(v) ? v : null));
+  /*
+   * Workspace financial defaults (inflation, seasonality, horizon, start month, view increment, cash on hand) follow the
+   * workspace to every device via `workspaces.settings`. The device copy (localStorage) is what renders first; the saved
+   * copy is adopted once it loads, and later changes are written back, debounced.
+   */
+  const settingsSynced = useRef<Record<string, string>>({});
+  const [settingsReady, setSettingsReady] = useState<Record<string, true>>({});
+  useEffect(() => {
+    if (!userId || !activeWsId || settingsReady[activeWsId] || activeWsId in settingsSynced.current) return;
+    const id = activeWsId;
+    settingsSynced.current[id] = "";
+    loadWorkspaceSettings(id)
+      .then((saved) => {
+        if (saved) {
+          const f = saved.forecast ? normalizeForecastSettings(saved.forecast) : null;
+          try {
+            if (f) window.localStorage.setItem(`lp:forecast:${userId}:${id}`, JSON.stringify(f));
+            if (typeof saved.cashOnHand === "number" && Number.isFinite(saved.cashOnHand)) window.localStorage.setItem(`lp:cash:${userId}:${id}`, JSON.stringify(saved.cashOnHand));
+            if (isGranularity(saved.granularity)) window.localStorage.setItem(`lp:granularity:${userId}:${id}`, JSON.stringify(saved.granularity));
+          } catch {
+            /* device copy is a convenience */
+          }
+          // Same shape and key order as the save below, so loading never triggers a redundant write (jsonb reorders keys).
+          settingsSynced.current[id] = JSON.stringify({ forecast: f ?? undefined, cashOnHand: typeof saved.cashOnHand === "number" ? saved.cashOnHand : null, granularity: saved.granularity });
+          // Re-adopt the (now updated) device copies for this workspace.
+          setForecastState((cur) => (cur.key === `lp:forecast:${userId}:${id}` && f ? { key: cur.key, value: f } : cur));
+          setSettingsAdopt((n) => n + 1);
+        }
+        setSettingsReady((cur) => ({ ...cur, [id]: true }));
+      })
+      .catch((e) => {
+        delete settingsSynced.current[id];
+        console.warn("[workspace] settings unavailable", e);
+        setSettingsReady((cur) => ({ ...cur, [id]: true }));
+      });
+  }, [userId, activeWsId, settingsReady]);
+  /** Bumped after saved settings land so the per-device prefs re-read their (updated) stored values. */
+  const [settingsAdopt, setSettingsAdopt] = useState(0);
+  useEffect(() => {
+    if (!settingsAdopt || !userId || !activeWsId) return;
+    const read = (k: string) => {
+      try {
+        const raw = window.localStorage.getItem(k);
+        return raw == null ? null : (JSON.parse(raw) as unknown);
+      } catch {
+        return null;
+      }
+    };
+    const c = read(`lp:cash:${userId}:${activeWsId}`);
+    if (typeof c === "number" && c !== cashOnHand) setCashOnHand(c);
+    const g = read(`lp:granularity:${userId}:${activeWsId}`);
+    if (isGranularity(g) && g !== granularity) setGranularity(g);
+    // Only when new saved settings arrive, not on every local change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsAdopt]);
+  useEffect(() => {
+    if (!activeWsId || !settingsReady[activeWsId]) return;
+    const id = activeWsId;
+    const next = { forecast, cashOnHand, granularity };
+    const json = JSON.stringify(next);
+    if (settingsSynced.current[id] === json) return;
+    const t = setTimeout(() => {
+      settingsSynced.current[id] = json;
+      saveWorkspaceSettings(id, next).catch((e) => {
+        delete settingsSynced.current[id];
+        console.warn("[workspace] settings save failed", e);
+      });
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [activeWsId, settingsReady, forecast, cashOnHand, granularity]);
+
   /** Benchmark peer group (defaults from the business type; households always use the 50/30/20 profile). */
   const [storedBenchmark, setBenchmarkProfile] = useWorkspacePref<BenchmarkProfile | null>(userId ? `lp:benchmark:${userId}:${wsKey}` : null, null, (v) => (isBenchmarkProfile(v) && v !== "HOUSEHOLD" ? v : null));
   const benchmarkProfile: BenchmarkProfile =
@@ -959,6 +1056,51 @@ export default function DashboardPage() {
       ? undefined
       : (f: { title: string; potentialSavings: number }) => tracker.update((st) => toggleImplemented(st, { title: f.title, monthly: f.potentialSavings }, monthKey(new Date())));
 
+  // Sidebar links from other pages (Settings) land here with ?open=documents or ?open=workspace-settings.
+  const deepLinkHandled = useRef(false);
+  useEffect(() => {
+    if (deepLinkHandled.current || !app.ready || !ws) return;
+    deepLinkHandled.current = true;
+    const params = new URLSearchParams(window.location.search);
+    const open = params.get("open");
+    if (!open) return;
+    params.delete("open");
+    const rest = params.toString();
+    window.history.replaceState(null, "", window.location.pathname + (rest ? `?${rest}` : ""));
+    if (open === "documents") openDocuments();
+    else if (open === "workspace-settings") setWsSettingsOpen(true);
+  }, [app.ready, ws, openDocuments]);
+
+  const deleteActiveWorkspace = async () => {
+    if (!ws) return;
+    const id = ws.id;
+    await app.removeWorkspace(id);
+    setWsSettingsOpen(false);
+    // Drop everything this device kept for the deleted workspace.
+    clearUnsyncedTracker(app.user!.id, id);
+    delete reportSynced.current[id];
+    delete settingsSynced.current[id];
+    reportFetched.current.delete(id);
+    docsFetched.current.delete(id);
+    versionsFetched.current.delete(id);
+    const drop = <T,>(r: Record<string, T>) => {
+      const { [id]: _gone, ...rest } = r;
+      void _gone;
+      return rest;
+    };
+    setVersionsByWs(drop);
+    setDocsByWs(drop);
+    setResults(drop);
+    try {
+      for (const k of ["forecast", "reportCallout", "cash", "cashDetected", "granularity", "benchmark"]) window.localStorage.removeItem(`lp:${k}:${app.user!.id}:${id}`);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  /** Quick wins + top performers for the Overview's left column. */
+  const insights = useMemo(() => (analysis && !teaser ? overviewInsights(analysis, tracker.state.savings) : null), [analysis, teaser, tracker.state.savings]);
+
   if (!app.ready || !app.user) {
     return (
       <div className="grid min-h-screen place-items-center bg-slate-950 text-sm text-slate-400" role="status">
@@ -970,6 +1112,7 @@ export default function DashboardPage() {
   }
 
   return (
+    <AppShell documents={ws ? { docs: workspaceDocs, loading: docsState.loading === ws.id, onOpen: openDocuments } : undefined} onOpenWorkspaceSettings={ws ? () => setWsSettingsOpen(true) : undefined}>
     <div className="relative min-h-screen overflow-x-clip bg-slate-950 text-slate-100">
       {/* Ambient glow */}
       <div aria-hidden className="pointer-events-none fixed inset-0">
@@ -990,62 +1133,25 @@ export default function DashboardPage() {
             <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-slate-300">
               {ws ? (
                 <>
-                  {ws.mode === "PERSONAL" ? <Home className="h-4 w-4 text-slate-400" /> : <Briefcase className="h-4 w-4 text-slate-400" />}
+                  {ws.mode === "PERSONAL" ? <Home className="h-4 w-4 text-emerald-300" /> : <Briefcase className="h-4 w-4 text-indigo-300" />}
                   Workspace: <span className="font-medium text-slate-100">{ws.name}</span>
-                  <span className="text-slate-500">· {BUSINESS_TYPE_LABELS[ws.businessType]}</span>
-                  <WorkspaceMenu
-                    // Keyed by id: the menu's name field must never show the previous workspace's name.
-                    key={ws.id}
-                    workspace={ws}
-                    docCount={docsByWs[ws.id]?.length ?? null}
-                    onOpenDocuments={() => {
-                      setDocsOpen(true);
-                      if (!docsFetched.current.has(ws.id)) void loadDocs(ws.id);
-                    }}
-                    onRename={async (name) => {
-                      await updateWorkspace(ws.id, { name });
-                      await app.refreshWorkspaces();
-                    }}
-                    onDelete={async () => {
-                      const id = ws.id;
-                      await app.removeWorkspace(id);
-                      // Drop everything this device kept for the deleted workspace.
-                      clearUnsyncedTracker(app.user!.id, id);
-                      delete reportSynced.current[id];
-                      reportFetched.current.delete(id);
-                      docsFetched.current.delete(id);
-                      versionsFetched.current.delete(id);
-                      setVersionsByWs((v) => {
-                        const { [id]: _gone, ...rest } = v;
-                        void _gone;
-                        return rest;
-                      });
-                      setDocsByWs((d) => {
-                        const { [id]: _gone, ...rest } = d;
-                        void _gone;
-                        return rest;
-                      });
-                      setResults((r) => {
-                        const { [id]: _gone, ...rest } = r;
-                        void _gone;
-                        return rest;
-                      });
-                      try {
-                        window.localStorage.removeItem(`lp:forecast:${app.user!.id}:${id}`);
-                        window.localStorage.removeItem(`lp:reportCallout:${app.user!.id}:${id}`);
-                      } catch {
-                        /* ignore */
-                      }
-                    }}
-                  />
+                  <span className="text-slate-500">· {ws.mode === "PERSONAL" ? "Personal book" : `Business · ${BUSINESS_TYPE_LABELS[ws.businessType].split(" (")[0]}`}</span>
+                  <button
+                    type="button"
+                    onClick={() => setWsSettingsOpen(true)}
+                    className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-xs text-slate-300 hover:bg-white/5 hover:text-white"
+                  >
+                    <Settings2 className="h-3.5 w-3.5" /> Workspace settings
+                  </button>
                 </>
               ) : (
-                <span className="text-slate-500">No saved workspace selected — you&apos;ll be asked to name one when you run an analysis.</span>
+                <span className="text-slate-500">No saved workspace selected — pick one in the sidebar, or you&apos;ll be asked to name one when you run an analysis.</span>
               )}
             </div>
           </div>
           <div className="flex items-center gap-3 self-end sm:self-start">
-            <ModeToggle mode={mode} onChange={setMode} />
+            {/* Only an unsaved (temporary) analysis can switch mode; a saved workspace is fixed to its own type. */}
+            {!modeLocked && <ModeToggle mode={mode} onChange={setMode} />}
             <ProfileMenu />
           </div>
         </header>
@@ -1191,6 +1297,15 @@ export default function DashboardPage() {
             </button>
           </div>
         )}
+        {docsState.error && !docsOpen && (
+          <div role="alert" className="mt-6 flex items-start gap-3 rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="flex-1">{docsState.error} Your report is unaffected; re-upload the statement to keep it in this workspace&apos;s documents.</span>
+            <button onClick={() => setDocsState((d) => ({ ...d, error: null }))} aria-label="Dismiss" className="text-rose-200 hover:text-white">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
         {error && (
           <div role="alert" className="mt-6 flex items-start gap-3 rounded-2xl border border-rose-400/30 bg-rose-500/10 p-4 text-rose-100">
             <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
@@ -1207,8 +1322,8 @@ export default function DashboardPage() {
               <h2 className="text-xl font-semibold">Results{ws ? <span className="text-base font-normal text-slate-400"> · {ws.name}</span> : null}</h2>
               <div className="flex flex-wrap items-center gap-2">
               {ws && (
-                <button type="button" onClick={() => setDocsOpen(true)} className={cn(secondaryBtn, "text-slate-200")}>
-                  <FolderOpen className="h-4 w-4" /> My Documents
+                <button type="button" onClick={() => openDocuments()} className={cn(secondaryBtn, "text-slate-200")}>
+                  <FolderOpen className="h-4 w-4" /> Documents
                   {workspaceDocs.length > 0 && <span className="rounded-full bg-white/10 px-1.5 text-[11px] tabular-nums">{workspaceDocs.length}</span>}
                 </button>
               )}
@@ -1218,8 +1333,8 @@ export default function DashboardPage() {
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               ) : (
-                <button onClick={downloadReport} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
-                  <Download className="h-4 w-4" /> Download Executive PDF Report
+                <button onClick={() => void downloadReport()} disabled={reportDownloading} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
+                  {reportDownloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} {reportDownloading ? "Preparing PDF…" : "Download Executive PDF Report"}
                 </button>
               )}
               </div>
@@ -1305,6 +1420,16 @@ export default function DashboardPage() {
                   <PanelBoundary title="Winner insight">
                     <WinnerCard analysis={analysis} label={copy.revenue} />
                   </PanelBoundary>
+                  {insights && insights.wins.length > 0 && (
+                    <PanelBoundary title="Quick wins">
+                      <QuickWinsCard wins={insights.wins} onOpenAudit={() => jumpTo("audit-panel")} onOpenScenarios={() => openTab("forecast", "results-panel-forecast")} />
+                    </PanelBoundary>
+                  )}
+                  {insights && insights.performers.length > 0 && (
+                    <PanelBoundary title="Top performers">
+                      <TopPerformersCard performers={insights.performers} personal={analysis.businessType === "PERSONAL_FAMILY"} label={copy.revenue} />
+                    </PanelBoundary>
+                  )}
                 </div>
                 <div className="min-w-0 space-y-6 lg:col-span-3">
                   <PanelBoundary title="Line items">
@@ -1386,7 +1511,13 @@ export default function DashboardPage() {
                 {teaser ? (
                   <LockedSection title="Executive PDF Report" paywall={paywall} placeholder={<FakeChart />} />
                 ) : (
-                  <ReportPreview html={resultsTab === "report" ? reportHtml(analysis, forecast, goalReport, inflationLabel, reportExtras) : ""} onDownload={downloadReport} hasGoal={!!goalReport} onSetGoal={() => jumpTo("goal-tracker", "input")} />
+                  <ReportPreview
+                    html={resultsTab === "report" ? reportHtml(analysis, forecast, goalReport, inflationLabel, reportExtras) : ""}
+                    onDownload={() => void downloadReport()}
+                    downloading={reportDownloading}
+                    hasGoal={!!goalReport}
+                    onSetGoal={() => jumpTo("goal-tracker", "input")}
+                  />
                 )}
               </PanelBoundary>
             </div>
@@ -1427,7 +1558,7 @@ export default function DashboardPage() {
                     requestAnimationFrame(() => jumpTo("analysis-inputs"));
                   }}
                   onOpenFiscal={() => setResultsTab("fiscal")}
-                  onOpenDocuments={workspaceDocs.length ? () => setDocsOpen(true) : undefined}
+                  onOpenDocuments={workspaceDocs.length ? () => openDocuments() : undefined}
                 />
                 {t === "overview" && workspaceDocs.length > 0 && (
                   <PanelBoundary title="Monthly breakdown">
@@ -1461,10 +1592,14 @@ export default function DashboardPage() {
       {docsOpen && ws && (
         <DocumentsHub
           workspaceName={ws.name}
+          focusId={docsFocus}
           docs={workspaceDocs}
           loading={docsState.loading === ws.id}
           error={docsState.error}
-          onClose={() => setDocsOpen(false)}
+          onClose={() => {
+            setDocsOpen(false);
+            setDocsFocus(null);
+          }}
           onRename={async (id, name) => {
             await updateDocument(id, { name });
             setDocsByWs((cur) => ({ ...cur, [ws.id]: (cur[ws.id] ?? []).map((d) => (d.id === id ? { ...d, name: name.trim().slice(0, 160) } : d)) }));
@@ -1510,7 +1645,34 @@ export default function DashboardPage() {
           onConfirm={confirmTarget}
         />
       )}
+
+      {wsSettingsOpen && ws && (
+        <WorkspaceSettingsDialog
+          // Keyed by id: the dialog's fields must never show the previous workspace's values.
+          key={ws.id}
+          workspace={ws}
+          forecast={forecast}
+          onForecastChange={setForecast}
+          cpi={cpi}
+          cashOnHand={cashOnHand}
+          onCashChange={setCashOnHand}
+          granularity={granularity}
+          onGranularityChange={setGranularity}
+          synced={!!settingsReady[ws.id]}
+          onRename={async (name) => {
+            await updateWorkspace(ws.id, { name });
+            await app.refreshWorkspaces();
+          }}
+          onChangeType={async (businessType) => {
+            await updateWorkspace(ws.id, { businessType });
+            await app.refreshWorkspaces();
+          }}
+          onDelete={deleteActiveWorkspace}
+          onClose={() => setWsSettingsOpen(false)}
+        />
+      )}
     </div>
+    </AppShell>
   );
 }
 
@@ -1556,7 +1718,9 @@ function AnalysisTargetDialog({
   onCancel: () => void;
   onConfirm: (t: AnalysisTarget) => void | Promise<void>;
 }) {
-  const [choice, setChoice] = useState<string>(activeId ?? "new");
+  const analysisModeForChoice = modeOf(businessType);
+  // A workspace of the other kind can't receive this analysis (its book would mix business and household numbers).
+  const [choice, setChoice] = useState<string>(() => (activeId && workspaces.some((w) => w.id === activeId && w.mode === analysisModeForChoice) ? activeId : "new"));
   const [name, setName] = useState(() => suggestWorkspaceName(businessType, workspaces));
   const [busy, setBusy] = useState(false);
   // Device-only tracker data (logged before any workspace existed). New workspaces start clean unless the owner opts in.
@@ -1585,7 +1749,10 @@ function AnalysisTargetDialog({
     e.preventDefault();
     setError(null);
     if (choice === "temporary") return void onConfirm({ kind: "temporary" });
-    if (choice !== "new") return void onConfirm({ kind: "existing", id: choice });
+    if (choice !== "new") {
+      if (workspaces.find((w) => w.id === choice)?.mode !== analysisMode) return setError("Pick a workspace of the same kind, or create a new one.");
+      return void onConfirm({ kind: "existing", id: choice });
+    }
     if (!name.trim()) return setError("Give the project or business a name.");
     setBusy(true);
     try {
@@ -1606,12 +1773,16 @@ function AnalysisTargetDialog({
     }
   };
 
-  const option = (value: string, children: ReactNode) => (
+  const option = (value: string, children: ReactNode, disabled = false) => (
     <label
       key={value}
-      className={cn("flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition", choice === value ? "border-indigo-400/60 bg-indigo-500/10" : "border-white/10 hover:bg-white/5")}
+      className={cn(
+        "flex items-start gap-3 rounded-xl border p-3 transition",
+        disabled ? "cursor-not-allowed border-white/5 opacity-50" : "cursor-pointer",
+        !disabled && (choice === value ? "border-indigo-400/60 bg-indigo-500/10" : "border-white/10 hover:bg-white/5"),
+      )}
     >
-      <input type="radio" name="analysis-target" className="mt-1 accent-indigo-400" checked={choice === value} onChange={() => setChoice(value)} />
+      <input type="radio" name="analysis-target" className="mt-1 accent-indigo-400" checked={choice === value} disabled={disabled} onChange={() => setChoice(value)} />
       <span className="min-w-0 flex-1 text-sm">{children}</span>
     </label>
   );
@@ -1640,10 +1811,13 @@ function AnalysisTargetDialog({
                 </span>
                 <span className="block text-xs text-slate-500">{BUSINESS_TYPE_LABELS[w.businessType]}</span>
                 {choice === w.id && hasReport(w.id) && <span className="mt-1 block text-xs text-amber-200">Replaces this workspace&apos;s current report. Its goals and logged actuals are kept.</span>}
-                {choice === w.id && w.mode !== analysisMode && (
-                  <span className="mt-1 block text-xs text-amber-200">This is a {w.mode === "PERSONAL" ? "personal" : "business"} workspace — consider a new one for this {analysisMode === "PERSONAL" ? "household" : "business"} analysis.</span>
+                {w.mode !== analysisMode && (
+                  <span className="mt-1 block text-xs text-slate-400">
+                    {w.mode === "PERSONAL" ? "Personal" : "Business"} workspace — can&apos;t hold this {analysisMode === "PERSONAL" ? "household" : "business"} analysis. Workspaces never mix the two.
+                  </span>
                 )}
               </>,
+              w.mode !== analysisMode,
             ),
           )}
           {option(
@@ -1705,113 +1879,307 @@ function AnalysisTargetDialog({
 }
 
 // ---------------------------------------------------------------------------
-// Workspace settings (rename / delete) next to the workspace name
+// Workspace settings: name & type, financial defaults (inflation master switch, …), danger zone
 // ---------------------------------------------------------------------------
 
-function WorkspaceMenu({
+function SettingSwitch({ checked, onChange, label, description }: { checked: boolean; onChange: (v: boolean) => void; label: string; description: string }) {
+  return (
+    <label className="flex cursor-pointer items-start justify-between gap-4 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
+      <span className="min-w-0">
+        <span className="block text-sm font-medium text-slate-100">{label}</span>
+        <span className="mt-0.5 block text-xs text-slate-400">{description}</span>
+      </span>
+      <input type="checkbox" role="switch" className="peer sr-only" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span
+        aria-hidden
+        className={cn(
+          "relative mt-0.5 h-6 w-11 shrink-0 rounded-full border transition peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-indigo-300",
+          checked ? "border-indigo-400 bg-indigo-500" : "border-white/15 bg-white/10",
+        )}
+      >
+        <span className={cn("absolute top-0.5 h-[18px] w-[18px] rounded-full bg-white shadow transition-all", checked ? "left-[22px]" : "left-0.5")} style={{ backgroundColor: "#fff" }} />
+      </span>
+    </label>
+  );
+}
+
+function SegmentedChoice<T extends string | number>({ value, options, onChange, label }: { value: T; options: readonly { value: T; label: string }[]; onChange: (v: T) => void; label: string }) {
+  return (
+    <div role="radiogroup" aria-label={label} className="inline-flex flex-wrap rounded-lg border border-white/10 p-0.5">
+      {options.map((o) => (
+        <button
+          key={String(o.value)}
+          type="button"
+          role="radio"
+          aria-checked={value === o.value}
+          onClick={() => onChange(o.value)}
+          className={cn("rounded-md px-2.5 py-1 text-xs font-medium tabular-nums transition", value === o.value ? "bg-indigo-500/80 text-white" : "text-slate-400 hover:text-slate-200")}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Everything that belongs to one workspace: its name and (business) type, the financial defaults every chart,
+ * forecast, scenario and the Executive report use — with Inflation as a master switch — and deletion. Documents moved
+ * out of here into their own sidebar menu.
+ */
+function WorkspaceSettingsDialog({
   workspace,
-  docCount,
-  onOpenDocuments,
+  forecast,
+  onForecastChange,
+  cpi,
+  cashOnHand,
+  onCashChange,
+  granularity,
+  onGranularityChange,
+  synced,
   onRename,
+  onChangeType,
   onDelete,
+  onClose,
 }: {
   workspace: WorkspaceProfile;
-  docCount: number | null;
-  onOpenDocuments: () => void;
+  forecast: ForecastSettings;
+  onForecastChange: (s: ForecastSettings) => void;
+  cpi: CpiReading | null;
+  cashOnHand: number | null;
+  onCashChange: (v: number | null) => void;
+  granularity: Granularity;
+  onGranularityChange: (g: Granularity) => void;
+  /** The saved (all-devices) copy has loaded, so changes are being synced. */
+  synced: boolean;
   onRename: (name: string) => Promise<void>;
+  onChangeType: (bt: BusinessType) => Promise<void>;
   onDelete: () => Promise<void>;
+  onClose: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [name, setName] = useState(workspace.name);
+  const [busy, setBusy] = useState<"rename" | "type" | "delete" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmText, setConfirmText] = useState("");
-  const [busy, setBusy] = useState<"rename" | "delete" | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const ref = useRef<HTMLDivElement>(null);
+  const [rateText, setRateText] = useState(() => (forecast.customInflationRate * 100).toFixed(1));
   const titleId = useId();
+  const personal = workspace.mode === "PERSONAL";
   const confirmOk = confirmText.trim().toLowerCase() === workspace.name.trim().toLowerCase();
+  const set = (patch: Partial<ForecastSettings>) => onForecastChange({ ...forecast, ...patch });
 
-  const reset = () => {
-    setOpen(false);
-    setConfirming(false);
-    setConfirmText("");
-    setError(null);
-    setName(workspace.name);
-  };
-  // Always open on the current name (a rename elsewhere, e.g. in Settings, must show here too).
-  const openMenu = () => {
-    setName(workspace.name);
-    setOpen(true);
-  };
   useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && !busy && reset();
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !busy && reset();
-    document.addEventListener("mousedown", onDown);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !busy && onClose();
     document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("keydown", onKey);
-    };
-  });
+    return () => document.removeEventListener("keydown", onKey);
+  }, [busy, onClose]);
 
-  const run = async (kind: "rename" | "delete", fn: () => Promise<void>) => {
+  const run = async (kind: "rename" | "type" | "delete", fn: () => Promise<void>, done?: string) => {
     setBusy(kind);
     setError(null);
+    setNote(null);
     try {
       await fn();
-      setBusy(null);
-      if (kind === "delete") return; // this menu unmounts with the workspace
-      reset();
+      if (done) setNote(done);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong.");
+    } finally {
       setBusy(null);
     }
   };
 
+  const commitRate = () => {
+    const r = Number(rateText) / 100;
+    if (!Number.isFinite(r)) return setRateText((forecast.customInflationRate * 100).toFixed(1));
+    const clamped = Math.min(0.5, Math.max(-0.1, r));
+    setRateText((clamped * 100).toFixed(1));
+    set({ customInflationRate: clamped });
+  };
+  const liveLabel = cpi ? (cpi.live ? `Live CPI · ${pct(cpi.rate)}${cpi.period ? ` (${cpi.period})` : ""}` : `Default assumption · ${pct(cpi.rate)}`) : "Live CPI (loading…)";
+
   return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => (open ? reset() : openMenu())}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-xs text-slate-300 hover:bg-white/5 hover:text-white"
-      >
-        <Settings2 className="h-3.5 w-3.5" /> Workspace settings
-      </button>
-      {open && (
-        <div role="dialog" aria-labelledby={titleId} className={cn(glass, "absolute left-0 z-50 mt-2 w-80 max-w-[calc(100vw-2rem)] bg-slate-900/95 p-4 text-sm")}>
-          <p id={titleId} className="text-xs uppercase tracking-wide text-slate-500">
-            Workspace settings
-          </p>
-          <form
-            className="mt-2 flex gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (name.trim() && name.trim() !== workspace.name) void run("rename", () => onRename(name));
-            }}
-          >
-            <input value={name} onChange={(e) => setName(e.target.value)} maxLength={80} aria-label="Workspace name" className={cn(inputCls, "py-1.5")} />
-            <button type="submit" disabled={!!busy || !name.trim() || name.trim() === workspace.name} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
-              {busy === "rename" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Rename"}
-            </button>
-          </form>
-
-          <button
-            type="button"
-            onClick={() => {
-              reset();
-              onOpenDocuments();
-            }}
-            className="mt-3 flex w-full items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
-          >
-            <FolderOpen className="h-4 w-4 text-indigo-300" />
-            <span className="flex-1">My Documents</span>
-            {docCount != null && <span className="rounded-full bg-white/10 px-2 py-0.5 text-[11px] tabular-nums text-slate-300">{docCount}</span>}
+    <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-slate-950/70 p-4 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
+      <section role="dialog" aria-modal="true" aria-labelledby={titleId} className={cn(glass, "flex max-h-[92vh] w-full max-w-2xl flex-col bg-slate-900/95")}>
+        <header className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
+          <div className="min-w-0">
+            <h2 id={titleId} className="flex items-center gap-2 text-lg font-semibold">
+              <Settings2 className="h-5 w-5 text-indigo-300" /> Workspace settings
+            </h2>
+            <p className="mt-0.5 truncate text-sm text-slate-400">
+              {workspace.name} · {personal ? "Personal book" : "Business book"}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} disabled={!!busy} aria-label="Close" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-white">
+            <X className="h-4 w-4" />
           </button>
+        </header>
 
-          <div className="mt-4 border-t border-white/10 pt-3">
+        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto overscroll-contain px-5 py-5">
+          {(error || note) && (
+            <p role={error ? "alert" : "status"} className={cn("rounded-lg border px-3 py-2 text-xs", error ? "border-rose-300/30 bg-rose-500/10 text-rose-100" : "border-emerald-300/30 bg-emerald-500/10 text-emerald-100")}>
+              {error ?? note}
+            </p>
+          )}
+
+          {/* General */}
+          <section aria-labelledby={`${titleId}-general`} className="space-y-3">
+            <h3 id={`${titleId}-general`} className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+              General
+            </h3>
+            <form
+              className="flex gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (name.trim() && name.trim() !== workspace.name) void run("rename", () => onRename(name), "Workspace renamed.");
+              }}
+            >
+              <input value={name} onChange={(e) => setName(e.target.value)} maxLength={80} aria-label="Workspace name" className={cn(inputCls, "py-1.5")} />
+              <button type="submit" disabled={!!busy || !name.trim() || name.trim() === workspace.name} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+                {busy === "rename" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Rename"}
+              </button>
+            </form>
+            {personal ? (
+              <p className="flex items-center gap-1.5 text-xs text-slate-400">
+                <Home className="h-3.5 w-3.5 text-emerald-300" /> Personal / household workspace. Create a separate workspace for a business.
+              </p>
+            ) : (
+              <label className="block text-xs text-slate-400">
+                Business type
+                <select
+                  value={workspace.businessType}
+                  disabled={!!busy}
+                  onChange={(e) => void run("type", () => onChangeType(e.target.value as BusinessType), "Business type updated. Re-run the analysis to apply its benchmarks and seasonality.")}
+                  className={cn(inputCls, "mt-1 py-1.5")}
+                >
+                  {BUSINESS_ONLY_TYPES.map((t) => (
+                    <option key={t} value={t}>
+                      {BUSINESS_TYPE_LABELS[t]}
+                    </option>
+                  ))}
+                </select>
+                <span className="mt-1 block text-slate-500">A business workspace stays a business; household budgets get their own workspace so the books never mix.</span>
+              </label>
+            )}
+          </section>
+
+          {/* Financial defaults */}
+          <section aria-labelledby={`${titleId}-fin`} className="space-y-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h3 id={`${titleId}-fin`} className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Financial defaults
+              </h3>
+              <span className="text-[11px] text-slate-500">{synced ? "Saved to this workspace on every device" : "Saved on this device"}</span>
+            </div>
+            <p className="text-xs text-slate-400">Apply to this workspace&apos;s charts, forecast, What-if and scenario tools, and the Executive PDF report.</p>
+
+            <SettingSwitch
+              checked={forecast.inflation}
+              onChange={(v) => set({ inflation: v })}
+              label="Inflation (master switch)"
+              description={forecast.inflation ? `On: costs and income compound at ${pct(effectiveInflationRate(forecast, cpi))}/yr across every projection.` : "Off: projections stay in today's dollars."}
+            />
+            {forecast.inflation && (
+              <div className="ml-1 space-y-2 border-l border-white/10 pl-4">
+                <SegmentedChoice
+                  label="Inflation rate source"
+                  value={forecast.inflationSource}
+                  onChange={(v) => set({ inflationSource: v })}
+                  options={[
+                    { value: "CPI", label: liveLabel },
+                    { value: "CUSTOM", label: "Custom rate" },
+                  ]}
+                />
+                {forecast.inflationSource === "CUSTOM" && (
+                  <label className="flex items-center gap-2 text-xs text-slate-400">
+                    Annual rate
+                    <span className="relative">
+                      <input
+                        inputMode="decimal"
+                        value={rateText}
+                        onChange={(e) => setRateText(e.target.value)}
+                        onBlur={commitRate}
+                        onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), commitRate())}
+                        aria-label="Custom annual inflation rate (%)"
+                        className={cn(inputCls, "w-24 py-1.5 pr-6 tabular-nums")}
+                      />
+                      <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-slate-500">%</span>
+                    </span>
+                    <span className="text-slate-500">−10% to 50%</span>
+                  </label>
+                )}
+              </div>
+            )}
+
+            <SettingSwitch
+              checked={forecast.seasonality}
+              onChange={(v) => set({ seasonality: v })}
+              label="Seasonality"
+              description={forecast.seasonality ? "On: projections follow this business type's month-by-month curve (fine-tune it on the Forecast tab)." : "Off: flat inputs project flat."}
+            />
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
+                <p className="text-sm font-medium text-slate-100">Default horizon</p>
+                <div className="mt-2">
+                  <SegmentedChoice label="Default forecast horizon" value={forecast.months} onChange={(v) => set({ months: v })} options={HORIZON_OPTIONS.map((m) => ({ value: m, label: `${m}M` }))} />
+                </div>
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
+                <p className="text-sm font-medium text-slate-100">View increment</p>
+                <div className="mt-2">
+                  <SegmentedChoice label="Default view increment" value={granularity} onChange={onGranularityChange} options={GRANULARITIES.map((g) => ({ value: g, label: GRANULARITY_LABELS[g] }))} />
+                </div>
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
+                <p className="text-sm font-medium text-slate-100">Projections start</p>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <SegmentedChoice
+                    label="Projection start"
+                    value={forecast.startMode === "CUSTOM" ? "NEXT" : forecast.startMode}
+                    onChange={(v) => set({ startMode: v })}
+                    options={[
+                      { value: "NEXT", label: "Next month" },
+                      { value: "CURRENT", label: "This month" },
+                      { value: "FISCAL", label: "Fiscal year" },
+                    ]}
+                  />
+                  {forecast.startMode === "FISCAL" && (
+                    <select value={forecast.fiscalStartMonth} onChange={(e) => set({ fiscalStartMonth: Number(e.target.value) })} aria-label="Fiscal year starts in" className={cn(inputCls, "w-auto py-1 text-xs")}>
+                      {MONTH_NAMES.map((m, i) => (
+                        <option key={m} value={i}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+                {forecast.startMode === "CUSTOM" && <p className="mt-1 text-[11px] text-slate-500">Currently a custom month (set on the Forecast tab).</p>}
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
+                <p className="text-sm font-medium text-slate-100">{personal ? "Savings / cash on hand" : "Cash on hand"}</p>
+                <p className="mt-0.5 text-[11px] text-slate-500">Used for runway and break-even.</p>
+                <MoneyNumberInput value={cashOnHand} onChange={onCashChange} placeholder="0.00" aria-label="Cash on hand" className={cn(inputCls, "mt-2 py-1.5 tabular-nums")} />
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                onForecastChange({ ...DEFAULT_FORECAST, customInflationRate: forecast.customInflationRate });
+                onGranularityChange("MONTHLY");
+                setNote("Financial defaults reset: inflation and seasonality off, 12-month horizon starting next month, monthly view.");
+              }}
+              className="text-xs text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline"
+            >
+              Reset financial defaults
+            </button>
+          </section>
+
+          {/* Danger zone */}
+          <section aria-labelledby={`${titleId}-danger`} className="border-t border-white/10 pt-4">
+            <h3 id={`${titleId}-danger`} className="sr-only">
+              Delete workspace
+            </h3>
             {confirming ? (
               <form
                 className="rounded-lg border border-rose-300/30 bg-rose-500/10 p-3"
@@ -1822,7 +2190,7 @@ function WorkspaceMenu({
               >
                 <p className="text-sm font-medium text-rose-100">Are you sure? This cannot be undone.</p>
                 <p className="mt-1 text-xs text-rose-200/80">
-                  Deleting <strong>{workspace.name}</strong> permanently removes its documents, report, Fiscal Year Tracker (monthly actuals, goals, savings) and saved scenarios.
+                  Deleting <strong>{workspace.name}</strong> permanently removes its documents, report, Fiscal Year Tracker (monthly actuals, goals, savings), saved scenarios and settings.
                 </p>
                 <label className="mt-2 block text-xs text-rose-100">
                   Type <strong className="select-all">{workspace.name}</strong> to confirm
@@ -1840,11 +2208,7 @@ function WorkspaceMenu({
                   >
                     Cancel
                   </button>
-                  <button
-                    type="submit"
-                    disabled={!!busy || !confirmOk}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-400 disabled:opacity-50"
-                  >
+                  <button type="submit" disabled={!!busy || !confirmOk} className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-400 disabled:opacity-50">
                     {busy === "delete" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} Delete workspace
                   </button>
                 </div>
@@ -1854,13 +2218,185 @@ function WorkspaceMenu({
                 <Trash2 className="h-3.5 w-3.5" /> Delete workspace…
               </button>
             )}
-          </div>
-          {error && (
-            <p role="alert" className="mt-2 text-xs text-rose-300">
-              {error}
-            </p>
-          )}
+          </section>
         </div>
+
+        <footer className="flex justify-end border-t border-white/10 px-5 py-3">
+          <button type="button" onClick={onClose} disabled={!!busy} className={primaryBtn}>
+            Done
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Overview insights: automated quick wins + top performers (left column)
+// ---------------------------------------------------------------------------
+
+interface QuickWin {
+  title: string;
+  detail: string;
+  /** Estimated monthly $ impact, used to rank the wins. */
+  monthly: number;
+  action?: "audit" | "scenarios";
+}
+
+interface Performer {
+  label: string;
+  amount: number;
+  share: number;
+  margin: number;
+  /** Monthly gross profit (amount × margin). */
+  contribution: number;
+}
+
+/**
+ * Deterministic suggestions from the report's own numbers — no extra AI call. Ranked by estimated monthly impact;
+ * savings already marked implemented in the ROI tracker are skipped.
+ */
+function overviewInsights(a: FinancialAnalysis, savings: { title: string; status: string }[]): { wins: QuickWin[]; performers: Performer[] } {
+  const personal = a.businessType === "PERSONAL_FAMILY";
+  const done = new Set(savings.filter((x) => x.status === "IMPLEMENTED").map((x) => x.title));
+  const recurringRevenue = a.itemizedRevenue.filter((r) => !r.oneTime);
+  const recurringExpenses = a.itemizedExpenses.filter((e) => !e.oneTime);
+  const revenue = a.monthlyRevenue;
+  const expenses = sum(recurringExpenses, (e) => e.amount);
+  const net = revenue - expenses;
+  const wins: QuickWin[] = [];
+
+  // 1) The single biggest open audit saving.
+  const open = a.auditFlags.filter((f) => f.potentialSavings > 0 && !done.has(f.title)).sort((x, y) => y.potentialSavings - x.potentialSavings);
+  if (open[0]) {
+    const total = sum(open, (f) => f.potentialSavings);
+    wins.push({
+      title: `Act on “${open[0].title}”`,
+      detail: `Worth about ${usd.format(open[0].potentialSavings)}/mo (${usd.format(open[0].potentialSavings * 12)}/yr).${open.length > 1 ? ` ${open.length} open audit items total ${usd.format(total)}/mo.` : ""}`,
+      monthly: open[0].potentialSavings,
+      action: "audit",
+    });
+  }
+
+  // 2) Renegotiate the largest recurring cost.
+  const biggest = [...recurringExpenses].sort((x, y) => y.amount - x.amount)[0];
+  if (biggest && revenue > 0 && biggest.amount / revenue >= 0.08) {
+    const five = biggest.amount * 0.05;
+    wins.push({
+      title: `${personal ? "Trim" : "Renegotiate"} ${biggest.label || biggest.category}`,
+      detail: `Your largest recurring cost is ${pct(biggest.amount / revenue)} of ${personal ? "income" : "revenue"}. Cutting it 5% frees ${usd.format(five)}/mo (${usd.format(five * 12)}/yr).`,
+      monthly: five,
+    });
+  }
+
+  // 3) Small recurring charges (subscription creep).
+  const small = recurringExpenses.filter((e) => e.amount > 0 && e.amount < 100);
+  if (small.length >= 3) {
+    const t = sum(small, (e) => e.amount);
+    wins.push({
+      title: "Review small recurring charges",
+      detail: `${small.length} charges under $100 add up to ${usd.format(t)}/mo. Cancelling a quarter of them saves about ${usd.format(t * 0.25)}/mo.`,
+      monthly: t * 0.25,
+    });
+  }
+
+  // 4) Pricing (business) or savings rate (household).
+  if (!personal && revenue > 0 && net / revenue < 0.15) {
+    const lift = revenue * 0.03;
+    wins.push({
+      title: "Test a 3% price increase",
+      detail: `Net margin is ${pct(net / revenue)}. A 3% price rise with no lost volume adds ${usd.format(lift)}/mo straight to profit. Model it in the What-if simulator.`,
+      monthly: lift,
+      action: "scenarios",
+    });
+  } else if (personal && revenue > 0 && net / revenue < 0.2) {
+    const gap = revenue * 0.2 - Math.max(0, net);
+    wins.push({
+      title: "Close the 20% savings gap",
+      detail: `You keep ${pct(Math.max(0, net) / revenue)} of income. Reaching the 50/30/20 savings target means finding ${usd.format(gap)}/mo.`,
+      monthly: gap,
+      action: "scenarios",
+    });
+  }
+
+  // 5) Revenue concentration risk (business).
+  const top = [...recurringRevenue].sort((x, y) => y.amount - x.amount)[0];
+  if (!personal && top && revenue > 0 && recurringRevenue.length > 1 && top.amount / revenue >= 0.6) {
+    wins.push({
+      title: "Reduce revenue concentration",
+      detail: `${pct(top.amount / revenue)} of revenue comes from ${top.label}. Losing it would cut income to ${usd.format(revenue - top.amount)}/mo. Adding a second stream lowers the risk.`,
+      monthly: top.amount * 0.1,
+    });
+  }
+
+  const performers: Performer[] = personal
+    ? []
+    : recurringRevenue
+        .filter((r) => r.amount > 0)
+        .map((r) => ({ label: r.label, amount: r.amount, share: revenue > 0 ? r.amount / revenue : 0, margin: r.margin, contribution: r.amount * r.margin }))
+        .sort((x, y) => y.contribution - x.contribution)
+        .slice(0, 3);
+
+  return { wins: wins.sort((x, y) => y.monthly - x.monthly).slice(0, 3), performers };
+}
+
+function QuickWinsCard({ wins, onOpenAudit, onOpenScenarios }: { wins: QuickWin[]; onOpenAudit: () => void; onOpenScenarios: () => void }) {
+  return (
+    <div className={cn(glass, "border-amber-300/20 bg-gradient-to-br from-amber-400/[0.08] to-transparent p-6")}>
+      <h2 className="flex items-center gap-2 text-sm font-medium text-amber-100">
+        <Lightbulb className="h-4 w-4" /> Quick wins
+      </h2>
+      <p className="mt-1 text-xs text-slate-400">Suggestions from this report&apos;s own numbers, biggest monthly impact first.</p>
+      <ol className="mt-3 space-y-3">
+        {wins.map((w, i) => (
+          <li key={w.title} className="flex gap-3">
+            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-amber-400/15 text-xs font-semibold text-amber-100 tabular-nums">{i + 1}</span>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-slate-100">{w.title}</p>
+              <p className="mt-0.5 text-xs text-slate-400">{w.detail}</p>
+              {w.action && (
+                <button type="button" onClick={w.action === "audit" ? onOpenAudit : onOpenScenarios} className="mt-1 text-xs text-indigo-300 hover:text-indigo-200">
+                  {w.action === "audit" ? "View in Audit Mode →" : "Model it in Forecast & Scenarios →"}
+                </button>
+              )}
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function TopPerformersCard({ performers, personal, label }: { performers: Performer[]; personal: boolean; label: string }) {
+  if (personal) return null;
+  const best = performers[0];
+  return (
+    <div className={cn(glass, "p-6")}>
+      <h2 className="flex items-center gap-2 text-sm font-medium text-slate-200">
+        <TrendingUp className="h-4 w-4 text-emerald-300" /> Top {label.toLowerCase()} lines by profit
+      </h2>
+      <ul className="mt-3 space-y-2.5">
+        {performers.map((p) => (
+          <li key={p.label}>
+            <div className="flex items-baseline justify-between gap-3 text-sm">
+              <span className="min-w-0 truncate text-slate-100" title={p.label}>
+                {p.label}
+              </span>
+              <span className="shrink-0 tabular-nums text-emerald-200">{usd.format(p.contribution)}/mo</span>
+            </div>
+            <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/10" aria-hidden>
+              <div className="h-full rounded-full bg-emerald-400/70" style={{ width: `${Math.max(4, Math.min(100, (p.contribution / (best?.contribution || 1)) * 100))}%` }} />
+            </div>
+            <p className="mt-0.5 text-[11px] tabular-nums text-slate-500">
+              {pct(p.share)} of {label.toLowerCase()} · {pct(p.margin)} margin
+            </p>
+          </li>
+        ))}
+      </ul>
+      {best && performers.length > 1 && (
+        <p className="mt-3 text-xs text-slate-400">
+          Growing <strong className="font-medium text-slate-200">{best.label}</strong> by 10% adds {usd.format(best.contribution * 0.1)}/mo in gross profit, more than any other line.
+        </p>
       )}
     </div>
   );
@@ -2089,7 +2625,7 @@ function ResultsTabs({ value, onChange }: { value: ResultsTab; onChange: (t: Res
   };
   const idx = RESULTS_TABS.findIndex((t) => t.key === value);
   return (
-    <div className="sticky top-0 z-30 -mx-4 bg-slate-950/85 px-4 py-2 backdrop-blur-md sm:mx-0 sm:rounded-2xl sm:px-0 sm:py-0 sm:bg-transparent sm:backdrop-blur-none">
+    <div className="sticky top-14 z-30 -mx-4 bg-slate-950/85 lg:top-0 px-4 py-2 backdrop-blur-md sm:mx-0 sm:rounded-2xl sm:px-0 sm:py-0 sm:bg-transparent sm:backdrop-blur-none">
       <div
         role="tablist"
         aria-label="Report sections"
@@ -2135,7 +2671,7 @@ function ResultsTabs({ value, onChange }: { value: ResultsTab; onChange: (t: Res
 }
 
 /** Live preview of the executive PDF (same HTML that prints), in a sandboxed frame. */
-function ReportPreview({ html, onDownload, hasGoal, onSetGoal }: { html: string; onDownload: () => void; hasGoal: boolean; onSetGoal: () => void }) {
+function ReportPreview({ html, onDownload, downloading, hasGoal, onSetGoal }: { html: string; onDownload: () => void; downloading: boolean; hasGoal: boolean; onSetGoal: () => void }) {
   return (
     <div className={cn(glass, "p-4 sm:p-6")}>
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -2152,8 +2688,8 @@ function ReportPreview({ html, onDownload, hasGoal, onSetGoal }: { html: string;
             </button>
           )}
         </div>
-        <button type="button" onClick={onDownload} className={primaryBtn}>
-          <Download className="h-4 w-4" /> Download PDF
+        <button type="button" onClick={onDownload} disabled={downloading} className={primaryBtn}>
+          {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} {downloading ? "Preparing PDF…" : "Download PDF"}
         </button>
       </div>
       <div className="mt-4 overflow-hidden rounded-xl border border-white/10 bg-white">
@@ -3853,7 +4389,7 @@ function PaywallButtons({ paywall, proOnly = false }: { paywall: Paywall; proOnl
     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-center">
       {canSpendCredit ? (
         <button onClick={paywall.unlock} disabled={!!busy} className={primaryBtn}>
-          {busy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} Use 1 of {access.reportUnlocks} report unlocks
+          {busy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} Use 1 of {creditsLabel(access.reportUnlocks)}
         </button>
       ) : (
         !proOnly &&
@@ -4449,7 +4985,7 @@ function AuditPanel({
   const doneFor = (f: AuditFlag) => implemented.find((x) => x.title === f.title && x.status === "IMPLEMENTED");
 
   return (
-    <div className={cn(glass, "p-6")}>
+    <div id="audit-panel" className={cn(glass, "scroll-mt-20 p-6")}>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
           <h2 className="flex items-center gap-2 text-lg font-semibold">
@@ -4530,7 +5066,7 @@ function AuditPanel({
                 <Lock className="h-4 w-4 text-indigo-300" /> {locked} more flag{locked === 1 ? "" : "s"} locked
               </p>
               <button onClick={paywall.access.reportUnlocks > 0 && paywall.access.sealed ? paywall.unlock : () => paywall.checkout("report")} className="mt-2 text-xs text-indigo-300 hover:text-indigo-200">
-                {paywall.access.reportUnlocks > 0 && paywall.access.sealed ? "Use a report unlock" : `Unlock full audit ($${PRICING.reportUnlockUsd})`}
+                {paywall.access.reportUnlocks > 0 && paywall.access.sealed ? "Use a full-report credit" : `Unlock full audit ($${PRICING.reportUnlockUsd})`}
               </button>
             </div>
           </div>
@@ -4899,7 +5435,16 @@ ${goal ? goalPaceReportHtml(goal.pace, goal.fyLabel, esc) : ""}
 </body></html>`;
 }
 
-/** Opens the browser's print dialog with the executive report so the user can save a PDF. */
-function printExecutiveReport(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string, extras?: ReportExtras) {
-  printHtml(reportHtml(a, settings, goal, inflationLabel, extras));
+/**
+ * Downloads the executive report as a real .pdf file (no print dialog — on macOS `window.print()` opened the native
+ * print preview instead of downloading). Falls back to the print dialog only if the PDF can't be built.
+ */
+async function downloadExecutiveReport(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string, extras: ReportExtras | undefined, workspaceName: string | null) {
+  const html = reportHtml(a, settings, goal, inflationLabel, extras);
+  try {
+    await downloadHtmlAsPdf(html, pdfFileName("LedgerPulse Executive Report", workspaceName, new Date().toISOString().slice(0, 10)));
+  } catch (e) {
+    console.warn("[report] pdf failed, falling back to print", e);
+    printHtml(html);
+  }
 }

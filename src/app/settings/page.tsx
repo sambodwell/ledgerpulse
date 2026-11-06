@@ -1,11 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Briefcase, Check, CheckCircle2, CreditCard, Home, Loader2, Pencil, ShieldCheck, Trash2, X } from "lucide-react";
+import { Briefcase, Check, CheckCircle2, CreditCard, FileText, Home, Infinity as InfinityIcon, Loader2, Pencil, Plus, ShieldCheck, Trash2, X } from "lucide-react";
 import {
-  BUSINESS_TYPES,
+  BUSINESS_ONLY_TYPES,
   BUSINESS_TYPE_LABELS,
   PLAN_CATEGORIES,
   PLAN_CATEGORY_LABELS,
@@ -16,7 +15,8 @@ import {
 } from "@/lib/schemas";
 import { authHeaders, updatePlanCategory, updateWorkspace } from "@/lib/supabase";
 import { useApp } from "@/components/AppProvider";
-import { ProfileMenu, TierBadge } from "@/components/ProfileMenu";
+import { ProfileMenu, TierBadge, creditsLabel } from "@/components/ProfileMenu";
+import { AppShell, CreateWorkspaceDialog } from "@/components/WorkspaceSidebar";
 import { PlanCard } from "@/components/PlanCard";
 import { cn, errorMessage, glass, inputCls, primaryBtn, secondaryBtn } from "@/components/ui";
 
@@ -41,6 +41,7 @@ export default function SettingsPage() {
   }, [refreshProfile]);
 
   return (
+    <AppShell>
     <div className="relative min-h-screen overflow-x-hidden bg-slate-950 text-slate-100">
       <div aria-hidden className="pointer-events-none fixed inset-0">
         <div className="absolute -top-40 right-1/4 h-[26rem] w-[26rem] rounded-full bg-indigo-600/20 blur-[120px]" />
@@ -49,11 +50,8 @@ export default function SettingsPage() {
       <main className="relative mx-auto max-w-4xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="mb-8 flex items-start justify-between gap-4">
           <div>
-            <Link href="/dashboard" className="inline-flex items-center gap-1.5 text-sm text-indigo-300 hover:text-indigo-200">
-              <ArrowLeft className="h-4 w-4" /> Back to dashboard
-            </Link>
-            <h1 className="mt-2 text-3xl font-semibold tracking-tight">Settings &amp; Subscription</h1>
-            <p className="mt-1 text-slate-400">Manage your plan, workspaces and billing.</p>
+            <h1 className="text-3xl font-semibold tracking-tight">Account &amp; Subscription</h1>
+            <p className="mt-1 text-slate-400">Manage your plan, workspaces and billing. Financial defaults such as inflation live in each workspace&apos;s settings.</p>
           </div>
           <ProfileMenu />
         </header>
@@ -95,6 +93,7 @@ export default function SettingsPage() {
         )}
       </main>
     </div>
+    </AppShell>
   );
 }
 
@@ -198,16 +197,40 @@ function SubscriptionCard() {
           <dd className="mt-1 font-medium capitalize">{profile?.subscriptionStatus?.replace(/_/g, " ") ?? (isPro ? "active" : "—")}</dd>
         </div>
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
-          <dt className="text-xs uppercase tracking-wide text-slate-500">Report unlocks</dt>
-          <dd className="mt-1 font-medium tabular-nums">{profile?.reportUnlocks ?? 0}</dd>
+          <dt className="text-xs uppercase tracking-wide text-slate-500">Full-report credits</dt>
+          <dd className="mt-1 flex items-center gap-1.5 font-medium tabular-nums">
+            {isPro ? (
+              <>
+                <InfinityIcon className="h-4 w-4 text-amber-200" aria-hidden /> Unlimited with Pro
+              </>
+            ) : (
+              <>{profile?.reportUnlocks ?? 0} available</>
+            )}
+          </dd>
         </div>
       </dl>
+
+      <div className="mt-3 flex items-start gap-2.5 rounded-xl border border-indigo-300/20 bg-indigo-500/[0.06] px-3.5 py-3 text-sm text-slate-300">
+        <FileText className="mt-0.5 h-4 w-4 shrink-0 text-indigo-300" aria-hidden />
+        <div>
+          <p className="font-medium text-slate-100">What is a full-report credit?</p>
+          <p className="mt-0.5 text-slate-400">
+            Every analysis starts as a free preview (totals and the top audit flag). One credit upgrades one analysis to the full audit: every flag with
+            its savings estimate, the 12-month projection and the downloadable Executive PDF report. Credits are bought one at a time (${PRICING.reportUnlockUsd}{" "}
+            each), never expire and work in any workspace.
+            {isPro ? " Pro includes unlimited full reports, so your credits are kept untouched while you're subscribed." : ""}
+          </p>
+          {!isPro && !!profile?.reportUnlocks && (
+            <p className="mt-1 text-xs text-indigo-200">You have {creditsLabel(profile.reportUnlocks)}. Use one from any free preview on the dashboard.</p>
+          )}
+        </div>
+      </div>
 
       {!isPro && (
         <div className="mt-5 grid gap-3 sm:grid-cols-2">
           <PlanCard plan="report">
             <button onClick={() => go("report")} disabled={!!busy} className={cn(secondaryBtn, "w-full")}>
-              {busy === "report" && <Loader2 className="h-4 w-4 animate-spin" />} Unlock Full Audit &amp; Report (${PRICING.reportUnlockUsd})
+              {busy === "report" && <Loader2 className="h-4 w-4 animate-spin" />} Buy 1 full-report credit (${PRICING.reportUnlockUsd})
             </button>
           </PlanCard>
           <PlanCard plan="pro">
@@ -230,57 +253,42 @@ function SubscriptionCard() {
 }
 
 function WorkspacesCard() {
-  const { workspaces, activeWorkspace, refreshWorkspaces, setActiveWorkspaceId, removeWorkspace, createFreshWorkspace } = useApp();
+  const { workspaces, activeWorkspace, refreshWorkspaces, setActiveWorkspaceId, removeWorkspace } = useApp();
   const router = useRouter();
-  const [name, setName] = useState("");
-  const [type, setType] = useState<BusinessType>("REAL_ESTATE");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const add = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
-      // A new workspace opens straight onto the dashboard's upload / guided input, starting from a clean slate.
-      await createFreshWorkspace({ name, businessType: type });
-      setName("");
-      router.push("/dashboard");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't create workspace.");
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [creating, setCreating] = useState(false);
 
   return (
     <section className={cn(glass, "p-6")} aria-labelledby="ws">
       <h2 id="ws" className="text-lg font-semibold">
         Workspace profiles
       </h2>
-      <p className="mt-1 text-sm text-slate-400">Keep each property, business line or household budget separate.</p>
+      <p className="mt-1 text-sm text-slate-400">
+        Keep each property, business line or household budget separate. Every workspace is either Business or Personal, and its data never mixes with another
+        workspace&apos;s.
+      </p>
 
       <ul className="mt-4 divide-y divide-white/5">
         {workspaces.length === 0 && <li className="py-3 text-sm text-slate-500">No workspaces yet — add your first below.</li>}
         {workspaces.map((w) => (
-          <WorkspaceRow key={w.id} ws={w} active={activeWorkspace?.id === w.id} onChanged={refreshWorkspaces} onDelete={() => removeWorkspace(w.id)} onActivate={() => setActiveWorkspaceId(w.id)} />
+          <WorkspaceRow
+            key={w.id}
+            ws={w}
+            active={activeWorkspace?.id === w.id}
+            onChanged={refreshWorkspaces}
+            onDelete={() => removeWorkspace(w.id)}
+            onActivate={() => {
+              setActiveWorkspaceId(w.id);
+              router.push("/dashboard");
+            }}
+          />
         ))}
       </ul>
 
-      <form onSubmit={add} className="mt-4 grid gap-2 sm:grid-cols-[1fr_14rem_auto]">
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder='e.g. "Lawn Service Q3"' aria-label="New workspace name" maxLength={80} required className={inputCls} />
-        <select value={type} onChange={(e) => setType(e.target.value as BusinessType)} aria-label="Workspace type" className={inputCls}>
-          {BUSINESS_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {BUSINESS_TYPE_LABELS[t]}
-            </option>
-          ))}
-        </select>
-        <button type="submit" disabled={busy} className={primaryBtn}>
-          {busy && <Loader2 className="h-4 w-4 animate-spin" />} Add
-        </button>
-      </form>
-      {error && <p className="mt-2 text-sm text-rose-300">{error}</p>}
+      {/* Same dialog as the sidebar: a new workspace opens on the dashboard's upload screen, completely empty. */}
+      <button type="button" onClick={() => setCreating(true)} className={cn(primaryBtn, "mt-4")}>
+        <Plus className="h-4 w-4" /> Create New Workspace
+      </button>
+      {creating && <CreateWorkspaceDialog onClose={() => setCreating(false)} />}
     </section>
   );
 }
@@ -324,15 +332,22 @@ function WorkspaceRow({
       {editing ? (
         <div className="grid gap-2 sm:grid-cols-[1fr_14rem_auto]">
           <input value={name} onChange={(e) => setName(e.target.value)} aria-label="Workspace name" maxLength={80} className={inputCls} />
-          <select value={type} onChange={(e) => setType(e.target.value as BusinessType)} aria-label="Workspace type" className={inputCls}>
-            {BUSINESS_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {BUSINESS_TYPE_LABELS[t]}
-              </option>
-            ))}
-          </select>
+          {ws.mode === "PERSONAL" ? (
+            <p className="flex items-center gap-1.5 self-center text-xs text-slate-500">
+              <Home className="h-3.5 w-3.5" /> Personal workspace
+            </p>
+          ) : (
+            // Business types only: a business book can't be turned into a personal one (its data would show up there).
+            <select value={type} onChange={(e) => setType(e.target.value as BusinessType)} aria-label="Business type" className={inputCls}>
+              {BUSINESS_ONLY_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {BUSINESS_TYPE_LABELS[t]}
+                </option>
+              ))}
+            </select>
+          )}
           <div className="flex gap-2">
-            <button onClick={() => run(() => updateWorkspace(ws.id, { name, businessType: type }))} disabled={busy || !name.trim()} className={cn(primaryBtn, "px-3")}>
+            <button onClick={() => run(() => updateWorkspace(ws.id, ws.mode === "PERSONAL" ? { name } : { name, businessType: type }))} disabled={busy || !name.trim()} className={cn(primaryBtn, "px-3")}>
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save"}
             </button>
             <button onClick={() => setEditing(false)} className={cn(secondaryBtn, "px-3")}>
@@ -347,7 +362,7 @@ function WorkspaceRow({
             <p className="truncate font-medium">
               {ws.name} {active && <span className="ml-1 rounded-full bg-indigo-500/20 px-2 py-0.5 text-[11px] text-indigo-200">Active</span>}
             </p>
-            <p className="text-xs text-slate-500">{BUSINESS_TYPE_LABELS[ws.businessType]}</p>
+            <p className="text-xs text-slate-500">{ws.mode === "PERSONAL" ? "Personal · Household budget" : `Business · ${BUSINESS_TYPE_LABELS[ws.businessType]}`}</p>
           </div>
           {!active && (
             <button onClick={onActivate} className="rounded-lg px-2 py-1 text-xs text-indigo-300 hover:bg-white/5">

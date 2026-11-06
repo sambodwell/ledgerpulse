@@ -13,6 +13,8 @@
     "@stripe/stripe-js": "^10.2.0",
     "@supabase/supabase-js": "^2.118.0",
     "clsx": "^2.1.1",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^3.0.4",
     "lucide-react": "^1.66.0",
     "next": "16.4.4",
     "pdf-parse": "^2.4.5",
