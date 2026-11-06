@@ -32,7 +32,8 @@ export interface ParsedStatement {
   fileName: string | null;
   fileSize: number | null;
   contentHash: string | null;
-  kind: "statement" | "pasted";
+  /** "form" = a month the owner added by hand in the review (no file behind it). */
+  kind: "statement" | "pasted" | "form";
   items: ExtractedLineItems;
   /** Month detected from the document ("" = not found). */
   detected: string;
@@ -287,8 +288,12 @@ export function effectiveDocumentKind(s: Pick<ParsedStatement, "documentKind" | 
   if (CARD_NAME.test(name)) return "CREDIT_CARD_STATEMENT";
   if (BANK_NAME.test(name)) return "BANK_STATEMENT";
   if (!s.items.revenue.length && s.items.expenses.length) return "CREDIT_CARD_STATEMENT";
-  // Summarized income + expenses with no flagged transactions (transaction logs carry flags) reads as a P&L.
-  if (s.items.revenue.length && s.items.expenses.length && !s.reviewFlags?.length) return "PROFIT_AND_LOSS";
+  if (s.items.revenue.length && s.items.expenses.length) {
+    // Summarized income + expenses with no flagged transactions reads as a P&L. With flagged transactions it's a
+    // transaction log carrying both deposits and spend — a bank statement, whose deposits a same-month P&L's revenue
+    // already includes (left unpaired, those deposits would be counted on top of the P&L's revenue).
+    return s.reviewFlags?.length ? "BANK_STATEMENT" : "PROFIT_AND_LOSS";
+  }
   return "OTHER";
 }
 
@@ -325,6 +330,8 @@ export function aggregateStatements(statements: ParsedStatement[], fallbackType:
         : []
       : [...list.filter(isPnl), ...(g === rawMonth ? unassignedPnl : [])];
     const pairedMonth = unassigned ? pnlMonth : g;
+    // An unconfirmed duplicate is dropped as a whole statement: its revenue (deposits, refunds, card credits) as well
+    // as its expenses, since the P&L's revenue already includes those deposits.
     const counted = list.filter((s) => {
       if (!pnl.length || !isRaw(s)) return true;
       overlaps.push({ ...overlapOf(s, pnl, pairedMonth), documentKind: kinds.get(s.id) ?? "OTHER" });
@@ -336,7 +343,7 @@ export function aggregateStatements(statements: ParsedStatement[], fallbackType:
     const rev = mergeMonth(counted.map((s) => s.items.revenue), revKey);
     const exp = mergeMonth(counted.map((s) => s.items.expenses), expKey);
     duplicateLines += rev.dupes + exp.dupes;
-    merged.push({ key: g.startsWith("?") ? "" : g, statementIds: list.map((s) => s.id), revenue: rev.lines, expenses: exp.lines });
+    merged.push({ key: g.startsWith("?") ? "" : g, statementIds: counted.map((s) => s.id), revenue: rev.lines, expenses: exp.lines });
   }
   merged.sort((a, b) => (a.key || "9999").localeCompare(b.key || "9999"));
 
@@ -423,7 +430,8 @@ export function isGeneratedName(name: string): boolean {
  * The statement's name after the owner moves it to `month`: a name we generated from the old month ("May 2026 P&L")
  * follows the new month; a name taken from the file name is kept.
  */
-export function renameForMonth(s: Pick<ParsedStatement, "name" | "fileName" | "month" | "documentKind" | "source">, month: string): string {
+export function renameForMonth(s: Pick<ParsedStatement, "name" | "fileName" | "month" | "documentKind" | "source"> & { kind?: ParsedStatement["kind"] }, month: string): string {
+  if (s.kind === "form") return month ? `Manual entry · ${LONG_MONTH.format(monthDate(month))}` : "Manual entry";
   if (!s.fileName || s.source) return s.name;
   const hint = (m: string) => ({ months: m ? [m] : [], documentKind: s.documentKind });
   return s.name === documentName(s.fileName, hint(s.month)) ? documentName(s.fileName, hint(month)) : s.name;

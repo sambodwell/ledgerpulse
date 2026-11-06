@@ -408,6 +408,8 @@ export default function DashboardPage() {
   }, [activeWsId]);
 
   const [tab, setTab] = useState<InputTab>("form");
+  /** Parsed statement lines are under review: the review takes the full width (revenue | expenses side by side). */
+  const [reviewing, setReviewing] = useState(false);
   /** Results command-center tab. */
   const [resultsTab, setResultsTab] = useState<ResultsTab>("overview");
   /** null = automatic: see `inputsOpen` below. */
@@ -1255,7 +1257,7 @@ export default function DashboardPage() {
 
         <div id="analysis-inputs" className={cn(!inputsOpen && "hidden")}>
           {/* Input selector: tabs on small screens, side-by-side on large */}
-          <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden")}>
+          <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden", reviewing && "hidden")}>
             {(
               [
                 ["form", "Guided Input Form", ClipboardList],
@@ -1276,7 +1278,8 @@ export default function DashboardPage() {
 
           {/* items-start: a long parsed statement in one column must not stretch (and reflow) the other. */}
           <section className="grid gap-6 lg:grid-cols-2 lg:items-start">
-            <div className={cn("min-w-0", tab !== "form" && "hidden lg:block")}>
+            {/* While a statement is under review the guided form steps aside so the review can use both columns. */}
+            <div className={cn("min-w-0", reviewing ? "hidden" : tab !== "form" && "hidden lg:block")}>
               <PanelBoundary title="Guided form">
                 <GuidedForm
                   key={`${wsKey}-${mode}`}
@@ -1290,7 +1293,7 @@ export default function DashboardPage() {
                 />
               </PanelBoundary>
             </div>
-            <div id="statement-uploader" className={cn("min-w-0 scroll-mt-6", tab !== "upload" && "hidden lg:block")}>
+            <div id="statement-uploader" className={cn("min-w-0 scroll-mt-6", reviewing ? "lg:col-span-2" : tab !== "upload" && "hidden lg:block")}>
               <PanelBoundary title="Statement upload">
                 {/* Not keyed by workspace: picking a workspace for the report must not throw away the parsed lines under review. */}
                 {/* Reset (via uploaderEpoch) for a brand-new workspace or a menu switch, so no parsed numbers carry over. */}
@@ -1306,6 +1309,7 @@ export default function DashboardPage() {
                   syncedType={syncedType}
                   onTypeChange={pickType}
                   uploadMoreRef={uploadMoreRef}
+                  onReviewChange={setReviewing}
                 />
               </PanelBoundary>
             </div>
@@ -3934,6 +3938,18 @@ function rowsToLines(rows: Pick<UploadReviewState, "revenue" | "expenses">, pers
 }
 
 /**
+ * Hand-added months ("+ Add Month") have no parsed lines to rebuild from: before a rebuild, copy what the owner typed
+ * into each one's rows back into its statement so the rebuild keeps it.
+ */
+function syncManualStatements(statements: ParsedStatement[], review: Pick<UploadReviewState, "monthRows">, personal: boolean): ParsedStatement[] {
+  return statements.map((s) => {
+    if (s.kind !== "form") return s;
+    const row = review.monthRows.find((m) => m.statementIds.length === 1 && m.statementIds[0] === s.id);
+    return row ? { ...s, items: { ...s.items, ...rowsToLines(row, personal) } } : s;
+  });
+}
+
+/**
  * The forward baseline the report runs on. Several months: recurring lines averaged across every month's *edited*
  * rows (one-time lines stay in their own month); a single month: its rows as they are.
  */
@@ -3996,6 +4012,11 @@ function docsToSave(review: UploadReviewState, personal: boolean): NewWorkspaceD
   const excluded = new Set(review.overlaps.filter((o) => !o.confirmed).map((o) => o.statementId));
   for (const s of review.statements) {
     if (excluded.has(s.id)) continue;
+    // A hand-added month the owner left blank isn't worth a document.
+    if (s.kind === "form") {
+      const own = editedLines(review, s, personal);
+      if (!own.revenue.length && !own.expenses.length) continue;
+    }
     const k = s.source?.id ?? s.id;
     groups.set(k, [...(groups.get(k) ?? []), s]);
   }
@@ -4076,6 +4097,7 @@ function StatementUploader({
   syncedType,
   onTypeChange,
   uploadMoreRef,
+  onReviewChange,
 }: {
   mode: WorkspaceMode;
   disabled: boolean;
@@ -4094,6 +4116,8 @@ function StatementUploader({
   onTypeChange: (bt: BusinessType | null) => void;
   /** Set to a function that opens the "add more documents" file picker (used by the sidebar's Upload button). */
   uploadMoreRef?: { current: (() => void) | null };
+  /** Told whether parsed lines are under review, so the page can give the review the full width. */
+  onReviewChange?: (reviewing: boolean) => void;
 }) {
   const personal = mode === "PERSONAL";
   const [files, setFiles] = useState<File[]>([]);
@@ -4121,6 +4145,12 @@ function StatementUploader({
       uploadMoreRef.current = null;
     };
   }, [uploadMoreRef]);
+  const reviewing = !!rawReview;
+  useEffect(() => {
+    if (!onReviewChange) return;
+    onReviewChange(reviewing);
+    return () => onReviewChange(false);
+  }, [onReviewChange, reviewing]);
 
   const ready = input === "file" ? files.length > 0 : pasted.trim().length > 0;
   const busy = disabled || extracting;
@@ -4243,7 +4273,7 @@ function StatementUploader({
       setFiles((cur) => [...cur, ...(opts.more ?? []).filter((f) => !cur.includes(f))]);
       setReview((r) => {
         if (!r) return r;
-        const all = [...r.statements, ...parsed];
+        const all = [...syncManualStatements(r.statements, r, personal), ...parsed];
         return buildReview(all, earlierFor(all, existingDocs, r.earlier), historyFor(all, existingDocs), mode, { ...r, statements: all, loggedKeys: [] });
       });
       return;
@@ -4470,7 +4500,7 @@ function OverlapGuard({ overlaps, onConfirm }: { overlaps: StatementOverlap[]; o
         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
         <span>
           Potential duplicates: {overlaps.length === 1 ? "a raw statement covers" : `${overlaps.length} raw statements cover`} the same month as a P&amp;L
-          {excluded.length ? ` — ${excluded.length === 1 ? "its" : "their"} lines are left out of the monthly totals so expenses aren't counted twice.` : "."}
+          {excluded.length ? ` — ${excluded.length === 1 ? "its" : "their"} revenue and expense lines are left out of the monthly totals so nothing is counted twice.` : "."}
         </span>
       </p>
       <ul className="mt-2 space-y-2">
@@ -4485,7 +4515,9 @@ function OverlapGuard({ overlaps, onConfirm }: { overlaps: StatementOverlap[]; o
                     · {DOCUMENT_KIND_LABELS[o.documentKind]} · {periodLabel(o.month)} · overlaps {o.pnlNames.join(", ")}
                   </span>
                 </span>
-                <span className={cn("tabular-nums", o.confirmed ? "text-slate-300" : "text-slate-500 line-through")}>{exactMoney(o.expenses)} out</span>
+                <span className={cn("tabular-nums", o.confirmed ? "text-slate-300" : "text-slate-500 line-through")} title={o.confirmed ? undefined : "Excluded from the monthly totals"}>
+                  {exactMoney(o.revenue)} in · {exactMoney(o.expenses)} out
+                </span>
               </div>
               <p className="mt-1 text-slate-400">
                 {o.lines.length} line{o.lines.length === 1 ? "" : "s"}
@@ -4577,10 +4609,13 @@ function MonthByMonthEditor({
   review,
   setReview,
   mode,
+  onAddMonth,
 }: {
   review: UploadReviewState;
   setReview: (fn: (r: UploadReviewState | null) => UploadReviewState | null) => void;
   mode: WorkspaceMode;
+  /** Adds a blank, editable month ("YYYY-MM") to the review. */
+  onAddMonth: (key: string) => void;
 }) {
   const copy = MODE_COPY[mode];
   const active = review.monthRows.find((m) => m.id === review.activeMonth) ?? review.monthRows[0];
@@ -4647,20 +4682,23 @@ function MonthByMonthEditor({
             </button>
           );
         })}
+        <AddMonthControl existing={review.monthRows.map((m) => m.key)} onAdd={onAddMonth} chip />
       </div>
 
       <div className="rounded-xl border border-white/10 bg-slate-900/30 p-3 sm:p-4">
-        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
-          <p className="text-sm font-semibold text-slate-100">{nameOf(active)}</p>
-          <p className="text-xs tabular-nums text-slate-400">
+        <div className="mb-3 flex flex-wrap items-start justify-between gap-x-4 gap-y-1">
+          <div className="flex min-w-0 flex-col">
+            <p className="text-sm font-semibold text-slate-100">{nameOf(active)}</p>
+            {totals.revenue === 0 && <ZeroRevenueNote />}
+          </div>
+          <p className="text-xs tabular-nums text-slate-400 sm:text-right">
             {exactMoney(totals.revenue)} in · {exactMoney(totals.expenses)} out
             {totals.oneTimeExpenses ? ` (${exactMoney(totals.oneTimeExpenses)} one-time)` : ""} · net {exactMoney(totals.revenue - totals.expenses)}
           </p>
-          {totals.revenue === 0 && <ZeroRevenueNote className="basis-full text-right" />}
         </div>
         {active.editable ? (
-          <div className="space-y-6">
-            <section aria-label={`${copy.revenue}, ${nameOf(active)}`}>
+          <div className="grid gap-6 lg:grid-cols-2 lg:items-start">
+            <section aria-label={`${copy.revenue}, ${nameOf(active)}`} className="min-w-0">
               <h4 className="mb-2 text-sm font-medium text-slate-200">
                 {copy.revenue}
                 <InsightCounts rows={active.revenue} />
@@ -4673,7 +4711,7 @@ function MonthByMonthEditor({
                 hint="This month's actual amounts. Mark anything that won't repeat as one-time — it's logged in this month but left out of the forecast."
               />
             </section>
-            <section aria-label={`${copy.expenses}, ${nameOf(active)}`}>
+            <section aria-label={`${copy.expenses}, ${nameOf(active)}`} className="min-w-0">
               <h4 className="mb-2 text-sm font-medium text-slate-200">
                 {copy.expenses}
                 <InsightCounts rows={active.expenses} />
@@ -4719,6 +4757,88 @@ const NO_REVENUE_NOTE = "No revenue recorded in this statement period";
 /** Muted note beside a $0-revenue month, so a seasonal dip doesn't read as a parsing error. */
 function ZeroRevenueNote({ className }: { className?: string }) {
   return <span className={cn("text-[11px] italic text-slate-500", className)}>{NO_REVENUE_NOTE}</span>;
+}
+
+const MONTH_KEY_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/** The month after the latest one in `keys` (skipping any already taken), or the current month when there are none. */
+function nextMonthKey(keys: string[], now = new Date()): string {
+  const taken = new Set(keys.filter((k) => MONTH_KEY_RE.test(k)));
+  const latest = [...taken].sort().pop();
+  let d = latest ? new Date(Date.UTC(Number(latest.slice(0, 4)), Number(latest.slice(5, 7)), 1)) : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  while (taken.has(monthKey(d))) d = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
+  return monthKey(d);
+}
+
+/**
+ * "+ Add Month": opens an inline month / year picker (defaulting to the month after the latest one in the review) and
+ * adds a blank, editable month for lines the statements didn't cover. `chip` styles it to sit at the end of the month chips.
+ */
+function AddMonthControl({ existing, onAdd, chip = false }: { existing: string[]; onAdd: (key: string) => void; chip?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [value, setValue] = useState("");
+  const inputId = useId();
+  const taken = existing.includes(value);
+  const valid = MONTH_KEY_RE.test(value) && !taken;
+  const start = () => {
+    setValue(nextMonthKey(existing));
+    setOpen(true);
+  };
+  const submit = () => {
+    if (!valid) return;
+    onAdd(value);
+    setOpen(false);
+  };
+  if (!open)
+    return (
+      <button
+        type="button"
+        onClick={start}
+        className={cn(
+          "inline-flex shrink-0 items-center justify-center gap-1 rounded-lg border border-dashed border-indigo-300/40 text-xs text-indigo-200 transition hover:border-indigo-300/70 hover:bg-indigo-500/10",
+          chip ? "min-w-[6.5rem] self-stretch px-2.5 py-1.5" : "px-2.5 py-1",
+        )}
+      >
+        <Plus className="h-3.5 w-3.5" aria-hidden /> Add Month
+      </button>
+    );
+  return (
+    <div
+      role="group"
+      aria-label="Add a month"
+      className={cn("flex shrink-0 flex-col gap-1 rounded-lg border border-indigo-300/50 bg-indigo-500/10 px-2.5 py-1.5 text-xs", chip && "self-stretch")}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") setOpen(false);
+      }}
+    >
+      <div className="flex items-center gap-1.5">
+        <label htmlFor={inputId} className="sr-only">
+          Month and year to add
+        </label>
+        <input
+          id={inputId}
+          type="month"
+          value={value}
+          autoFocus
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          className={cn(inputCls, "w-auto py-1 text-xs [color-scheme:dark]")}
+        />
+        <button type="button" onClick={submit} disabled={!valid} className="rounded-md bg-indigo-500 px-2 py-1 font-medium text-white hover:bg-indigo-400 disabled:opacity-40">
+          Add
+        </button>
+        <button type="button" onClick={() => setOpen(false)} aria-label="Cancel adding a month" className="grid h-6 w-6 place-items-center rounded text-slate-400 hover:bg-white/5 hover:text-white">
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      {taken && <span className="text-[10px] text-amber-200">{periodLabel(value)} is already in this review.</span>}
+    </div>
+  );
 }
 
 function UploadReview({
@@ -4783,18 +4903,67 @@ function UploadReview({
     setReview((r) => {
       if (!r) return r;
       // One statement, nothing to fold in: just re-label the month and keep the owner's edited rows.
-      if (statements.length === 1 && !earlier.length && !r.earlier.length && !(r.cumulative && (history.length || r.history.length))) {
+      // (Coming from a month-by-month review, e.g. after removing a statement, rebuild instead so no stale month tabs stay.)
+      if (statements.length === 1 && !r.monthRows.length && !earlier.length && !r.earlier.length && !(r.cumulative && (history.length || r.history.length))) {
         const m = statements[0].month;
         return { ...r, statements, history, months: [{ key: m, actual: reviewTotals(r), statementIds: [statements[0].id] }], logToTracker: !!m, loggedKeys: [] };
       }
-      return buildReview(statements, earlier, history, mode, { ...r, loggedKeys: [] });
+      return buildReview(syncManualStatements(statements, r, personal), earlier, history, mode, { ...r, loggedKeys: [] });
     });
   };
   const setCumulative = (cumulative: boolean) => {
     setLogNote(null);
-    setReview((r) => r && buildReview(r.statements, r.earlier, r.history, mode, { ...r, cumulative }));
+    setReview((r) => r && buildReview(syncManualStatements(r.statements, r, personal), r.earlier, r.history, mode, { ...r, cumulative }));
+  };
+  /**
+   * "+ Add Month": a blank, editable month for figures no uploaded statement covers. It's backed by a hand-entered
+   * statement (kind "form") so it survives later rebuilds and is saved like any other month. Inserted in place rather
+   * than rebuilt, so edits already made to other months are kept; a single-month review becomes month by month.
+   */
+  const addMonth = (key: string) => {
+    setLogNote(null);
+    setReview((r) => {
+      if (!r || !MONTH_KEY_RE.test(key)) return r;
+      const existing = r.monthRows.find((m) => m.key === key);
+      if (existing) return { ...r, activeMonth: existing.id };
+      if (!r.monthRows.length && r.months.some((m) => m.key === key)) return r;
+      const manual: ParsedStatement = {
+        id: `manual-${key}-${newId()}`,
+        name: `Manual entry · ${periodLabel(key)}`,
+        fileName: null,
+        fileSize: null,
+        contentHash: null,
+        kind: "form",
+        items: { businessType: r.businessType, revenue: [], expenses: [] },
+        detected: "",
+        month: key,
+      };
+      const current: MonthRows[] = r.monthRows.length
+        ? r.monthRows
+        : r.months.slice(0, 1).map((m) => ({
+            id: m.key || `?${m.statementIds[0]}`,
+            key: m.key,
+            statementIds: m.statementIds,
+            editable: m.statementIds.some((id) => !isHistoryId(id)),
+            revenue: r.revenue,
+            expenses: r.expenses,
+          }));
+      const added: MonthRows = { id: key, key, statementIds: [manual.id], editable: true, revenue: [blankRevenue()], expenses: [blankExpense()] };
+      const byKey = (a: { key: string }, b: { key: string }) => (a.key || "9999").localeCompare(b.key || "9999");
+      return {
+        ...r,
+        statements: [...r.statements, manual],
+        monthRows: [...current, added].sort(byKey),
+        months: [...r.months, { key, actual: statementTotals({ revenue: [], expenses: [] }), statementIds: [manual.id] }].sort(byKey),
+        activeMonth: added.id,
+        logToTracker: r.logToTracker || r.months.length === 0,
+        rebuilt: false,
+      };
+    });
   };
   const historyMonths = [...new Set(review.history.map((h) => h.month))].sort();
+  /** Unconfirmed P&L duplicates: neither their revenue nor their expenses are in any month's totals. */
+  const excludedIds = new Set(review.overlaps.filter((o) => !o.confirmed).map((o) => o.statementId));
 
   const logNow = () => {
     if (!canLog) return;
@@ -4818,9 +4987,10 @@ function UploadReview({
       </div>
       <p className="mt-1 text-sm text-slate-400">
         {(() => {
-          const files = new Set(review.statements.map((s) => s.source?.id ?? s.id)).size;
-          if (files === review.statements.length) return review.statements.length > 1 ? `We read ${files} statements. ` : "";
-          return `We read ${files} document${files === 1 ? "" : "s"} covering ${review.statements.length} month entries. `;
+          const read = review.statements.filter((s) => s.kind !== "form");
+          const files = new Set(read.map((s) => s.source?.id ?? s.id)).size;
+          if (files === read.length) return read.length > 1 ? `We read ${files} statements. ` : "";
+          return `We read ${files} document${files === 1 ? "" : "s"} covering ${read.length} month entries. `;
         })()}
         {multiMonth
           ? `Line items are itemized month by month across ${review.monthRows.length} months${review.cumulative && historyMonths.length ? ` (${historyMonths.length} of them already saved in this workspace)` : ""} — pick a month to inspect and edit it on its own. The forecast uses the average of the recurring lines; one-time items stay in their month.`
@@ -4851,15 +5021,17 @@ function UploadReview({
             <ul className="mt-2 space-y-1.5">
               {review.statements.map((s) => {
                 const t = statementTotals({ revenue: s.items.revenue, expenses: s.items.expenses });
+                const dropped = excludedIds.has(s.id);
                 return (
                   <li key={s.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-white/10 bg-slate-900/40 px-2.5 py-2 text-xs">
                     <FileText className="h-3.5 w-3.5 shrink-0 text-indigo-300" />
                     <span className="min-w-0 flex-1 truncate text-slate-200" title={s.fileName ?? s.name}>
                       {s.name}
                     </span>
-                    <span className="tabular-nums text-slate-400">
+                    <span className={cn("tabular-nums", dropped ? "text-slate-500 line-through" : "text-slate-400")} title={dropped ? "Potential duplicate of a P&L — excluded from the monthly totals" : undefined}>
                       {exactMoney(t.revenue)} in · {exactMoney(t.expenses)} out
                     </span>
+                    {dropped && <span className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-rose-200">excluded</span>}
                     <select
                       aria-label={`Month for ${s.name}`}
                       value={s.month}
@@ -4955,14 +5127,18 @@ function UploadReview({
           {toLog.length > 0 && (
             <ul className="mb-2 space-y-1 tabular-nums text-slate-400">
               {toLog.map((m) => (
-                <li key={m.key} className="flex flex-wrap justify-between gap-x-3">
-                  <span className="text-slate-300">
-                    {periodLabel(m.key)}
-                    {review.loggedKeys.includes(m.key) && <span className="ml-1 text-emerald-300">· logged ✓</span>}
+                <li key={m.key} className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-4">
+                  {/* Label + auxiliary note stack on the left so the totals column stays aligned on the right. */}
+                  <span className="flex min-w-0 flex-col">
+                    <span className="text-slate-300">
+                      {periodLabel(m.key)}
+                      {review.loggedKeys.includes(m.key) && <span className="ml-1 text-emerald-300">· logged ✓</span>}
+                    </span>
+                    {m.actual.revenue === 0 && <ZeroRevenueNote className="leading-tight" />}
                   </span>
-                  <span>
-                    {m.actual.revenue === 0 && <ZeroRevenueNote className="mr-2" />}
-                    {exactMoney(m.actual.revenue)} in · {exactMoney(m.actual.expenses)} out{m.actual.oneTimeExpenses ? ` (${exactMoney(m.actual.oneTimeExpenses)} one-time)` : ""}
+                  <span className="whitespace-nowrap text-right">
+                    {exactMoney(m.actual.revenue)} in · {exactMoney(m.actual.expenses)} out
+                    {m.actual.oneTimeExpenses ? <span className="block text-[11px] text-slate-500">({exactMoney(m.actual.oneTimeExpenses)} one-time)</span> : null}
                   </span>
                 </li>
               ))}
@@ -5020,25 +5196,33 @@ function UploadReview({
 
       <div className="mt-5 flex-1 space-y-6">
         {multiMonth ? (
-          <MonthByMonthEditor review={review} setReview={setReview} mode={mode} />
+          <MonthByMonthEditor review={review} setReview={setReview} mode={mode} onAddMonth={addMonth} />
         ) : (
           <>
-            <section aria-label={copy.revenue}>
-              <h3 className="mb-2 text-sm font-medium text-slate-200">
-                {copy.revenue}
-                <InsightCounts rows={revenue} />
-              </h3>
-              <RevenueRowsEditor rows={revenue} setRows={setRevenue} mode={mode} custom={businessType === "OTHER_CUSTOM"} hint="Recurring lines are monthly amounts; one-time lines are the full single amount." />
-            </section>
-            <section aria-label={copy.expenses}>
-              <h3 className="mb-2 text-sm font-medium text-slate-200">
-                {copy.expenses}
-                <InsightCounts rows={expenses} />
-              </h3>
-              <ExpenseRowsEditor rows={expenses} setRows={setExpenses} revenue={revenue} mode={mode} businessType={businessType} hint="Change a category if it was misread; a blank category is auto-classified." />
-            </section>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-slate-400">{review.months[0]?.key ? `Line items for ${periodLabel(review.months[0].key)}.` : "Line items for this statement."} Missing a month? Add it and enter its lines by hand.</p>
+              <AddMonthControl existing={review.months.map((m) => m.key)} onAdd={addMonth} />
+            </div>
+            {/* Revenue on the left, expenses on the right; stacked on narrow screens. */}
+            <div className="grid gap-6 lg:grid-cols-2 lg:items-start">
+              <section aria-label={copy.revenue} className="min-w-0">
+                <h3 className="mb-2 text-sm font-medium text-slate-200">
+                  {copy.revenue}
+                  <InsightCounts rows={revenue} />
+                </h3>
+                <RevenueRowsEditor rows={revenue} setRows={setRevenue} mode={mode} custom={businessType === "OTHER_CUSTOM"} hint="Recurring lines are monthly amounts; one-time lines are the full single amount." />
+              </section>
+              <section aria-label={copy.expenses} className="min-w-0">
+                <h3 className="mb-2 text-sm font-medium text-slate-200">
+                  {copy.expenses}
+                  <InsightCounts rows={expenses} />
+                </h3>
+                <ExpenseRowsEditor rows={expenses} setRows={setExpenses} revenue={revenue} mode={mode} businessType={businessType} hint="Change a category if it was misread; a blank category is auto-classified." />
+              </section>
+            </div>
           </>
         )}
+        {/* Baseline summary spans both columns, with the actions pinned beneath it. */}
         <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
           {baselineRows && (
             <div className="mb-3">
@@ -5069,7 +5253,8 @@ function UploadReview({
 
       {validRevenue.length === 0 && <p className="mt-4 text-sm text-amber-200">Add at least one {personal ? "income" : "revenue"} line with an amount to generate the report.</p>}
 
-      <div className="mt-6 flex items-center justify-between">
+      {/* Action bar: full width under both columns, kept in view while scrolling long line lists. */}
+      <div className="sticky bottom-0 z-10 -mx-6 -mb-6 mt-6 flex items-center justify-between gap-3 rounded-b-2xl border-t border-white/10 bg-slate-950/85 px-6 py-4 backdrop-blur">
         <button type="button" onClick={onBack} disabled={disabled} className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-white/5 disabled:opacity-30">
           <ArrowLeft className="h-4 w-4" /> Back to upload
         </button>
