@@ -3,6 +3,7 @@
  * never exposed to the browser). Every admin request re-verifies the caller's Supabase JWT.
  */
 
+import type { User } from "@supabase/supabase-js";
 import { bearerToken, createRequestClient } from "@/lib/supabase";
 
 export function adminEmails(): Set<string> {
@@ -12,6 +13,12 @@ export function adminEmails(): Set<string> {
       .map((e) => e.trim().toLowerCase())
       .filter(Boolean),
   );
+}
+
+/** True for a user whose confirmed email is on ADMIN_EMAILS (an unconfirmed address could be anyone's). */
+export function isAdminUser(user: Pick<User, "email" | "email_confirmed_at"> | null | undefined): boolean {
+  const email = user?.email?.trim().toLowerCase();
+  return !!email && !!user?.email_confirmed_at && adminEmails().has(email);
 }
 
 export type AdminCheck = { ok: true; email: string } | { ok: false; status: 401 | 403 | 503; error: string };
@@ -27,6 +34,6 @@ export async function requireAdmin(request: Request): Promise<AdminCheck> {
   const email = data.user?.email?.toLowerCase();
   if (error || !data.user || !email) return { ok: false, status: 401, error: "Your session has expired. Sign in again." };
   // An unconfirmed address could be anyone's: only confirmed emails count.
-  if (!data.user.email_confirmed_at || !allow.has(email)) return { ok: false, status: 403, error: "This page is only available to the LedgerPulse team." };
+  if (!data.user.email_confirmed_at || !allow.has(email)) return { ok: false, status: 403, error: "This page is only available to the Sumhaven team." };
   return { ok: true, email };
 }

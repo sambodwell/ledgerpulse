@@ -25,7 +25,7 @@ export function AuthDialog({ initialMode, onClose }: { initialMode: AuthMode; on
       <div className={cn(glass, "bg-slate-900/90 p-6")}>
         <div className="flex items-start justify-between">
           <h2 id="auth-title" className="text-lg font-semibold">
-            {mode === "signin" ? "Sign in to LedgerPulse" : "Create your account"}
+            {mode === "signin" ? "Sign in to Sumhaven" : "Create your account"}
           </h2>
           <button onClick={onClose} aria-label="Close" className="text-slate-400 hover:text-white">
             <X className="h-5 w-5" />

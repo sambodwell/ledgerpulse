@@ -1,8 +1,9 @@
 import Link from "next/link";
 import { Lock, Monitor } from "lucide-react";
+import { LegalLinks } from "@/components/LegalModals";
 
 export const LEGAL_DISCLAIMER =
-  "LedgerPulse provides AI-driven financial analysis and projections for informational purposes only. It does not constitute professional accounting, tax, or legal advice.";
+  "Sumhaven provides AI-driven financial analysis and projections for informational purposes only. It does not constitute professional accounting, tax, or legal advice.";
 
 /** Legal & financial disclaimer shown on every page (rendered from the root layout). */
 export function Footer() {
@@ -20,12 +21,13 @@ export function Footer() {
           <Link href="/settings" className="hover:text-slate-300">
             Settings &amp; Billing
           </Link>
-          <span>© LedgerPulse</span>
+          <LegalLinks className="hover:text-slate-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400" />
+          <span>© Sumhaven</span>
         </div>
         <p className="inline-flex items-start gap-1.5 text-[11px] text-slate-500">
           <Monitor className="mt-px h-3 w-3 shrink-0" aria-hidden />
           <span>
-            <span className="font-medium text-slate-400">Tip:</span> LedgerPulse is optimized for desktop and laptop screens for the best financial modeling experience.
+            <span className="font-medium text-slate-400">Tip:</span> Sumhaven is optimized for desktop and laptop screens for the best financial modeling experience.
             It works on phones too: wide tables scroll sideways.
           </span>
         </p>

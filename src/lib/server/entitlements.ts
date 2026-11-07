@@ -8,6 +8,8 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { bearerToken, createRequestClient, fetchProfile } from "@/lib/supabase";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
+import { isAdminUser } from "@/lib/server/admin";
+import { getAdminSupabase } from "@/lib/server/billing";
 import { isFinancialAnalysis, type AnalysisAccess, type FinancialAnalysis, type SubscriptionTier } from "@/lib/schemas";
 
 export interface Viewer {
@@ -33,13 +35,24 @@ async function lookupViewer(request: Request): Promise<Viewer> {
   if (!db) return GUEST;
   const { data, error } = await db.auth.getUser(token);
   if (error || !data.user) return GUEST;
+  const admin = isAdminUser(data.user);
   try {
     const profile = await fetchProfile(db, data.user.id);
-    return { userId: data.user.id, tier: profile?.tier ?? "free", reportUnlocks: profile?.reportUnlocks ?? 0, db };
+    // Admin override: ADMIN_EMAILS accounts are permanently Pro, whatever the stored row says.
+    if (admin && profile?.tier !== "pro") await persistAdminPro(data.user.id);
+    return { userId: data.user.id, tier: admin ? "pro" : profile?.tier ?? "free", reportUnlocks: profile?.reportUnlocks ?? 0, db };
   } catch (err) {
     console.error("[entitlements] profile lookup failed", err instanceof Error ? err.message : err);
-    return { userId: data.user.id, tier: "free", reportUnlocks: 0, db };
+    return { userId: data.user.id, tier: admin ? "pro" : "free", reportUnlocks: 0, db };
   }
+}
+
+/** Writes the admin's Pro tier to their profile (service role) so the browser, which reads the row directly, shows it too. */
+async function persistAdminPro(userId: string): Promise<void> {
+  const adminDb = getAdminSupabase();
+  if (!adminDb) return; // still Pro server-side via resolveViewer; the badge just won't show until the key is set
+  const { error } = await adminDb.from("profiles").update({ subscription_tier: "pro", subscription_status: "admin" }).eq("id", userId);
+  if (error) console.error("[entitlements] admin Pro override failed", error.message);
 }
 
 /** Atomically spends one report unlock. */

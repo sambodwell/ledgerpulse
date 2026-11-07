@@ -24,6 +24,7 @@ import type { WorkspaceDocument } from "@/lib/supabase";
 import { documentDateLabel, documentTitle, groupByKind } from "@/lib/documentGroups";
 import { useApp } from "@/components/AppProvider";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { BrandLogo } from "@/components/BrandLogo";
 import { cn, glass, inputCls, primaryBtn, secondaryBtn } from "@/components/ui";
 
 /** The Documents nav item's data, when the page has the active workspace's documents loaded (the dashboard). */
@@ -151,9 +152,8 @@ function SidebarContent({ documents, onOpenWorkspaceSettings, onCreate, onNaviga
 
   return (
     <div className="flex min-h-full flex-1 flex-col gap-5 px-4 py-5">
-      <Link href="/dashboard" onClick={onNavigate} className="flex items-center gap-2 px-1 text-sm font-semibold tracking-wide text-indigo-300">
-        <span className="grid h-7 w-7 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-emerald-500 text-xs font-bold text-white">LP</span>
-        LedgerPulse
+      <Link href="/dashboard" onClick={onNavigate} aria-label="Sumhaven home" className="flex items-center px-1">
+        <BrandLogo height={30} preload />
       </Link>
 
       {/* Which book you're in */}

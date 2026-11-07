@@ -115,13 +115,14 @@ import { periodLabel } from "@/lib/statementPeriod";
 import { StatementMonthPicker, statementMonthOptions } from "@/components/dashboard/StatementMonth";
 import { DocumentsHub } from "@/components/dashboard/DocumentsHub";
 import { AuditDeepDive } from "@/components/dashboard/AuditDeepDive";
+import { BrandLogo } from "@/components/BrandLogo";
+import { CheckoutModal, type CheckoutBusy, type CheckoutKind } from "@/components/CheckoutModal";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
 import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu, creditsLabel } from "@/components/ProfileMenu";
 import { AppShell } from "@/components/WorkspaceSidebar";
-import { PlanCard } from "@/components/PlanCard";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { CHART, COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml, signedUsd } from "@/components/dashboard/chartKit";
 import { downloadHtmlAsPdf, pdfFileName } from "@/lib/pdfDownload";
@@ -187,9 +188,11 @@ class PanelBoundary extends Component<{ title: string; children: ReactNode }, { 
 interface Paywall {
   access: AnalysisAccess;
   isPro: boolean;
-  busy: "report" | "pro" | "unlock" | null;
+  busy: CheckoutBusy;
   message: string | null;
-  checkout: (kind: "report" | "pro") => void;
+  checkout: (kind: CheckoutKind) => void;
+  /** Opens the Pro checkout modal (plans, Stripe checkout, VIP access code). */
+  openCheckout: () => void;
   unlock: () => void;
 }
 
@@ -420,6 +423,8 @@ export default function DashboardPage() {
   const [paywallMsg, setPaywallMsg] = useState<string | null>(null);
   const [pendingUnlock, setPendingUnlock] = useState<{ sealed: string; wsKey: string } | null>(null);
   const [confirmingCheckout, setConfirmingCheckout] = useState(false);
+  /** The post-analysis paywall modal. Opens on its own when a free account's analysis comes back as a preview. */
+  const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [checkoutNotice, setCheckoutNotice] = useState<string | null>(null);
   /**
    * Projection start month + horizon + seasonality / inflation, shared by the baseline chart, scenarios, KPIs and the
@@ -579,6 +584,8 @@ export default function DashboardPage() {
         const data: unknown = await res.json();
         if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
         setResults((r) => ({ ...r, [targetKey]: data }));
+        // High-intent moment: the preview is on screen, the Pro dashboard behind it is locked.
+        if (!opts.quiet && data.access.level === "teaser" && data.access.tier !== "pro") setCheckoutOpen(true);
         // Every run is kept as its own version; the previous report stays restorable from Report history.
         recordVersion(targetKey, data, {
           source: opts.source ?? "analysis",
@@ -890,18 +897,19 @@ export default function DashboardPage() {
   }, [refreshProfile, unlockSealed]);
 
   const checkout = useCallback(
-    async (kind: "report" | "pro") => {
+    async (kind: CheckoutKind) => {
       if (!app.user) {
+        setCheckoutOpen(false);
         app.openAuth("signup");
         return;
       }
       setPaywallBusy(kind);
       setPaywallMsg(null);
       try {
-        const res = await fetch("/api/billing/checkout", {
+        const res = await fetch("/api/stripe/checkout", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...(await authHeaders()) },
-          body: JSON.stringify({ kind }),
+          body: JSON.stringify({ kind, from: "dashboard" }),
         });
         if (!res.ok) throw new Error(await errorMessage(res));
         const { url } = (await res.json()) as { url?: string };
@@ -925,6 +933,10 @@ export default function DashboardPage() {
         busy: paywallBusy,
         message: paywallMsg,
         checkout,
+        openCheckout: () => {
+          setPaywallMsg(null);
+          setCheckoutOpen(true);
+        },
         unlock: () => {
           if (!app.user) return app.openAuth("signin");
           if (current.access.sealed) void unlockSealed(current.access.sealed, wsKey);
@@ -934,6 +946,8 @@ export default function DashboardPage() {
     : null;
 
   const teaser = current?.access.level === "teaser";
+  const teaserSealed = teaser ? current?.access.sealed ?? null : null;
+  const teaserCreditUnlock = teaserSealed && app.user ? () => void unlockSealed(teaserSealed, wsKey).then(() => setCheckoutOpen(false)) : undefined;
   const rawAnalysis = current?.analysis ?? null;
   // Full reports re-project client-side so line-item edits and the chosen horizon/start month apply immediately.
   // Teasers stay redacted (no projection) exactly as the server sent them.
@@ -1162,7 +1176,7 @@ export default function DashboardPage() {
       <main className="relative mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
-            <p className="text-sm font-medium tracking-wide text-indigo-300">LedgerPulse</p>
+            <BrandLogo height={26} />
             <h1 className="mt-1 text-3xl font-semibold tracking-tight">{mode === "PERSONAL" ? "Household budget & savings forecast" : "Cash flow & runway forecast"}</h1>
             <p className="mt-2 max-w-2xl text-slate-400">
               {mode === "PERSONAL"
@@ -1373,7 +1387,7 @@ export default function DashboardPage() {
               )}
               {ws && versions.length > 0 && <ReportHistory versions={versions} activeId={shownVersionId} onRestore={restoreVersion} />}
               {teaser ? (
-                <button onClick={() => paywall.checkout("report")} className={cn(secondaryBtn, "text-slate-300")} title="Unlock the full audit to download">
+                <button onClick={paywall.openCheckout} className={cn(secondaryBtn, "text-slate-300")} title="Upgrade to Pro to download">
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               ) : (
@@ -1719,6 +1733,27 @@ export default function DashboardPage() {
           }}
           onDelete={deleteActiveWorkspace}
           onClose={() => setWsSettingsOpen(false)}
+        />
+      )}
+      {checkoutOpen && (
+        <CheckoutModal
+          onClose={() => setCheckoutOpen(false)}
+          onCheckout={(kind) => void checkout(kind)}
+          onUnlocked={async () => {
+            // Access code accepted server-side: pick up the new tier, then open the analysis that was previewed.
+            await refreshProfile();
+            if (current?.access.level === "teaser" && current.access.sealed) await unlockSealed(current.access.sealed, wsKey);
+            setCheckoutOpen(false);
+          }}
+          busy={paywallBusy}
+          message={paywallMsg}
+          signedIn={!!app.user}
+          onSignIn={() => {
+            setCheckoutOpen(false);
+            app.openAuth("signin");
+          }}
+          lockedFlagCount={current?.access.level === "teaser" ? current.access.lockedFlagCount : 0}
+          report={current?.access.level === "teaser" ? { credits: current.access.reportUnlocks, onUseCredit: teaserCreditUnlock } : undefined}
         />
       )}
     </div>
@@ -5280,20 +5315,15 @@ function PaywallButtons({ paywall, proOnly = false }: { paywall: Paywall; proOnl
           {busy === "unlock" && <Loader2 className="h-4 w-4 animate-spin" />} Use 1 of {creditsLabel(access.reportUnlocks)}
         </button>
       ) : (
-        !proOnly &&
         !paywall.isPro && (
-          <button onClick={() => paywall.checkout("report")} disabled={!!busy} className={primaryBtn}>
-            {busy === "report" && <Loader2 className="h-4 w-4 animate-spin" />} Unlock Full Audit &amp; Report (${PRICING.reportUnlockUsd})
+          <button onClick={paywall.openCheckout} disabled={!!busy} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
+            <Sparkles className="h-4 w-4" /> Unlock Pro Dashboard · from ${PRICING.proMonthlyUsd}/mo
           </button>
         )
       )}
-      {!paywall.isPro && (
-        <button
-          onClick={() => paywall.checkout("pro")}
-          disabled={!!busy}
-          className={cn(proOnly ? primaryBtn : secondaryBtn, !proOnly && "border-amber-300/30 text-amber-100 hover:bg-amber-400/10")}
-        >
-          {busy === "pro" && <Loader2 className="h-4 w-4 animate-spin" />} Upgrade to Pro Subscription (${PRICING.proMonthlyUsd}/mo)
+      {canSpendCredit && !paywall.isPro && (
+        <button onClick={paywall.openCheckout} disabled={!!busy} className={cn(secondaryBtn, "border-amber-300/30 text-amber-100 hover:bg-amber-400/10")}>
+          <Sparkles className="h-4 w-4" /> See Pro plans
         </button>
       )}
       {paywall.isPro && access.level === "teaser" && (
@@ -5315,17 +5345,11 @@ function TeaserBanner({ paywall }: { paywall: Paywall }) {
         </p>
         <p className="mt-1 text-sm text-slate-400">
           {access.lockedFlagCount > 0 ? `${access.lockedFlagCount} more audit flag${access.lockedFlagCount === 1 ? "" : "s"}, ` : ""}
-          the potential-savings total, the multi-month projection and the executive report are locked.
+          the potential-savings total, the interactive Pro dashboard, rolling projections, audit deep-dives and the executive report are locked.
         </p>
         {paywall.message && <p className="mt-2 text-sm text-amber-200">{paywall.message}</p>}
       </div>
       <PaywallButtons paywall={paywall} />
-      {!paywall.isPro && (
-        <div className="grid w-full gap-3 sm:grid-cols-2 lg:basis-full">
-          <PlanCard plan="report" />
-          <PlanCard plan="pro" />
-        </div>
-      )}
     </div>
   );
 }
@@ -5911,7 +5935,7 @@ function AuditPanel({
                   f.severity === "HIGH" ? "border-rose-300/25 hover:border-rose-300/40" : "border-white/10 hover:border-white/20",
                 )}
               >
-                <button type="button" onClick={() => setOpenFlag(f)} className="group block w-full text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-indigo-300" aria-label={`${f.title}: open strategy and recommendations`}>
+                <button type="button" onClick={() => (teaser ? paywall.openCheckout() : setOpenFlag(f))} className="group block w-full text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-indigo-300" aria-label={teaser ? `${f.title}: upgrade to open the strategy deep-dive` : `${f.title}: open strategy and recommendations`}>
                   <span className="flex items-start justify-between gap-3">
                     <span className="text-sm font-medium text-slate-100 group-hover:text-white">{f.title}</span>
                     <span className={cn("inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium", s.badge)}>
@@ -5953,8 +5977,8 @@ function AuditPanel({
               <p className="flex items-center justify-center gap-1.5 font-medium">
                 <Lock className="h-4 w-4 text-indigo-300" /> {locked} more flag{locked === 1 ? "" : "s"} locked
               </p>
-              <button onClick={paywall.access.reportUnlocks > 0 && paywall.access.sealed ? paywall.unlock : () => paywall.checkout("report")} className="mt-2 text-xs text-indigo-300 hover:text-indigo-200">
-                {paywall.access.reportUnlocks > 0 && paywall.access.sealed ? "Use a full-report credit" : `Unlock full audit ($${PRICING.reportUnlockUsd})`}
+              <button onClick={paywall.access.reportUnlocks > 0 && paywall.access.sealed ? paywall.unlock : paywall.openCheckout} className="mt-2 text-xs text-indigo-300 hover:text-indigo-200">
+                {paywall.access.reportUnlocks > 0 && paywall.access.sealed ? "Use a full-report credit" : "Unlock with Pro"}
               </button>
             </div>
           </div>
@@ -6291,7 +6315,7 @@ function reportHtml(a: FinancialAnalysis, settings: ForecastSettings, goal: Goal
   const generated = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LedgerPulse Executive Report ${new Date().toISOString().slice(0, 10)}</title>
+<title>Sumhaven Executive Report ${new Date().toISOString().slice(0, 10)}</title>
 <style>
 body{font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#111;max-width:860px;margin:40px auto;padding:0 20px}
 h1{font-size:24px;margin:0}h2{font-size:16px;margin:28px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
@@ -6303,7 +6327,7 @@ td:first-child,th:first-child{text-align:left}.neg{color:#b42318}.pos{color:#047
 .pace-head{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}.pace-good .pace-head{color:#047857}.pace-bad .pace-head{color:#b42318}
 @page{margin:16mm}@media print{body{margin:0;max-width:none}}
 </style></head><body>
-<h1>LedgerPulse Executive Report</h1>
+<h1>Sumhaven Executive Report</h1>
 <p class="muted">${esc(BUSINESS_TYPE_LABELS[a.businessType])} · Generated ${esc(generated)} · ${esc(macro)}</p>
 <div class="kpis">
 <div class="kpi">Monthly ${esc(copy.revenue.toLowerCase())}<b>${usd.format(a.monthlyRevenue)}</b></div>
@@ -6330,7 +6354,7 @@ ${goal ? goalPaceReportHtml(goal.pace, goal.fyLabel, esc) : ""}
 async function downloadExecutiveReport(a: FinancialAnalysis, settings: ForecastSettings, goal: GoalReport | null, inflationLabel: string, extras: ReportExtras | undefined, workspaceName: string | null) {
   const html = reportHtml(a, settings, goal, inflationLabel, extras);
   try {
-    await downloadHtmlAsPdf(html, pdfFileName("LedgerPulse Executive Report", workspaceName, new Date().toISOString().slice(0, 10)));
+    await downloadHtmlAsPdf(html, pdfFileName("Sumhaven Executive Report", workspaceName, new Date().toISOString().slice(0, 10)));
   } catch (e) {
     console.warn("[report] pdf failed, falling back to print", e);
     printHtml(html);

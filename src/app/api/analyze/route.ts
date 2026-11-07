@@ -417,7 +417,7 @@ function buildSystemPrompt(): string {
     return `${bt}\n  ${bt === "PERSONAL_FAMILY" ? "income sources" : "revenue streams"}: ${t.revenue.join(", ")}\n  expense categories: ${t.expenses.map((e) => e.category).join(", ")}`;
   }).join("\n");
 
-  return `You are LedgerPulse's financial analyst for small businesses, real estate owners and households. You turn bank statements, P&Ls and owner-entered figures into a structured monthly picture and a short, practical audit.
+  return `You are Sumhaven's financial analyst for small businesses, real estate owners and households. You turn bank statements, P&Ls and owner-entered figures into a structured monthly picture and a short, practical audit.
 
 Classify the source as one of ${BUSINESS_TYPES.join(", ")} (use the owner's stated type when given). Choose PERSONAL_FAMILY when it is a personal or household account: paycheck deposits, groceries, rent or mortgage paid, consumer subscriptions, card payments. Choose OTHER_CUSTOM for a business that fits none of the other types. Use these category templates so dashboards stay consistent; for OTHER_CUSTOM keep the owner's own category names when they gave them. Use "Other" only when nothing fits:
 ${templates}

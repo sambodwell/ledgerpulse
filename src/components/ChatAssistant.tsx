@@ -20,7 +20,7 @@ const SUGGESTIONS = [
 
 const GREETING: ChatMessage = {
   role: "assistant",
-  content: "Hi! I'm the LedgerPulse guide. Ask about anything on this page — the projection, the Fiscal Year Tracker, goals, plans, or how to phrase a \"what if\" scenario. Drag me anywhere if I'm in the way.",
+  content: "Hi! I'm the Sumhaven guide. Ask about anything on this page — the projection, the Fiscal Year Tracker, goals, plans, or how to phrase a \"what if\" scenario. Drag me anywhere if I'm in the way.",
 };
 
 /** Offset of the launcher from the bottom-right corner of the viewport, in px. */
@@ -212,13 +212,13 @@ export function ChatAssistant() {
     <div className={cn(dragging && "select-none")}>
       {open && (
         <section
-          aria-label="LedgerPulse assistant"
+          aria-label="Sumhaven assistant"
           className={cn(glass, "fixed z-50 flex flex-col bg-slate-900/95")}
           style={{ left: panelLeft, top: panelTop, width: panelW, height: panelH }}
         >
           <header className={cn("flex touch-none items-center justify-between border-b border-white/10 px-4 py-3", dragging ? "cursor-grabbing" : "cursor-grab")} {...dragHandlers} title="Drag to move">
             <h2 className="flex items-center gap-2 text-sm font-semibold">
-              <Sparkles className="h-4 w-4 text-indigo-300" /> LedgerPulse Guide
+              <Sparkles className="h-4 w-4 text-indigo-300" /> Sumhaven Guide
               <GripHorizontal className="h-4 w-4 text-slate-500" aria-hidden />
             </h2>
             <button onPointerDown={(e) => e.stopPropagation()} onClick={() => setOpen(false)} aria-label="Close assistant" className="text-slate-400 hover:text-white">

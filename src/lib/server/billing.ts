@@ -3,8 +3,9 @@
  *
  * Required env (all server-side, never NEXT_PUBLIC_):
  *   STRIPE_SECRET_KEY            sk_live_… / sk_test_…
- *   STRIPE_WEBHOOK_SECRET        whsec_… for /api/billing/webhook
+ *   STRIPE_WEBHOOK_SECRET        whsec_… for /api/stripe/webhook (the legacy /api/billing/webhook path still works)
  *   STRIPE_PRICE_PRO_MONTHLY     price_… recurring $39/mo
+ *   STRIPE_PRICE_PRO_ANNUAL      price_… recurring $399/yr
  *   STRIPE_PRICE_REPORT_UNLOCK   price_… one-time $29
  *   SUPABASE_SERVICE_ROLE_KEY    lets the webhook write billing columns
  */
@@ -12,7 +13,21 @@
 import Stripe from "stripe";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-export type CheckoutKind = "pro" | "report";
+/** "pro" = Pro monthly, "pro_annual" = Pro yearly, "report" = one full-report credit. */
+export type CheckoutKind = "pro" | "pro_annual" | "report";
+
+export const isCheckoutKind = (v: unknown): v is CheckoutKind => v === "pro" || v === "pro_annual" || v === "report";
+export const isProKind = (k: CheckoutKind) => k !== "report";
+
+/** Shown on card statements for Pro subscription charges (set on the Stripe Product; max 22 chars). */
+export const PRO_STATEMENT_DESCRIPTOR = "SUMHAVEN PRO";
+
+const PRICE_ENV: Record<CheckoutKind, string> = {
+  pro: "STRIPE_PRICE_PRO_MONTHLY",
+  pro_annual: "STRIPE_PRICE_PRO_ANNUAL",
+  report: "STRIPE_PRICE_REPORT_UNLOCK",
+};
+export const priceEnvName = (kind: CheckoutKind) => PRICE_ENV[kind];
 
 let stripe: Stripe | null = null;
 
@@ -25,7 +40,7 @@ export function getStripe(): Stripe | null {
 
 /** Returns the configured Stripe price id, or null if it's missing or not a `price_…` id (e.g. a `prod_…` id pasted by mistake). */
 export function priceFor(kind: CheckoutKind): string | null {
-  const id = (kind === "pro" ? process.env.STRIPE_PRICE_PRO_MONTHLY : process.env.STRIPE_PRICE_REPORT_UNLOCK)?.trim();
+  const id = process.env[PRICE_ENV[kind]]?.trim();
   return id && /^price_[A-Za-z0-9]+$/.test(id) ? id : null;
 }
 
@@ -72,7 +87,7 @@ export async function grantEntitlement(
   kind: CheckoutKind,
   ids: { customerId?: string | null; subscriptionId?: string | null } = {},
 ): Promise<void> {
-  if (kind === "report") {
+  if (!isProKind(kind)) {
     if (ids.customerId) await admin.from("profiles").update({ stripe_customer_id: ids.customerId }).eq("id", userId);
     const { error } = await admin.rpc("grant_report_unlock", { target: userId, amount: 1 });
     if (error) throw new Error(error.message);
@@ -99,7 +114,7 @@ export type FulfillResult = "fulfilled" | "duplicate" | "unpaid" | "invalid";
 export async function fulfillCheckoutSession(admin: SupabaseClient, s: Stripe.Checkout.Session): Promise<FulfillResult> {
   const userId = s.client_reference_id ?? s.metadata?.userId;
   const kind = s.metadata?.kind;
-  if (!userId || (kind !== "pro" && kind !== "report")) return "invalid";
+  if (!userId || !isCheckoutKind(kind)) return "invalid";
   if (s.status !== "complete" || (s.payment_status !== "paid" && s.payment_status !== "no_payment_required")) return "unpaid";
 
   const key = `fulfill:${s.id}`;
@@ -111,7 +126,7 @@ export async function fulfillCheckoutSession(admin: SupabaseClient, s: Stripe.Ch
   try {
     const customerId = typeof s.customer === "string" ? s.customer : s.customer?.id ?? null;
     const subscriptionId = typeof s.subscription === "string" ? s.subscription : s.subscription?.id ?? null;
-    await grantEntitlement(admin, userId, kind, kind === "pro" ? { customerId, subscriptionId } : { customerId });
+    await grantEntitlement(admin, userId, kind, isProKind(kind) ? { customerId, subscriptionId } : { customerId });
   } catch (err) {
     // Release the key so a retry (webhook redelivery or another confirm) can fulfill it.
     await admin.from("stripe_events").delete().eq("id", key);
@@ -122,11 +137,32 @@ export async function fulfillCheckoutSession(admin: SupabaseClient, s: Stripe.Ch
 
 /**
  * Local-testing override: never active in production builds. Enabled when
- * LEDGERPULSE_DEV_UNLOCK=1, or automatically when Stripe keys / price ids are absent.
+ * LEDGERPULSE_DEV_UNLOCK=1 (env name kept from before the Sumhaven rename), or automatically when Stripe keys / price ids are absent.
  * Checkout then grants the entitlement directly instead of redirecting to Stripe.
  */
 export function devBillingBypass(kind: CheckoutKind): boolean {
   if (process.env.NODE_ENV === "production") return false;
   if (process.env.LEDGERPULSE_DEV_UNLOCK === "1") return true;
   return !getStripe() || !priceFor(kind);
+}
+
+/**
+ * Subscription charges take their card-statement text from the Product, not the Checkout Session, so the Pro
+ * products are given PRO_STATEMENT_DESCRIPTOR the first time each price is sold from this server process.
+ * Best-effort: a failure is logged and checkout continues with the account's default descriptor.
+ */
+const descriptorChecked = new Set<string>();
+export async function ensureProStatementDescriptor(stripe: Stripe, priceId: string): Promise<void> {
+  if (descriptorChecked.has(priceId)) return;
+  try {
+    const price = await stripe.prices.retrieve(priceId, { expand: ["product"] });
+    const product = price.product;
+    if (product && typeof product === "object" && !("deleted" in product && product.deleted)) {
+      const p = product as Stripe.Product;
+      if (p.statement_descriptor !== PRO_STATEMENT_DESCRIPTOR) await stripe.products.update(p.id, { statement_descriptor: PRO_STATEMENT_DESCRIPTOR });
+    }
+    descriptorChecked.add(priceId);
+  } catch (err) {
+    console.warn("[billing] couldn't set the Pro statement descriptor", err instanceof Error ? err.message : err);
+  }
 }

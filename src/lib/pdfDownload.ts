@@ -16,7 +16,7 @@ const PAGE = { w: 612, h: 792, margin: 36 };
 /** Blocks a page may end after. */
 const BREAK_SELECTOR = "h1,h2,h3,p,li,tr,.kpis,.pace-banner,svg,table,ol,ul,div";
 
-/** "LedgerPulse Executive Report – 123 Main St" → "LedgerPulse-Executive-Report-123-Main-St". */
+/** "Sumhaven Executive Report – 123 Main St" → "Sumhaven-Executive-Report-123-Main-St". */
 export function pdfFileName(...parts: (string | null | undefined)[]): string {
   const base = parts
     .filter((p): p is string => !!p && !!p.trim())
@@ -27,7 +27,7 @@ export function pdfFileName(...parts: (string | null | undefined)[]): string {
     .replace(/[\s_]+/g, "-")
     .replace(/-+/g, "-")
     .slice(0, 120);
-  return `${base || "LedgerPulse-Report"}.pdf`;
+  return `${base || "Sumhaven-Report"}.pdf`;
 }
 
 function loadFrame(html: string): Promise<HTMLIFrameElement> {
@@ -109,7 +109,7 @@ export async function downloadHtmlAsPdf(html: string, fileName: string): Promise
     const pages = slicePages(total, pagePx, breakPoints(doc));
 
     const pdf = new jsPDF({ unit: "pt", format: "letter", orientation: "portrait", compress: true });
-    pdf.setProperties({ title: fileName.replace(/\.pdf$/i, "").replace(/-/g, " "), creator: "LedgerPulse" });
+    pdf.setProperties({ title: fileName.replace(/\.pdf$/i, "").replace(/-/g, " "), creator: "Sumhaven" });
     const slice = document.createElement("canvas");
     const ctx = slice.getContext("2d");
     if (!ctx) throw new Error("Your browser couldn't render the PDF.");

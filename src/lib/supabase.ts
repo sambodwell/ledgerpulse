@@ -85,7 +85,7 @@ export async function getAccessToken(): Promise<string | null> {
   return (await getSession())?.access_token ?? null;
 }
 
-/** Headers to attach to LedgerPulse API calls so the server can resolve the caller's plan. */
+/** Headers to attach to Sumhaven API calls so the server can resolve the caller's plan. */
 export async function authHeaders(): Promise<Record<string, string>> {
   const token = await getAccessToken();
   return token ? { Authorization: `Bearer ${token}` } : {};

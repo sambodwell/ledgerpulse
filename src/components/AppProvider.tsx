@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { User } from "@supabase/supabase-js";
 import {
+  authHeaders,
   createWorkspace,
   deleteWorkspace,
   fetchProfile,
@@ -51,6 +52,15 @@ interface AppState {
   openAuth: (mode?: "signin" | "signup") => void;
   uiHints: UiHints;
   setUiHints: (h: Partial<UiHints>) => void;
+}
+
+/** Best-effort: never blocks sign-in if the route is unavailable. */
+async function syncEntitlements(): Promise<void> {
+  try {
+    await fetch("/api/account/sync", { method: "POST", headers: await authHeaders() });
+  } catch {
+    /* offline or route unavailable: the stored profile is used as-is */
+  }
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -119,6 +129,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setReady(true);
         return;
       }
+      // Server-side entitlement sync first (e.g. ADMIN_EMAILS accounts are made Pro), so the profile read below reflects it.
+      await syncEntitlements();
       const [p, ws] = await Promise.all([refreshProfile(), refreshWorkspaces()]);
       if (cancelled) return;
       setActiveId((cur) => (cur && ws.some((w) => w.id === cur) ? cur : p?.defaultWorkspaceId && ws.some((w) => w.id === p.defaultWorkspaceId) ? p.defaultWorkspaceId : ws[0]?.id ?? null));

@@ -338,7 +338,7 @@ export function ScenarioPanel({
                 onDownload={() => {
                   const html = scenarioReportHtml({ analysis, entry: active, plan: active.plan!, c: activeComputed, start });
                   // Direct .pdf download; the print dialog is only a fallback if the PDF can't be built.
-                  return downloadHtmlAsPdf(html, pdfFileName("LedgerPulse Scenario", String(active.n), new Date().toISOString().slice(0, 10))).catch((e) => {
+                  return downloadHtmlAsPdf(html, pdfFileName("Sumhaven Scenario", String(active.n), new Date().toISOString().slice(0, 10))).catch((e) => {
                     console.warn("[scenario] pdf failed, falling back to print", e);
                     printHtml(html);
                   });
@@ -608,7 +608,7 @@ function scenarioReportHtml({ analysis, entry, plan, c, start }: { analysis: Fin
     )
     .join("");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LedgerPulse Scenario ${entry.n} ${new Date().toISOString().slice(0, 10)}</title>
+<title>Sumhaven Scenario ${entry.n} ${new Date().toISOString().slice(0, 10)}</title>
 <style>
 body{font:13px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#111;max-width:860px;margin:32px auto;padding:0 20px}
 h1{font-size:22px;margin:0}h2{font-size:15px;margin:24px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}

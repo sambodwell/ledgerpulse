@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import type { ReactNode } from "react";
 
 export const metadata: Metadata = {
-  title: "Feedback Hub · LedgerPulse Admin",
+  title: "Feedback Hub · Admin",
   robots: { index: false, follow: false },
 };
 

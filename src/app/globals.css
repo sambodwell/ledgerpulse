@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /*
- * LedgerPulse defaults to dark (glassmorphism on slate-950). A high-contrast light theme is opt-in via the Sun/Moon
+ * Sumhaven defaults to dark (glassmorphism on slate-950). A high-contrast light theme is opt-in via the Sun/Moon
  * toggle, which sets `data-theme="light"` on <html> (see ThemeToggle + the no-flash script in layout.tsx).
  *
  * Light mode works by remapping Tailwind's color tokens rather than rewriting every class:
@@ -148,4 +148,15 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Theme-matched Sumhaven logo (BrandLogo): light ink on dark mode, dark ink on light mode. */
+.brand-logo-light {
+  display: none;
+}
+:root[data-theme="light"] .brand-logo-dark {
+  display: none;
+}
+:root[data-theme="light"] .brand-logo-light {
+  display: block;
 }

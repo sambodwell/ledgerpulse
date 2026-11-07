@@ -1,5 +1,5 @@
 /**
- * LedgerPulse — financial domain constants, category templates, validators,
+ * Sumhaven — financial domain constants, category templates, validators,
  * and macro (seasonality + inflation) projection rules.
  *
  * Everything in here is pure and deterministic so it can run on both the
@@ -1073,7 +1073,12 @@ export interface SavedScenario {
 export const PRICING = {
   reportUnlockUsd: 29,
   proMonthlyUsd: 39,
+  proAnnualUsd: 399,
 } as const;
+
+/** Annual vs. twelve monthly payments: $69 saved, ~15%, close to two months free. */
+export const ANNUAL_SAVINGS_USD = PRICING.proMonthlyUsd * 12 - PRICING.proAnnualUsd;
+export const ANNUAL_SAVINGS_PCT = Math.round((ANNUAL_SAVINGS_USD / (PRICING.proMonthlyUsd * 12)) * 100);
 
 /** Marketing copy for pricing cards / paywalls. Keep in sync with server caps (AI_QUERY_CAP). */
 export const PLANS = {
@@ -1085,7 +1090,7 @@ export const PLANS = {
   },
   pro: {
     name: "Pro",
-    price: `$${PRICING.proMonthlyUsd}/mo`,
+    price: `${PRICING.proMonthlyUsd}/mo or ${PRICING.proAnnualUsd}/yr`,
     badge: "Recommended for Businesses & Serious Operators",
     features: [
       "Unlimited Guided Audits",

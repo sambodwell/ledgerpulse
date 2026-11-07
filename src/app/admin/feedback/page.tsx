@@ -102,7 +102,7 @@ export default function AdminFeedbackPage() {
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
     const a = document.createElement("a");
     a.href = url;
-    a.download = `ledgerpulse-feedback-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `sumhaven-feedback-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -117,7 +117,7 @@ export default function AdminFeedbackPage() {
           <h1 className="mt-2 flex items-center gap-2 text-2xl font-semibold tracking-tight">
             <MessageSquareText className="h-6 w-6 text-indigo-300" /> Feedback Hub
           </h1>
-          <p className="mt-1 text-sm text-slate-400">Every rating and comment from the in-app feedback widget. Visible only to the LedgerPulse team.</p>
+          <p className="mt-1 text-sm text-slate-400">Every rating and comment from the in-app feedback widget. Visible only to the Sumhaven team.</p>
         </div>
         <ProfileMenu />
       </header>

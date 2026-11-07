@@ -18,9 +18,13 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const DESCRIPTION = "AI-driven cash flow audits and 12-month forecasts for small businesses, landlords and households.";
+
 export const metadata: Metadata = {
-  title: "LedgerPulse — Cash Flow Audit & Forecast",
-  description: "AI-driven cash flow audits and 12-month forecasts for small businesses, landlords and households.",
+  title: { default: "Sumhaven — Cash Flow Audit & Forecast", template: "%s · Sumhaven" },
+  description: DESCRIPTION,
+  applicationName: "Sumhaven",
+  openGraph: { title: "Sumhaven — Cash Flow Audit & Forecast", description: DESCRIPTION, siteName: "Sumhaven", type: "website" },
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -187,7 +187,7 @@ export function AuditDeepDive({
   }, [messages, busy]);
 
   // The first question carries the recommendation it's about, so the guide can answer in context.
-  const context = `About my LedgerPulse audit recommendation "${flag.title}" (${flag.severity} priority): ${flag.message}`.slice(0, 900);
+  const context = `About my Sumhaven audit recommendation "${flag.title}" (${flag.severity} priority): ${flag.message}`.slice(0, 900);
 
   const ask = async (text: string) => {
     const q = text.trim();
@@ -337,7 +337,7 @@ export function AuditDeepDive({
 
           <section aria-label="Ask a follow-up question" className="rounded-xl border border-indigo-300/20 bg-indigo-500/[0.05] p-3">
             <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-indigo-200">
-              <Sparkles className="h-3.5 w-3.5" /> Ask the LedgerPulse guide
+              <Sparkles className="h-3.5 w-3.5" /> Ask the Sumhaven guide
             </h3>
             {messages.length === 0 && (
               <div className="mt-2 flex flex-wrap gap-2">

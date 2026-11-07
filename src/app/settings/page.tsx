@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Briefcase, Check, CheckCircle2, CreditCard, FileText, Home, Infinity as InfinityIcon, Loader2, Pencil, Plus, ShieldCheck, Trash2, X } from "lucide-react";
+import { AlertTriangle, Briefcase, Check, CheckCircle2, CreditCard, FileText, Home, Infinity as InfinityIcon, Loader2, Pencil, Plus, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
 import {
   BUSINESS_ONLY_TYPES,
   BUSINESS_TYPE_LABELS,
@@ -19,6 +19,9 @@ import { ProfileMenu, TierBadge, creditsLabel } from "@/components/ProfileMenu";
 import { AppShell, CreateWorkspaceDialog } from "@/components/WorkspaceSidebar";
 import { PlanCard } from "@/components/PlanCard";
 import { cn, errorMessage, glass, inputCls, primaryBtn, secondaryBtn } from "@/components/ui";
+import { CheckoutModal, type CheckoutBusy, type CheckoutKind } from "@/components/CheckoutModal";
+import { Modal } from "@/components/Modal";
+import { THEME_KEY } from "@/lib/theme";
 
 const PLAN_COPY: Record<PlanCategory, { Icon: typeof Home; blurb: string }> = {
   PERSONAL_FAMILY: { Icon: Home, blurb: "Household budgets: rent/mortgage, groceries, subscriptions, utilities, investments and debt, checked against 50/30/20." },
@@ -73,7 +76,7 @@ export default function SettingsPage() {
         ) : !app.user ? (
           <div className={cn(glass, "p-8 text-center")}>
             <h2 className="text-lg font-semibold">Sign in to manage your account</h2>
-            <p className="mt-1 text-sm text-slate-400">Plans, workspaces and billing are tied to your LedgerPulse account.</p>
+            <p className="mt-1 text-sm text-slate-400">Plans, workspaces and billing are tied to your Sumhaven account.</p>
             <div className="mt-5 flex justify-center gap-3">
               <button onClick={() => app.openAuth("signin")} className={primaryBtn}>
                 Sign in
@@ -89,6 +92,7 @@ export default function SettingsPage() {
             <SubscriptionCard />
             <WorkspacesCard />
             <PrivacyCard />
+            <DangerZoneCard />
           </div>
         )}
       </main>
@@ -153,20 +157,28 @@ function PlanCategoryCard() {
   );
 }
 
+function planLabel(isPro: boolean, status: string | null | undefined): string {
+  if (!isPro) return "Free";
+  if (status === "admin") return "Pro · Admin";
+  if (status === "promo") return "Pro · VIP access";
+  return "Pro";
+}
+
 function SubscriptionCard() {
-  const { profile } = useApp();
-  const [busy, setBusy] = useState<"pro" | "report" | "portal" | null>(null);
+  const { profile, refreshProfile, user, openAuth } = useApp();
+  const [busy, setBusy] = useState<CheckoutBusy | "portal">(null);
   const [error, setError] = useState<string | null>(null);
+  const [plansOpen, setPlansOpen] = useState(false);
   const isPro = profile?.tier === "pro";
 
-  const go = async (action: "pro" | "report" | "portal") => {
+  const go = async (action: CheckoutKind | "portal") => {
     setBusy(action);
     setError(null);
     try {
-      const res = await fetch(action === "portal" ? "/api/billing/portal" : "/api/billing/checkout", {
+      const res = await fetch(action === "portal" ? "/api/billing/portal" : "/api/stripe/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(await authHeaders()) },
-        body: action === "portal" ? "{}" : JSON.stringify({ kind: action }),
+        body: action === "portal" ? "{}" : JSON.stringify({ kind: action, from: "settings" }),
       });
       if (!res.ok) throw new Error(await errorMessage(res));
       const { url } = (await res.json()) as { url?: string };
@@ -190,7 +202,7 @@ function SubscriptionCard() {
       <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3">
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
           <dt className="text-xs uppercase tracking-wide text-slate-500">Plan</dt>
-          <dd className="mt-1 font-medium">{isPro ? `Pro · $${PRICING.proMonthlyUsd}/mo` : "Free"}</dd>
+          <dd className="mt-1 font-medium">{planLabel(isPro, profile?.subscriptionStatus)}</dd>
         </div>
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
           <dt className="text-xs uppercase tracking-wide text-slate-500">Status</dt>
@@ -234,11 +246,28 @@ function SubscriptionCard() {
             </button>
           </PlanCard>
           <PlanCard plan="pro">
-            <button onClick={() => go("pro")} disabled={!!busy} className={cn(primaryBtn, "w-full")}>
-              {busy === "pro" && <Loader2 className="h-4 w-4 animate-spin" />} Upgrade to Pro Subscription (${PRICING.proMonthlyUsd}/mo)
+            <button onClick={() => setPlansOpen(true)} disabled={!!busy} className={cn(primaryBtn, "w-full")}>
+              <Sparkles className="h-4 w-4" /> Upgrade to Pro (${PRICING.proMonthlyUsd}/mo or ${PRICING.proAnnualUsd}/yr)
             </button>
           </PlanCard>
         </div>
+      )}
+      {plansOpen && (
+        <CheckoutModal
+          onClose={() => setPlansOpen(false)}
+          onCheckout={(kind) => void go(kind)}
+          onUnlocked={async () => {
+            await refreshProfile();
+            setPlansOpen(false);
+          }}
+          busy={busy === "portal" ? null : busy}
+          message={error}
+          signedIn={!!user}
+          onSignIn={() => {
+            setPlansOpen(false);
+            openAuth("signin");
+          }}
+        />
       )}
 
       {profile?.hasStripeCustomer && (
@@ -246,7 +275,7 @@ function SubscriptionCard() {
           {busy === "portal" && <Loader2 className="h-4 w-4 animate-spin" />} Manage billing in Stripe
         </button>
       )}
-      <p className="mt-3 text-xs text-slate-500">Payments are processed by Stripe. LedgerPulse never sees or stores your card details.</p>
+      <p className="mt-3 text-xs text-slate-500">Payments are processed by Stripe and appear on your statement as SUMHAVEN PRO. Sumhaven never sees or stores your card details.</p>
       {error && <p className="mt-3 text-sm text-rose-300">{error}</p>}
     </section>
   );
@@ -398,6 +427,130 @@ function PrivacyCard() {
         <li>Inside each saved workspace we keep what was parsed from your documents (name, statement month, reviewed line items and totals), the latest report, your tracker and any scenarios you save, so nothing disappears on reload. Deleting a workspace deletes all of it.</li>
         <li>Statement contents are sent to our AI provider to produce the analysis.</li>
       </ul>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Danger Zone
+// ---------------------------------------------------------------------------
+
+const CONFIRM_WORD = "DELETE";
+
+/** Clears this browser's saved app state (drafts, cached preferences, pending unlocks), keeping only the theme choice. */
+function clearLocalAppState() {
+  try {
+    const theme = window.localStorage.getItem(THEME_KEY);
+    window.localStorage.clear();
+    if (theme) window.localStorage.setItem(THEME_KEY, theme);
+  } catch {
+    /* storage blocked: nothing stored to clear */
+  }
+  try {
+    window.sessionStorage.clear();
+  } catch {
+    /* storage blocked */
+  }
+}
+
+function DangerZoneCard() {
+  const [confirming, setConfirming] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const armed = typed.trim() === CONFIRM_WORD;
+
+  const close = () => {
+    if (busy) return;
+    setConfirming(false);
+    setTyped("");
+    setError(null);
+  };
+
+  const wipe = async (e: { preventDefault(): void }) => {
+    e.preventDefault();
+    if (!armed || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/account/data", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+        body: JSON.stringify({ confirm: CONFIRM_WORD }),
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      clearLocalAppState();
+      // A full page load (not client navigation) so no in-memory report, document or tracker outlives the deleted rows.
+      window.location.assign(new URL("/dashboard", window.location.origin).href);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't delete your data.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className={cn(glass, "border-rose-400/30 p-6")} aria-labelledby="danger">
+      <h2 id="danger" className="flex items-center gap-2 text-lg font-semibold text-rose-200">
+        <AlertTriangle className="h-5 w-5 text-rose-300" /> Danger Zone
+      </h2>
+      <div className="mt-3 flex flex-col gap-4 rounded-xl border border-rose-400/25 bg-rose-500/[0.06] p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="text-sm">
+          <p className="font-medium text-slate-100">Delete all workspace &amp; document data</p>
+          <p className="mt-1 text-slate-400">
+            Permanently removes every workspace, saved document, report and report history, Fiscal Year Tracker, saved scenario and feedback entry, and
+            clears data cached in this browser. Your account and subscription stay active. This can&apos;t be undone.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setConfirming(true)}
+          className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-rose-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-rose-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-300"
+        >
+          <Trash2 className="h-4 w-4" /> Delete All Workspace &amp; Document Data
+        </button>
+      </div>
+
+      {confirming && (
+        <Modal tone="danger" title="Delete all workspace data?" subtitle="This permanently erases your saved financial data. It can't be recovered." onClose={close} dismissible={!busy}>
+          <form onSubmit={wipe} className="space-y-4 text-sm">
+            <ul className="list-disc space-y-1 pl-5 text-slate-300">
+              <li>All workspaces (Business and Personal)</li>
+              <li>Saved documents, line items and monthly breakdowns</li>
+              <li>Reports, report history and Fiscal Year Trackers (actuals, goals, savings)</li>
+              <li>Saved scenarios and feedback</li>
+              <li>Drafts and cached data in this browser</li>
+            </ul>
+            <p className="text-slate-400">Your sign-in, plan and billing history are kept.</p>
+            <div>
+              <label htmlFor="danger-confirm" className="text-xs font-medium text-slate-300">
+                Type <span className="font-mono text-rose-200">{CONFIRM_WORD}</span> to confirm
+              </label>
+              <input
+                id="danger-confirm"
+                value={typed}
+                onChange={(e) => setTyped(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                autoFocus
+                className={cn(inputCls, "mt-1.5 font-mono focus:border-rose-400")}
+              />
+            </div>
+            {error && <p className="text-rose-300">{error}</p>}
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button type="button" onClick={close} disabled={busy} className={secondaryBtn}>
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={!armed || busy}
+                className="inline-flex items-center justify-center gap-2 rounded-lg bg-rose-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-rose-500 disabled:opacity-50"
+              >
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} {busy ? "Deleting…" : "Permanently delete everything"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
     </section>
   );
 }
