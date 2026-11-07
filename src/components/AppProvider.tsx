@@ -37,6 +37,11 @@ interface AppState {
   profile: UserProfile | null;
   /** True for ADMIN_EMAILS accounts (decided server-side); shows the admin links. Admin routes re-check it themselves. */
   isAdmin: boolean;
+  /**
+   * Single source of truth for Pro access in the UI: a Pro subscription, an admin account, or the dev unlock. Admins
+   * count as Pro even when their profile row is missing or hasn't been updated yet. The server enforces the same rule.
+   */
+  isPro: boolean;
   workspaces: WorkspaceProfile[];
   activeWorkspace: WorkspaceProfile | null;
   setActiveWorkspaceId: (id: string | null) => void;
@@ -150,6 +155,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
       // Server-side entitlement sync first (e.g. ADMIN_EMAILS accounts are made Pro), so the profile read below reflects it.
       const ent = await syncEntitlements();
+      if (cancelled) return;
       adminPro.current = !!ent?.admin;
       setIsAdmin(!!ent?.admin);
       const [p, ws] = await Promise.all([refreshProfile(), refreshWorkspaces()]);
@@ -222,6 +228,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       user,
       profile,
       isAdmin,
+      isPro: !!user && (DEV_UNLOCK || isAdmin || profile?.tier === "pro"),
       workspaces,
       activeWorkspace: workspaces.find((w) => w.id === activeId) ?? null,
       setActiveWorkspaceId,

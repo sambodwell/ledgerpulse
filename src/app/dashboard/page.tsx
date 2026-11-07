@@ -120,7 +120,6 @@ import { BrandLogo } from "@/components/BrandLogo";
 import { CheckoutModal, type CheckoutBusy, type CheckoutKind, type PaywallReason } from "@/components/CheckoutModal";
 import { ShareReportModal } from "@/components/dashboard/ShareReportModal";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
-import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
 import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
 import { ProfileMenu, creditsLabel } from "@/components/ProfileMenu";
@@ -514,7 +513,7 @@ export default function DashboardPage() {
 
   const { setUiHints, refreshProfile } = app;
   /** Strict paywall: Pro (incl. admin / access code) or an unspent one-time report credit is needed to analyze. */
-  const paidPlan = DEV_UNLOCK || app.profile?.tier === "pro";
+  const paidPlan = app.isPro;
   const reportCredits = app.profile?.reportUnlocks ?? 0;
   const canAnalyze = paidPlan || reportCredits > 0;
   useEffect(
@@ -948,7 +947,7 @@ export default function DashboardPage() {
     [app, current, wsKey],
   );
 
-  const isPro = DEV_UNLOCK || app.profile?.tier === "pro";
+  const isPro = app.isPro;
   const paywall: Paywall | null = current
     ? {
         access: current.access,

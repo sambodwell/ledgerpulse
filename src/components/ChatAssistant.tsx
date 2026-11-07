@@ -56,7 +56,7 @@ function readOffset(): Offset | null {
  * position is remembered on this device. Sees no financial data — only which page and features are on screen.
  */
 export function ChatAssistant() {
-  const { profile, uiHints } = useApp();
+  const { isPro, uiHints } = useApp();
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([GREETING]);
   const [draft, setDraft] = useState("");
@@ -178,7 +178,7 @@ export function ChatAssistant() {
         headers: { "Content-Type": "application/json", ...(await authHeaders()) },
         body: JSON.stringify({
           messages: next.filter((m) => m !== GREETING),
-          context: { page: window.location.pathname, tier: profile?.tier ?? "free", ...uiHints },
+          context: { page: window.location.pathname, tier: isPro ? "pro" : "free", ...uiHints },
         }),
       });
       if (!res.ok) throw new Error(await errorMessage(res));

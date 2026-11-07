@@ -165,11 +165,10 @@ function planLabel(isPro: boolean, status: string | null | undefined): string {
 }
 
 function SubscriptionCard() {
-  const { profile, refreshProfile, user, openAuth } = useApp();
+  const { profile, refreshProfile, user, openAuth, isPro } = useApp();
   const [busy, setBusy] = useState<CheckoutBusy | "portal">(null);
   const [error, setError] = useState<string | null>(null);
   const [plansOpen, setPlansOpen] = useState(false);
-  const isPro = profile?.tier === "pro";
 
   const go = async (action: CheckoutKind | "portal") => {
     setBusy(action);

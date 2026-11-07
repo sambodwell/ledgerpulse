@@ -6,10 +6,15 @@
 import type { User } from "@supabase/supabase-js";
 import { bearerToken, createRequestClient } from "@/lib/supabase";
 
+/**
+ * Built-in owner account(s): always admin (and so always Pro), even if ADMIN_EMAILS is missing from a deployment's
+ * environment. Server-only, so the address never ships in the browser bundle. Still requires a confirmed email.
+ */
+const OWNER_EMAILS = ["sambodwellpolitics@gmail.com"];
+
 export function adminEmails(): Set<string> {
   return new Set(
-    (process.env.ADMIN_EMAILS ?? "")
-      .split(",")
+    [...OWNER_EMAILS, ...(process.env.ADMIN_EMAILS ?? "").split(",")]
       .map((e) => e.trim().toLowerCase())
       .filter(Boolean),
   );

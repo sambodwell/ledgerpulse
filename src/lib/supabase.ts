@@ -99,6 +99,8 @@ export function onAuthChange(cb: (user: User | null) => void): () => void {
   return () => data.subscription.unsubscribe();
 }
 
+const INCORRECT_PASSWORD = "Password incorrect. Please check your email and password.";
+
 /**
  * Turns a Supabase auth error (or a raw network failure) into a sentence a person can act on. Supabase reports a
  * request that never reached it as `AuthRetryableFetchError("Failed to fetch", status 0)`, which used to be shown as-is.
@@ -118,7 +120,7 @@ export function friendlyAuthError(err: unknown, action: "signin" | "signup" | "r
   switch (code) {
     case "invalid_credentials":
       // Supabase doesn't say which half was wrong (so accounts can't be probed); the password is the usual culprit.
-      return "Password incorrect. Check your password, and that this is the email you signed up with.";
+      return INCORRECT_PASSWORD;
     case "email_not_confirmed":
       return "Confirm your email first: click the link we sent you, then sign in.";
     case "user_already_exists":
@@ -136,7 +138,9 @@ export function friendlyAuthError(err: unknown, action: "signin" | "signup" | "r
     case "user_banned":
       return "This account has been suspended. Contact support.";
   }
-  if (/invalid login credentials/i.test(message)) return "Password incorrect. Check your password, and that this is the email you signed up with.";
+  if (/invalid login credentials/i.test(message)) return INCORRECT_PASSWORD;
+  // A bare AuthApiError 400 with no code on sign-in is a wrong email/password on older auth servers.
+  if (action === "signin" && name === "AuthApiError" && status === 400 && !code) return INCORRECT_PASSWORD;
   return message || "Something went wrong. Please try again.";
 }
 
@@ -173,10 +177,17 @@ export function getSiteUrl(): string {
   return "";
 }
 
-/** Only same-site relative paths are allowed as post-auth destinations (prevents open redirects). */
+/** Auth pages are never a post-auth destination: sending a signed-in user back to one loops or breaks. */
+const AUTH_PATHS = /^\/(signup|login|auth)(\/|\?|#|$)/i;
+
+/**
+ * Only same-site relative paths are allowed as post-auth destinations (prevents open redirects). Anything else
+ * (empty, absolute, protocol-relative, backslashed, control characters, or an auth page) falls back to `fallback`.
+ */
 export function safeNextPath(next: string | null | undefined, fallback = "/dashboard"): string {
-  if (!next || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) return fallback;
-  return next;
+  const v = next?.trim();
+  if (!v || !v.startsWith("/") || v.startsWith("//") || v.includes("\\") || /[\u0000-\u001f]/.test(v) || AUTH_PATHS.test(v)) return fallback;
+  return v;
 }
 
 /** Returns true when the project requires email confirmation before first sign-in. */

@@ -67,8 +67,8 @@ export function ProfileMenu() {
               <>
                 <p className="truncate font-medium text-slate-100">{app.user.email}</p>
                 <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                  <TierBadge tier={app.profile?.tier ?? "free"} />
-                  {credits > 0 && app.profile?.tier !== "pro" && <span className="text-xs text-slate-400">{creditsLabel(credits)}</span>}
+                  <TierBadge tier={app.isPro ? "pro" : "free"} />
+                  {credits > 0 && !app.isPro && <span className="text-xs text-slate-400">{creditsLabel(credits)}</span>}
                 </div>
               </>
             ) : (
