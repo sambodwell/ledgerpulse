@@ -119,6 +119,7 @@ import { AuditDeepDive } from "@/components/dashboard/AuditDeepDive";
 import { BrandLogo } from "@/components/BrandLogo";
 import { CheckoutModal, type CheckoutBusy, type CheckoutKind, type PaywallReason } from "@/components/CheckoutModal";
 import { ShareReportModal } from "@/components/dashboard/ShareReportModal";
+import { reportLockedFor } from "@/lib/proAccess";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { useApp } from "@/components/AppProvider";
 import { fromMode, useWorkspace } from "@/context/WorkspaceContext";
@@ -605,7 +606,8 @@ export default function DashboardPage() {
         setResults((r) => ({ ...r, [targetKey]: data }));
         // A one-time report credit was spent on this run: pick up the new balance.
         if (data.access.tier !== "pro") void refreshProfile();
-        if (!opts.quiet && data.access.level === "teaser" && data.access.tier !== "pro") openPaywall("preview");
+        // A free manual summary explains what Pro adds in its own banner; only a sealed (paid-for-later) preview opens checkout.
+        if (!opts.quiet && data.access.level === "teaser" && data.access.sealed && data.access.tier !== "pro") openPaywall("preview");
         // Every run is kept as its own version; the previous report stays restorable from Report history.
         recordVersion(targetKey, data, {
           source: opts.source ?? "analysis",
@@ -968,6 +970,11 @@ export default function DashboardPage() {
     : null;
 
   const teaser = current?.access.level === "teaser";
+  /**
+   * Pro has ended: a report generated with Pro locks behind an upgrade overlay; one bought as a one-time Executive
+   * Report never does. Waits for the profile, so a Pro user never sees a flash of the lock while it loads.
+   */
+  const lapsed = !!current && app.ready && !!app.profile && reportLockedFor(current.access, isPro);
   const teaserSealed = teaser ? current?.access.sealed ?? null : null;
   const teaserCreditUnlock = teaserSealed && app.user ? () => void unlockSealed(teaserSealed, wsKey).then(() => setCheckoutOpen(false)) : undefined;
   const rawAnalysis = current?.analysis ?? null;
@@ -1002,7 +1009,7 @@ export default function DashboardPage() {
   const copy = MODE_COPY[mode];
   const [reportDownloading, setReportDownloading] = useState(false);
   const downloadReport = async () => {
-    if (!analysis || teaser || reportDownloading) return;
+    if (!analysis || teaser || lapsed || reportDownloading) return;
     setReportDownloading(true);
     try {
       await downloadExecutiveReport(analysis, forecast, goalReport, inflationLabel, reportExtras, ws?.name ?? null);
@@ -1302,7 +1309,7 @@ export default function DashboardPage() {
             />
           )}
           {/* Input selector: tabs on small screens, side-by-side on large */}
-          <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden", (reviewing || !canAnalyze) && "hidden")}>
+          <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden", reviewing && "hidden")}>
             {(
               [
                 ["form", "Guided Input Form", ClipboardList],
@@ -1322,7 +1329,7 @@ export default function DashboardPage() {
           </div>
 
           {/* items-start: a long parsed statement in one column must not stretch (and reflow) the other. */}
-          <section className={cn("grid gap-6 lg:grid-cols-2 lg:items-start", !canAnalyze && "hidden")}>
+          <section className="grid gap-6 lg:grid-cols-2 lg:items-start">
             {/* While a statement is under review the guided form steps aside so the review can use both columns. */}
             <div className={cn("min-w-0", reviewing ? "hidden" : tab !== "form" && "hidden lg:block")}>
               <PanelBoundary title="Guided form">
@@ -1342,20 +1349,30 @@ export default function DashboardPage() {
               <PanelBoundary title="Statement upload">
                 {/* Not keyed by workspace: picking a workspace for the report must not throw away the parsed lines under review. */}
                 {/* Reset (via uploaderEpoch) for a brand-new workspace or a menu switch, so no parsed numbers carry over. */}
-                <StatementUploader
-                  key={`${mode}-${uploaderEpoch}`}
-                  mode={mode}
-                  disabled={loading}
-                  onSubmit={(init, bt, extras) => requestAnalysis(init, bt ?? formDefaultType, extras)}
-                  trackerReady={tracker.status !== "loading" && !tracker.loadFailed}
-                  onLogActuals={logStatementMonth}
-                  existingDocs={workspaceDocs}
-                  onBalanceDetected={setDetectedCash}
-                  syncedType={syncedType}
-                  onTypeChange={pickType}
-                  uploadMoreRef={uploadMoreRef}
-                  onReviewChange={setReviewing}
-                />
+                {canAnalyze ? (
+                  <StatementUploader
+                    key={`${mode}-${uploaderEpoch}`}
+                    mode={mode}
+                    disabled={loading}
+                    onSubmit={(init, bt, extras) => requestAnalysis(init, bt ?? formDefaultType, extras)}
+                    trackerReady={tracker.status !== "loading" && !tracker.loadFailed}
+                    onLogActuals={logStatementMonth}
+                    existingDocs={workspaceDocs}
+                    onBalanceDetected={setDetectedCash}
+                    syncedType={syncedType}
+                    onTypeChange={pickType}
+                    uploadMoreRef={uploadMoreRef}
+                    onReviewChange={setReviewing}
+                  />
+                ) : (
+                  // Free plan: document scanning is Pro. A blurred, inert stand-in (no real data) with the upgrade callout.
+                  <UploadLocked
+                    onUpgrade={() => {
+                      setPaywallMsg(null);
+                      openPaywall("analyze");
+                    }}
+                  />
+                )}
               </PanelBoundary>
             </div>
           </section>
@@ -1417,7 +1434,7 @@ export default function DashboardPage() {
                 </button>
               )}
               {ws && versions.length > 0 && <ReportHistory versions={versions} activeId={shownVersionId} onRestore={restoreVersion} />}
-              {teaser ? (
+              {teaser || lapsed ? (
                 <button onClick={paywall.openCheckout} className={cn(secondaryBtn, "text-slate-300")} title="Upgrade to Pro to download">
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
                 </button>
@@ -1455,6 +1472,10 @@ export default function DashboardPage() {
                   </button>
                 </div>
               )}
+              {lapsed ? (
+                <ProLapsedLock title="Report overview" paywall={paywall} />
+              ) : (
+              <>
               <PanelBoundary title="Summary">
                 <KpiRow analysis={analysis} mode={modeOf(analysis.businessType)} locked={teaser} settings={forecast} inflationLabel={inflationLabel} />
               </PanelBoundary>
@@ -1553,9 +1574,15 @@ export default function DashboardPage() {
                   />
                 </PanelBoundary>
               )}
+              </>
+              )}
             </div>
 
             <div role="tabpanel" id="results-panel-forecast" aria-labelledby="results-tab-forecast" hidden={resultsTab !== "forecast"} className="space-y-6">
+              {lapsed ? (
+                <ProLapsedLock title="Forecast & scenarios" paywall={paywall} />
+              ) : (
+              <>
               <PanelBoundary title="Projection chart">
                 {teaser ? (
                   <LockedSection title="Macro-Adjusted Projection" paywall={paywall} placeholder={<FakeChart />} />
@@ -1590,18 +1617,22 @@ export default function DashboardPage() {
                   <LockedSection title="Interactive Scenario Forecasting" paywall={paywall} proOnly placeholder={<FakeScenarioChat mode={mode} />} />
                 )}
               </PanelBoundary>
+              </>
+              )}
             </div>
 
             <div role="tabpanel" id="results-panel-fiscal" aria-labelledby="results-tab-fiscal" hidden={resultsTab !== "fiscal"} className="space-y-6">
               {goalTracker}
               <PanelBoundary title="Fiscal Year Tracker">
-                <FiscalYearTracker tracker={tracker} analysis={teaser ? null : rawAnalysis} id="fiscal-tracker" />
+                <FiscalYearTracker tracker={tracker} analysis={teaser || lapsed ? null : rawAnalysis} id="fiscal-tracker" />
               </PanelBoundary>
             </div>
 
             <div role="tabpanel" id="results-panel-report" aria-labelledby="results-tab-report" hidden={resultsTab !== "report"} className="space-y-6">
               <PanelBoundary title="Executive report">
-                {teaser ? (
+                {lapsed ? (
+                  <ProLapsedLock title="Executive PDF Report" paywall={paywall} />
+                ) : teaser ? (
                   <LockedSection title="Executive PDF Report" paywall={paywall} placeholder={<FakeChart />} />
                 ) : (
                   <ReportPreview
@@ -1794,7 +1825,7 @@ export default function DashboardPage() {
           reason={checkoutReason}
         />
       )}
-      {shareOpen && analysis && !teaser && (
+      {shareOpen && analysis && !teaser && !lapsed && (
         <ShareReportModal
           onClose={() => setShareOpen(false)}
           buildHtml={() => reportHtml(analysis, forecast, goalReport, inflationLabel, reportExtras)}
@@ -5393,11 +5424,17 @@ function TeaserBanner({ paywall }: { paywall: Paywall }) {
     <div className={cn(glass, "flex flex-col gap-4 border-indigo-400/20 bg-gradient-to-r from-indigo-500/10 to-transparent p-5 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between")}>
       <div>
         <p className="flex items-center gap-2 font-medium">
-          <Sparkles className="h-4 w-4 text-indigo-300" /> You&apos;re viewing the free preview
+          <Sparkles className="h-4 w-4 text-indigo-300" /> {access.sealed ? "You're viewing the free preview" : "Your free summary"}
         </p>
         <p className="mt-1 text-sm text-slate-400">
-          {access.lockedFlagCount > 0 ? `${access.lockedFlagCount} more audit flag${access.lockedFlagCount === 1 ? "" : "s"}, ` : ""}
-          the potential-savings total, the interactive Pro dashboard, rolling projections, audit deep-dives and the executive report are locked.
+          {access.sealed ? (
+            <>
+              {access.lockedFlagCount > 0 ? `${access.lockedFlagCount} more audit flag${access.lockedFlagCount === 1 ? "" : "s"}, ` : ""}
+              the potential-savings total, the interactive Pro dashboard, rolling projections, audit deep-dives and the executive report are locked.
+            </>
+          ) : (
+            "Totals and line items from the numbers you entered. Upgrade to Pro for the AI audit with savings estimates, statement scanning, rolling projections, what-if scenarios and the Executive Report."
+          )}
         </p>
         {paywall.message && <p className="mt-2 text-sm text-amber-200">{paywall.message}</p>}
       </div>
@@ -5406,25 +5443,87 @@ function TeaserBanner({ paywall }: { paywall: Paywall }) {
   );
 }
 
-/** Blurred, non-interactive placeholder with an overlay CTA. Placeholders contain no real data. */
-/** Strict paywall: shown in place of the guided form and uploader for accounts without Pro or a report credit. */
+/**
+ * Free plan note above the inputs: manual entry (guided form, goals, logged actuals) is free; scanning, the AI audit,
+ * forecasting and the Executive Report are Pro.
+ */
 function AnalysisLocked({ signedIn, onUpgrade }: { signedIn: boolean; onUpgrade: () => void }) {
   return (
-    <div className={cn(glass, "flex flex-col items-start gap-4 border-amber-300/25 bg-gradient-to-br from-amber-400/[0.07] via-transparent to-indigo-500/[0.07] p-6 sm:flex-row sm:items-center sm:justify-between")}>
+    <div className={cn(glass, "mb-4 flex flex-col items-start gap-4 border-amber-300/25 bg-gradient-to-br from-amber-400/[0.07] via-transparent to-indigo-500/[0.07] p-5 sm:flex-row sm:items-center sm:justify-between")}>
       <div className="flex items-start gap-3">
         <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-amber-400/15">
-          <Lock className="h-5 w-5 text-amber-200" aria-hidden />
+          <Sparkles className="h-5 w-5 text-amber-200" aria-hidden />
         </span>
         <div>
-          <h2 className="text-lg font-semibold">Upgrade to analyze your finances</h2>
+          <h2 className="font-semibold">You&apos;re on the free plan</h2>
           <p className="mt-1 max-w-xl text-sm text-slate-400">
-            Statement uploads, AI analyses, the full audit and the Executive Report are part of Sumhaven Pro (${PRICING.proMonthlyUsd}/month or ${PRICING.proAnnualUsd}/year). Need just one? Buy a single Executive Report for ${PRICING.reportUnlockUsd}.
+            Type your revenue and expenses into the guided form for a free summary, and set goals and log actuals any time. Statement scanning, the AI audit, forecasting and the
+            Executive Report are part of Sumhaven Pro (${PRICING.proMonthlyUsd}/month or ${PRICING.proAnnualUsd}/year), or buy a single Executive Report for ${PRICING.reportUnlockUsd}.
           </p>
         </div>
       </div>
       <button type="button" onClick={onUpgrade} className={cn(primaryBtn, "shrink-0 shadow-lg shadow-indigo-500/25")}>
-        <Sparkles className="h-4 w-4" /> {signedIn ? "See plans" : "Sign in to upgrade"}
+        <Sparkles className="h-4 w-4" /> {signedIn ? "Upgrade to Pro" : "Sign in to upgrade"}
       </button>
+    </div>
+  );
+}
+
+/** Free plan: stands in for the statement uploader. The blurred placeholder is decorative and holds no data. */
+function UploadLocked({ onUpgrade }: { onUpgrade: () => void }) {
+  return (
+    <div className={cn(glass, "relative overflow-hidden p-6")}>
+      <h2 className="flex items-center gap-2 text-lg font-semibold">
+        <Lock className="h-4 w-4 text-slate-400" aria-hidden /> Upload Statement
+      </h2>
+      <div aria-hidden inert className="pointer-events-none mt-4 select-none space-y-3 blur-sm">
+        <div className="grid h-36 place-items-center rounded-xl border-2 border-dashed border-white/15 text-sm text-slate-500">
+          <Upload className="h-6 w-6" />
+        </div>
+        {[70, 55, 82].map((w) => (
+          <div key={w} className="h-3 rounded-full bg-white/10" style={{ width: `${w}%` }} />
+        ))}
+      </div>
+      <div className="absolute inset-0 top-14 grid place-items-center p-4">
+        <div className={cn(glass, "max-w-sm bg-slate-900/85 p-5 text-center")}>
+          <Lock className="mx-auto h-6 w-6 text-indigo-300" aria-hidden />
+          <p className="mt-2 font-medium">Automatic statement scanning is a Pro feature</p>
+          <p className="mt-1 text-sm text-slate-400">Upload bank statements, card statements or P&amp;Ls and Sumhaven reads every line for you. On the free plan, use the guided form.</p>
+          <button type="button" onClick={onUpgrade} className={cn(primaryBtn, "mt-4 shadow-lg shadow-indigo-500/25")}>
+            <Sparkles className="h-4 w-4" /> Upgrade to Pro
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Pro has ended: a report generated with Pro is kept (nothing is deleted) but locked until Pro is active again.
+ * Reports bought as one-time Executive Reports never reach this.
+ */
+function ProLapsedLock({ title, paywall }: { title: string; paywall: Paywall }) {
+  return (
+    <div className={cn(glass, "relative overflow-hidden p-6")}>
+      <h2 className="flex items-center gap-2 text-lg font-semibold">
+        <Lock className="h-4 w-4 text-slate-400" aria-hidden /> {title}
+      </h2>
+      <div aria-hidden inert className="pointer-events-none mt-4 select-none blur-md">
+        <FakeChart />
+      </div>
+      <div className="absolute inset-0 top-14 grid place-items-center p-4">
+        <div className={cn(glass, "max-w-md bg-slate-900/85 p-5 text-center")}>
+          <Lock className="mx-auto h-6 w-6 text-indigo-300" aria-hidden />
+          <p className="mt-2 font-medium">Your Pro plan has ended</p>
+          <p className="mt-1 text-sm text-slate-400">
+            This report was generated with Sumhaven Pro. It&apos;s saved safely in your workspace and unlocks again as soon as you renew. Your goals and logged actuals stay available on the free plan.
+          </p>
+          <button type="button" onClick={paywall.openCheckout} disabled={!!paywall.busy} className={cn(primaryBtn, "mt-4 shadow-lg shadow-indigo-500/25")}>
+            <Sparkles className="h-4 w-4" /> Renew Pro · from ${PRICING.proMonthlyUsd}/mo
+          </button>
+          {paywall.message && <p className="mt-3 text-sm text-amber-200">{paywall.message}</p>}
+        </div>
+      </div>
     </div>
   );
 }

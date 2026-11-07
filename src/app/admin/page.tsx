@@ -8,6 +8,7 @@ import { useApp } from "@/components/AppProvider";
 import { ProfileMenu } from "@/components/ProfileMenu";
 import { cn, errorMessage, glass, secondaryBtn } from "@/components/ui";
 import type { AdminStats } from "@/app/api/admin/stats/route";
+import { useAdminRedirect } from "@/app/admin/useAdminGuard";
 
 const DATE_FMT = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
 const DAY_FMT = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
@@ -47,6 +48,7 @@ export default function AdminOverviewPage() {
   }, [apply]);
 
   const signedIn = app.ready && !!app.user;
+  useAdminRedirect(error?.status);
   useEffect(() => {
     if (!signedIn) return;
     let cancelled = false;
@@ -98,18 +100,17 @@ export default function AdminOverviewPage() {
             Sign in
           </button>
         </Status>
+      ) : error?.status === 403 ? (
+        <Status>
+          <Loader2 className="h-4 w-4 animate-spin" /> This page is only available to the Sumhaven team. Taking you to your dashboard…
+        </Status>
       ) : error ? (
         <div role="alert" className={cn(glass, "flex flex-wrap items-center gap-3 border-rose-300/30 p-5 text-sm text-rose-100")}>
           <ShieldAlert className="h-5 w-5 shrink-0 text-rose-300" />
-          <span className="flex-1">
-            {error.message}
-            {error.status === 503 && <span className="mt-1 block text-xs text-rose-200/80">Set ADMIN_EMAILS (comma-separated) and SUPABASE_SERVICE_ROLE_KEY on the server, then reload.</span>}
-          </span>
-          {error.status !== 403 && (
-            <button type="button" onClick={() => void load()} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
-              <RotateCw className="h-3.5 w-3.5" /> Retry
-            </button>
-          )}
+          <span className="flex-1">{error.message}</span>
+          <button type="button" onClick={() => void load()} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+            <RotateCw className="h-3.5 w-3.5" /> Retry
+          </button>
         </div>
       ) : !stats || !t ? (
         <Status>
@@ -117,6 +118,13 @@ export default function AdminOverviewPage() {
         </Status>
       ) : (
         <>
+          {stats.warnings?.length > 0 && (
+            <div role="status" className="mb-4 rounded-xl border border-amber-300/30 bg-amber-400/[0.07] px-4 py-3 text-sm text-amber-100">
+              {stats.warnings.map((w) => (
+                <p key={w}>{w}</p>
+              ))}
+            </div>
+          )}
           <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" aria-label="Signups">
             <Tile label="Total signups" value={t.signups.toLocaleString()} sub={`${t.confirmed.toLocaleString()} confirmed (${pct(t.confirmed, t.signups)})${stats.truncated ? " · first 20k" : ""}`} />
             <Tile label="New signups" value={t.last7.toLocaleString()} sub={`last 7 days · ${t.last30} in 30 days · ${t.today} today`} />

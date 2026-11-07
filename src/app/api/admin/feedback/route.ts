@@ -1,5 +1,4 @@
-import { requireAdmin } from "@/lib/server/admin";
-import { getAdminSupabase } from "@/lib/server/billing";
+import { adminRoute, isMissingTable, isServiceKeyRejected } from "@/lib/server/admin";
 
 /**
  * GET /api/admin/feedback — every rating + comment submitted through the in-app feedback widget, newest first,
@@ -10,6 +9,8 @@ import { getAdminSupabase } from "@/lib/server/billing";
  */
 
 const NO_STORE = { "Cache-Control": "no-store" };
+/** Submitters whose email isn't on their profile row are looked up one by one; cap that fallback. */
+const MAX_AUTH_LOOKUPS = 50;
 
 export interface AdminFeedbackRow {
   id: string;
@@ -21,12 +22,12 @@ export interface AdminFeedbackRow {
   workspaceName: string | null;
 }
 
-export async function GET(request: Request) {
-  const admin = await requireAdmin(request);
-  if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status, headers: NO_STORE });
+type FeedbackDbRow = { id: string; user_id: string; workspace_id: string | null; context: AdminFeedbackRow["context"]; rating: number; comment: string | null; created_at: string };
 
-  const db = getAdminSupabase();
-  if (!db) return Response.json({ error: "Add SUPABASE_SERVICE_ROLE_KEY to the server environment to read feedback." }, { status: 503, headers: NO_STORE });
+export async function GET(request: Request) {
+  const guard = await adminRoute(request);
+  if (!guard.ok) return guard.response;
+  const { db } = guard;
 
   const limit = Math.min(1000, Math.max(1, Number(new URL(request.url).searchParams.get("limit")) || 500));
   const { data, error } = await db
@@ -35,24 +36,36 @@ export async function GET(request: Request) {
     .order("created_at", { ascending: false })
     .limit(limit);
   if (error) {
-    console.error("[admin/feedback] query failed", error.message);
-    return Response.json({ error: "Couldn't load feedback." }, { status: 502, headers: NO_STORE });
+    console.error("[admin/feedback] query failed", error.code, error.message);
+    if (isMissingTable(error)) return Response.json({ feedback: [], truncated: false, warning: "Feedback needs migration 0003_fiscal_tracker_feedback.sql." }, { headers: NO_STORE });
+    if (isServiceKeyRejected(error)) {
+      return Response.json({ error: "Supabase rejected SUPABASE_SERVICE_ROLE_KEY. Copy the service_role (secret) key into Vercel, then redeploy.", code: "service_role" }, { status: 503, headers: NO_STORE });
+    }
+    return Response.json({ error: "Couldn't load feedback right now. Try again in a moment." }, { status: 502, headers: NO_STORE });
   }
-  const rows = (data ?? []) as { id: string; user_id: string; workspace_id: string | null; context: AdminFeedbackRow["context"]; rating: number; comment: string | null; created_at: string }[];
+  const rows = (data ?? []) as FeedbackDbRow[];
 
-  // Workspace names (one query) and submitter emails (auth admin API, per distinct user, capped).
+  // Names and emails are enrichment only: a failed lookup leaves them blank, it never hides the reviews.
   const wsIds = [...new Set(rows.map((r) => r.workspace_id).filter((x): x is string => !!x))];
-  const wsNames = new Map<string, string>();
-  if (wsIds.length) {
-    const { data: ws } = await db.from("workspaces").select("id, name").in("id", wsIds);
-    for (const w of (ws ?? []) as { id: string; name: string }[]) wsNames.set(w.id, w.name);
-  }
-  const userIds = [...new Set(rows.map((r) => r.user_id))].slice(0, 200);
-  const emails = new Map<string, string>();
+  const userIds = [...new Set(rows.map((r) => r.user_id))];
+  const [wsResult, profileResult] = await Promise.all([
+    wsIds.length ? db.from("workspaces").select("id, name").in("id", wsIds) : Promise.resolve({ data: [], error: null }),
+    userIds.length ? db.from("profiles").select("id, email").in("id", userIds) : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (wsResult.error) console.warn("[admin/feedback] workspace names unavailable", wsResult.error.message);
+  if (profileResult.error) console.warn("[admin/feedback] profile emails unavailable", profileResult.error.message);
+  const wsNames = new Map(((wsResult.data ?? []) as { id: string; name: string }[]).map((w) => [w.id, w.name]));
+  const emails = new Map(((profileResult.data ?? []) as { id: string; email: string | null }[]).filter((p) => p.email).map((p) => [p.id, p.email!]));
+
+  const missing = userIds.filter((id) => !emails.has(id)).slice(0, MAX_AUTH_LOOKUPS);
   await Promise.all(
-    userIds.map(async (id) => {
-      const { data: u } = await db.auth.admin.getUserById(id);
-      if (u.user?.email) emails.set(id, u.user.email);
+    missing.map(async (id) => {
+      try {
+        const { data: u } = await db.auth.admin.getUserById(id);
+        if (u?.user?.email) emails.set(id, u.user.email);
+      } catch {
+        /* enrichment only */
+      }
     }),
   );
 

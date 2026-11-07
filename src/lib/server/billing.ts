@@ -59,11 +59,56 @@ export function billingError(route: string, err: unknown): Response {
   return Response.json({ error: "Billing is temporarily unavailable. Please try again." }, { status: 502 });
 }
 
+/**
+ * Reads an env var the way it's often pasted into a hosting dashboard (Vercel): trims whitespace / trailing newlines
+ * and strips one pair of wrapping quotes, either of which makes Supabase reject the key ("Invalid API key").
+ */
+function cleanEnv(...names: string[]): string | null {
+  for (const name of names) {
+    const v = process.env[name]?.trim().replace(/^(['"])(.*)\1$/, "$2").trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+/** Supabase project URL (the public one is inlined at build time; SUPABASE_URL also works server-side). */
+const supabaseUrl = () => cleanEnv("NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_URL")?.replace(/\/+$/, "") ?? null;
+/** Service-role key. Supabase's newer "secret" key (sb_secret_…) is accepted under either name. */
+const serviceKey = () => cleanEnv("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEY");
+
+/**
+ * Why the service-role client can't be used, or null when it's configured. Catches the most common deployment
+ * mistake — the anon / publishable key pasted as SUPABASE_SERVICE_ROLE_KEY — which otherwise surfaces later as an
+ * opaque "User not allowed" from the auth admin API.
+ */
+export function serviceRoleProblem(): string | null {
+  if (!supabaseUrl()) return "NEXT_PUBLIC_SUPABASE_URL is missing from the server environment.";
+  const key = serviceKey();
+  if (!key) return "SUPABASE_SERVICE_ROLE_KEY is missing from the server environment (add it in Vercel → Settings → Environment Variables, then redeploy).";
+  if (key.startsWith("sb_publishable_")) return "SUPABASE_SERVICE_ROLE_KEY holds the publishable key. Use the secret / service_role key from Supabase → Project Settings → API.";
+  const parts = key.split(".");
+  if (parts.length === 3) {
+    try {
+      const role = (JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as { role?: unknown }).role;
+      if (role && role !== "service_role") return `SUPABASE_SERVICE_ROLE_KEY holds the "${String(role)}" key. Use the service_role key from Supabase → Project Settings → API.`;
+    } catch {
+      /* not a JWT we can read: let Supabase decide */
+    }
+  }
+  return null;
+}
+
+let adminClient: { key: string; client: SupabaseClient } | null = null;
+
 export function getAdminSupabase(): SupabaseClient | null {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) return null;
-  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+  const url = supabaseUrl();
+  const key = serviceKey();
+  if (!url || !key || serviceRoleProblem()) return null;
+  const cacheKey = `${url}|${key}`;
+  if (adminClient?.key !== cacheKey) {
+    adminClient = { key: cacheKey, client: createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }) };
+  }
+  return adminClient.client;
 }
 
 export function appOrigin(request: Request): string {

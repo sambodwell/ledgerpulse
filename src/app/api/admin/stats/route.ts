@@ -1,6 +1,5 @@
 import type { User } from "@supabase/supabase-js";
-import { adminEmails, requireAdmin } from "@/lib/server/admin";
-import { getAdminSupabase } from "@/lib/server/billing";
+import { adminEmails, adminRoute, isMissingTable, isServiceKeyRejected } from "@/lib/server/admin";
 
 /**
  * GET /api/admin/stats — signups and conversion analytics for the admin overview. Admin-only (ADMIN_EMAILS); reads
@@ -31,6 +30,8 @@ export interface AdminStats {
   recent: { email: string | null; createdAt: string; confirmed: boolean; source: string; tier: "free" | "pro" }[];
   feedback: { total: number; average: number | null; last7: number; byContext: { context: string; count: number; average: number | null }[] };
   truncated: boolean;
+  /** Sections that couldn't be loaded (shown as a note; the rest of the overview still renders). */
+  warnings: string[];
 }
 
 const sourceOf = (u: User) => {
@@ -39,10 +40,10 @@ const sourceOf = (u: User) => {
 };
 
 export async function GET(request: Request) {
-  const admin = await requireAdmin(request);
-  if (!admin.ok) return Response.json({ error: admin.error }, { status: admin.status, headers: NO_STORE });
-  const db = getAdminSupabase();
-  if (!db) return Response.json({ error: "Add SUPABASE_SERVICE_ROLE_KEY to the server environment to read analytics." }, { status: 503, headers: NO_STORE });
+  const guard = await adminRoute(request);
+  if (!guard.ok) return guard.response;
+  const { db } = guard;
+  const warnings: string[] = [];
 
   // All auth users (paged), minus the team's own accounts.
   const staff = adminEmails();
@@ -51,8 +52,16 @@ export async function GET(request: Request) {
   for (let page = 1; ; page++) {
     const { data, error } = await db.auth.admin.listUsers({ page, perPage: 1000 });
     if (error) {
-      console.error("[admin/stats] listUsers failed", error.message);
-      return Response.json({ error: "Couldn't load users." }, { status: 502, headers: NO_STORE });
+      console.error("[admin/stats] listUsers failed", error.status, error.message);
+      // A rejected key is a configuration problem for the whole page; anything else is noted and the rest still loads.
+      if (isServiceKeyRejected(error)) {
+        return Response.json(
+          { error: "Supabase rejected SUPABASE_SERVICE_ROLE_KEY. Copy the service_role (secret) key from Supabase → Project Settings → API into Vercel, then redeploy.", code: "service_role" },
+          { status: 503, headers: NO_STORE },
+        );
+      }
+      warnings.push("Signups couldn't be loaded right now; refresh to try again.");
+      break;
     }
     users.push(...data.users.filter((u) => !staff.has(u.email?.toLowerCase() ?? "")));
     if (data.users.length < 1000) break;
@@ -62,11 +71,18 @@ export async function GET(request: Request) {
     }
   }
 
-  const [{ data: profiles, error: profileError }, { data: feedback }] = await Promise.all([
+  const [{ data: profiles, error: profileError }, { data: feedback, error: feedbackError }] = await Promise.all([
     db.from("profiles").select("id,subscription_tier,subscription_status,stripe_customer_id,report_unlocks").limit(MAX_USERS),
     db.from("user_feedback").select("rating,context,created_at").order("created_at", { ascending: false }).limit(10_000),
   ]);
-  if (profileError) console.error("[admin/stats] profiles query failed", profileError.message);
+  if (profileError) {
+    console.error("[admin/stats] profiles query failed", profileError.code, profileError.message);
+    warnings.push("Plan data couldn't be loaded, so Pro and paid counts may read zero.");
+  }
+  if (feedbackError) {
+    console.error("[admin/stats] feedback query failed", feedbackError.code, feedbackError.message);
+    warnings.push(isMissingTable(feedbackError) ? "Feedback needs migration 0003_fiscal_tracker_feedback.sql." : "Feedback couldn't be loaded right now.");
+  }
   type P = { id: string; subscription_tier: string; subscription_status: string | null; stripe_customer_id: string | null; report_unlocks: number };
   const byId = new Map(((profiles ?? []) as P[]).map((p) => [p.id, p]));
 
@@ -74,7 +90,7 @@ export async function GET(request: Request) {
   const startOfToday = new Date(new Date().toISOString().slice(0, 10)).getTime();
   const isPro = (p?: P) => p?.subscription_tier === "pro";
   /** Pro from an access code / manual grant rather than a Stripe subscription. */
-  const viaCode = (p?: P) => isPro(p) && (!p!.stripe_customer_id || p!.subscription_status === "promo" || p!.subscription_status === "admin");
+  const viaCode = (p?: P) => isPro(p) && (!p!.stripe_customer_id || ["promo", "vip", "admin"].includes(p!.subscription_status ?? ""));
   const paid = (p?: P) => !!p?.stripe_customer_id;
 
   const origins = new Map<string, OriginRow>();
@@ -126,6 +142,7 @@ export async function GET(request: Request) {
       byContext: contexts.map((c) => ({ context: c, count: fb.filter((f) => f.context === c).length, average: avg(fb.filter((f) => f.context === c)) })),
     },
     truncated,
+    warnings,
   };
   return Response.json(stats, { headers: NO_STORE });
 }

@@ -39,7 +39,7 @@ export function SignupClient({ searchParams }: { searchParams: Promise<Query> })
         <div className="absolute -top-40 left-1/4 h-[28rem] w-[28rem] rounded-full bg-indigo-600/20 blur-[120px]" />
       </div>
       <div className={cn(glass, "relative w-full max-w-md p-6")}>
-        <BrandLogo height={28} preload />
+        <BrandLogo height={28} />
         <h1 className="mt-1 text-2xl font-semibold">{mode === "signin" ? "Sign in to continue" : "Create your account"}</h1>
         <p className="mt-2 flex items-start gap-2 text-sm text-slate-400">
           <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />

@@ -150,13 +150,3 @@ body {
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
-/* Theme-matched Sumhaven logo (BrandLogo): light ink on dark mode, dark ink on light mode. */
-.brand-logo-light {
-  display: none;
-}
-:root[data-theme="light"] .brand-logo-dark {
-  display: none;
-}
-:root[data-theme="light"] .brand-logo-light {
-  display: block;
-}

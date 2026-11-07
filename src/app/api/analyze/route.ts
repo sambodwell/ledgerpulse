@@ -33,7 +33,7 @@ import {
 import { isSupabaseConfigured } from "@/lib/supabase";
 import { detectStatementPeriod, periodFromModel, type StatementPeriod } from "@/lib/statementPeriod";
 import { DOCUMENT_KINDS, REVIEW_FLAG_KINDS, type ReviewFlag } from "@/lib/batchStatements";
-import { analysisGate, buildAccess, consumeAiQuery, consumeReportUnlock, resolveViewer, unseal, type Viewer } from "@/lib/server/entitlements";
+import { analysisGate, buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, resolveViewer, unseal, type Viewer } from "@/lib/server/entitlements";
 
 /**
  * POST /api/analyze
@@ -792,6 +792,31 @@ async function respondWithAnalysis(full: FinancialAnalysis, viewer: Viewer) {
   return json({ analysis: full, access: buildAccess(full, viewer, "full", null) } satisfies AnalysisResponse);
 }
 
+/**
+ * Free manual input: the owner's own revenue and expense lines, totalled and checked against the rule-based
+ * missing-category / budget rules — no model call, so it costs nothing. Returned as a teaser: the projection, AI
+ * audit, deep-dives, scenarios and Executive Report stay locked behind Pro (redacted here, not just blurred).
+ */
+function basicManualSummary(input: Extract<AnalysisInput, { kind: "form" }>, viewer: Viewer) {
+  const top = [...input.revenue].sort((a, b) => b.amount - a.amount)[0];
+  const personal = input.businessType === "PERSONAL_FAMILY";
+  const full = assemble(
+    {
+      businessType: input.businessType,
+      itemizedRevenue: [],
+      itemizedExpenses: [],
+      auditFlags: [],
+      missingCategories: [],
+      winnerInsight: {
+        topService: top?.label ?? "",
+        message: top ? `${top.label} is your largest ${personal ? "income source" : "revenue line"}. Upgrade to Pro for an AI audit of every line.` : "",
+      },
+    },
+    input,
+  );
+  return json({ analysis: redactForTeaser(full), access: buildAccess(full, viewer, "teaser", null) } satisfies AnalysisResponse);
+}
+
 // ---------------------------------------------------------------------------
 // Unlock
 // ---------------------------------------------------------------------------
@@ -918,8 +943,10 @@ export async function POST(request: Request) {
 
     // Previews sealed before the strict paywall can still be opened with Pro or a credit.
     if (input.kind === "unlock") return await handleUnlock(input.sealed, viewer);
-    // Everything else (reading statements, analyses, scenarios) is paid-only, checked before any model call.
+    // Everything else (reading statements, AI analyses, scenarios) is paid-only, checked before any model call.
     const gate = analysisGate(viewer);
+    // Free tier: numbers typed into the guided form still get a basic summary, built without a model call.
+    if (!gate.ok && gate.status === 402 && input.kind === "form" && input.origin === "manual") return basicManualSummary(input, viewer);
     if (!gate.ok) throw new HttpError(gate.status, gate.error);
     if (input.kind === "scenario") return await handleScenario(input.prompt, input.baseline, input.horizon, input.start, viewer);
 

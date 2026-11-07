@@ -1051,6 +1051,8 @@ export interface UserProfile {
   reportUnlocks: number;
   hasStripeCustomer: boolean;
   defaultWorkspaceId: string | null;
+  /** When time-limited (VIP code) Pro ends; null for paid / admin Pro and free accounts. */
+  proExpiresAt: string | null;
 }
 
 export interface WorkspaceProfile {

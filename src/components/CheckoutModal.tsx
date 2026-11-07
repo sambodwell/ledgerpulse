@@ -68,7 +68,8 @@ export function CheckoutModal({
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
   const [codeError, setCodeError] = useState<string | null>(null);
-  const [codeOk, setCodeOk] = useState(false);
+  /** true = accepted; a string = accepted, with time-limited (VIP) Pro ending at that ISO date. */
+  const [codeOk, setCodeOk] = useState<boolean | string>(false);
   const plan = PLANS.find((p) => p.id === interval)!;
   const working = !!busy || codeBusy;
 
@@ -86,7 +87,8 @@ export function CheckoutModal({
         body: JSON.stringify({ code: value }),
       });
       if (!res.ok) throw new Error(await errorMessage(res));
-      setCodeOk(true);
+      const out = (await res.json().catch(() => ({}))) as { expiresAt?: unknown };
+      setCodeOk(typeof out.expiresAt === "string" ? out.expiresAt : true);
       await onUnlocked();
     } catch (err) {
       setCodeError(err instanceof Error ? err.message : "Couldn't verify the code.");
@@ -204,7 +206,7 @@ export function CheckoutModal({
       <div className="mt-4 border-t border-white/10 pt-4 text-sm">
         {codeOk ? (
           <p className="flex items-center gap-2 text-emerald-200" role="status">
-            <ShieldCheck className="h-4 w-4" /> Access code accepted. Pro is unlocked{busy === "unlock" ? ", opening your full report…" : "."}
+            <ShieldCheck className="h-4 w-4" /> Access code accepted. Pro is unlocked{typeof codeOk === "string" ? ` until ${new Date(codeOk).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}` : ""}{busy === "unlock" ? ", opening your full report…" : "."}
           </p>
         ) : !showCode ? (
           <button type="button" onClick={() => setShowCode(true)} className="inline-flex items-center gap-1.5 text-amber-200 hover:text-amber-100">

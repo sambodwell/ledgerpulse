@@ -10,6 +10,7 @@
 import { createClient, type Session, type SupabaseClient, type User } from "@supabase/supabase-js";
 import { clearAllDrafts } from "@/lib/formDraft";
 import { signupMetadata } from "@/lib/attribution";
+import { vipLapsed } from "@/lib/proAccess";
 import {
   isAnalysisResponse,
   isBusinessType,
@@ -243,20 +244,25 @@ interface ProfileRow {
   report_unlocks: number;
   stripe_customer_id: string | null;
   default_workspace_id: string | null;
+  /** Migration 0009; absent on older databases. */
+  pro_expires_at?: string | null;
 }
 
 const PROFILE_COLUMNS = "id,email,plan_category,subscription_tier,subscription_status,report_unlocks,stripe_customer_id,default_workspace_id";
 
 export function toUserProfile(row: ProfileRow): UserProfile {
+  // Time-limited VIP Pro reads as free the moment it lapses, even before the server writes the downgrade.
+  const pro = row.subscription_tier === "pro" && !vipLapsed(row.subscription_status, row.pro_expires_at);
   return {
     id: row.id,
     email: row.email,
     planCategory: (PLAN_CATEGORIES as readonly string[]).includes(row.plan_category) ? (row.plan_category as PlanCategory) : "SMALL_BUSINESS",
-    tier: row.subscription_tier === "pro" ? "pro" : "free",
+    tier: pro ? "pro" : "free",
     subscriptionStatus: row.subscription_status,
     reportUnlocks: Math.max(0, row.report_unlocks ?? 0),
     hasStripeCustomer: !!row.stripe_customer_id,
     defaultWorkspaceId: row.default_workspace_id,
+    proExpiresAt: row.subscription_status === "vip" ? row.pro_expires_at ?? null : null,
   };
 }
 
@@ -265,7 +271,9 @@ export async function fetchProfile(client: SupabaseClient | null = getSupabase()
   if (!client) return null;
   const id = userId ?? (await client.auth.getUser()).data.user?.id;
   if (!id) return null;
-  const { data, error } = await client.from("profiles").select(PROFILE_COLUMNS).eq("id", id).maybeSingle<ProfileRow>();
+  let { data, error } = await client.from("profiles").select(`${PROFILE_COLUMNS},pro_expires_at`).eq("id", id).maybeSingle<ProfileRow>();
+  // 42703: migration 0009 not applied yet, so there are no VIP expiries to read.
+  if (error?.code === "42703") ({ data, error } = await client.from("profiles").select(PROFILE_COLUMNS).eq("id", id).maybeSingle<ProfileRow>());
   if (error) throw new Error(error.message);
   return data ? toUserProfile(data) : null;
 }

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { resolveViewer } from "@/lib/server/entitlements";
 import { appOrigin, getAdminSupabase } from "@/lib/server/billing";
 import { MAX_SHARE_HTML, SHARE_TTL_DAYS, sanitizeReportHtml, type ShareTtlDays } from "@/lib/reportShare";
+import { reportLockedFor } from "@/lib/proAccess";
 
 /**
  * Shareable Executive Report links (table: report_shares, migration 0008).
@@ -80,6 +81,14 @@ export async function POST(request: Request) {
     const { data } = await viewer.db.from("workspaces").select("id").eq("id", body.workspaceId).maybeSingle<{ id: string }>();
     if (!data) return fail("That workspace isn't yours.", 403);
     workspaceId = data.id;
+    // A report generated with Pro can only be shared while Pro is active; one bought as an Executive Report always can.
+    if (viewer.tier !== "pro") {
+      const { data: saved } = await viewer.db.from("workspace_reports").select("report").eq("workspace_id", workspaceId).maybeSingle<{ report: unknown }>();
+      const access = (saved?.report as { access?: { level?: unknown; tier?: unknown } } | null)?.access;
+      if (access && (access.level === "full" || access.level === "teaser") && reportLockedFor({ level: access.level, tier: access.tier === "pro" ? "pro" : "free" }, false)) {
+        return fail("This report was generated with Sumhaven Pro. Renew Pro to share it.", 402);
+      }
+    }
   }
 
   const now = Date.now();

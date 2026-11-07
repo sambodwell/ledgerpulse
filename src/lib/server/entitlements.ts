@@ -42,6 +42,8 @@ async function lookupViewer(request: Request): Promise<Viewer> {
     const profile = await fetchProfile(db, data.user.id);
     // Admin override: ADMIN_EMAILS accounts are permanently Pro, whatever the stored row says.
     if (admin && profile?.tier !== "pro") await persistAdminPro(data.user.id);
+    // Time-limited VIP Pro that has lapsed (fetchProfile already reads it as free): write the downgrade back.
+    else if (!admin && profile?.subscriptionStatus === "vip" && profile.tier === "free") await persistVipExpiry(data.user.id);
     return { userId: data.user.id, tier: admin ? "pro" : profile?.tier ?? "free", reportUnlocks: profile?.reportUnlocks ?? 0, admin, db };
   } catch (err) {
     console.error("[entitlements] profile lookup failed", err instanceof Error ? err.message : err);
@@ -55,6 +57,14 @@ async function persistAdminPro(userId: string): Promise<void> {
   if (!adminDb) return; // still Pro server-side via resolveViewer; the badge just won't show until the key is set
   const { error } = await adminDb.from("profiles").update({ subscription_tier: "pro", subscription_status: "admin" }).eq("id", userId);
   if (error) console.error("[entitlements] admin Pro override failed", error.message);
+}
+
+/** Returns a lapsed VIP account to the free tier. Guarded on status so a just-started paid subscription is never undone. */
+async function persistVipExpiry(userId: string): Promise<void> {
+  const adminDb = getAdminSupabase();
+  if (!adminDb) return; // still free everywhere: both server and browser read the lapsed expiry as free
+  const { error } = await adminDb.from("profiles").update({ subscription_tier: "free", subscription_status: "vip_expired" }).eq("id", userId).eq("subscription_status", "vip");
+  if (error) console.error("[entitlements] VIP expiry write failed", error.message);
 }
 
 /**

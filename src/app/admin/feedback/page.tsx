@@ -8,19 +8,20 @@ import { useApp } from "@/components/AppProvider";
 import { ProfileMenu } from "@/components/ProfileMenu";
 import { cn, errorMessage, glass, inputCls, secondaryBtn } from "@/components/ui";
 import type { AdminFeedbackRow } from "@/app/api/admin/feedback/route";
+import { useAdminRedirect } from "@/app/admin/useAdminGuard";
 
 type Context = AdminFeedbackRow["context"];
 const CONTEXT_LABEL: Record<Context, string> = { report: "Report", audit: "Audit", tracker: "Tracker" };
 const DATE_FMT = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
 
-type FetchResult = { ok: true; feedback: AdminFeedbackRow[]; truncated: boolean; at: number } | { ok: false; status: number; message: string };
+type FetchResult = { ok: true; feedback: AdminFeedbackRow[]; truncated: boolean; warning: string | null; at: number } | { ok: false; status: number; message: string };
 
 async function fetchFeedback(): Promise<FetchResult> {
   try {
     const res = await fetch("/api/admin/feedback", { headers: await authHeaders(), cache: "no-store" });
     if (!res.ok) return { ok: false, status: res.status, message: await errorMessage(res) };
-    const data = (await res.json()) as { feedback: AdminFeedbackRow[]; truncated: boolean };
-    return { ok: true, feedback: data.feedback, truncated: data.truncated, at: Date.now() };
+    const data = (await res.json()) as { feedback?: AdminFeedbackRow[]; truncated?: boolean; warning?: string };
+    return { ok: true, feedback: Array.isArray(data.feedback) ? data.feedback : [], truncated: !!data.truncated, warning: data.warning ?? null, at: Date.now() };
   } catch (e) {
     return { ok: false, status: 0, message: e instanceof Error ? e.message : "Couldn't load feedback." };
   }
@@ -31,6 +32,7 @@ export default function AdminFeedbackPage() {
   const app = useApp();
   const [rows, setRows] = useState<AdminFeedbackRow[] | null>(null);
   const [truncated, setTruncated] = useState(false);
+  const [warning, setWarning] = useState<string | null>(null);
   /** When the data was fetched (for "last 7 days"); read in the event handler, never during render. */
   const [loadedAt, setLoadedAt] = useState(0);
   const [error, setError] = useState<{ status: number; message: string } | null>(null);
@@ -44,6 +46,7 @@ export default function AdminFeedbackPage() {
     if (r.ok) {
       setRows(r.feedback);
       setTruncated(r.truncated);
+      setWarning(r.warning);
       setLoadedAt(r.at);
       setError(null);
     } else setError({ status: r.status, message: r.message });
@@ -57,6 +60,7 @@ export default function AdminFeedbackPage() {
   }, [apply]);
 
   const signedIn = app.ready && !!app.user;
+  useAdminRedirect(error?.status);
   useEffect(() => {
     if (!signedIn) return;
     let cancelled = false;
@@ -139,18 +143,17 @@ export default function AdminFeedbackPage() {
             Sign in
           </button>
         </Status>
+      ) : error?.status === 403 ? (
+        <Status>
+          <Loader2 className="h-4 w-4 animate-spin" /> This page is only available to the Sumhaven team. Taking you to your dashboard…
+        </Status>
       ) : error ? (
         <div role="alert" className={cn(glass, "flex flex-wrap items-center gap-3 border-rose-300/30 p-5 text-sm text-rose-100")}>
           <ShieldAlert className="h-5 w-5 shrink-0 text-rose-300" />
-          <span className="flex-1">
-            {error.message}
-            {error.status === 503 && <span className="mt-1 block text-xs text-rose-200/80">Set ADMIN_EMAILS (comma-separated) and SUPABASE_SERVICE_ROLE_KEY on the server, then reload.</span>}
-          </span>
-          {error.status !== 403 && (
-            <button type="button" onClick={() => void load()} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
-              <RotateCw className="h-3.5 w-3.5" /> Retry
-            </button>
-          )}
+          <span className="flex-1">{error.message}</span>
+          <button type="button" onClick={() => void load()} className={cn(secondaryBtn, "px-3 py-1.5 text-xs")}>
+            <RotateCw className="h-3.5 w-3.5" /> Retry
+          </button>
         </div>
       ) : !rows ? (
         <Status>
@@ -158,6 +161,11 @@ export default function AdminFeedbackPage() {
         </Status>
       ) : (
         <>
+          {warning && (
+            <p role="status" className="mb-4 rounded-xl border border-amber-300/30 bg-amber-400/[0.07] px-4 py-3 text-sm text-amber-100">
+              {warning}
+            </p>
+          )}
           {/* Summary */}
           <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" aria-label="Summary">
             <Tile label="Average rating" value={stats.avg != null ? stats.avg.toFixed(2) : "—"} sub={<Stars n={Math.round(stats.avg ?? 0)} />} />

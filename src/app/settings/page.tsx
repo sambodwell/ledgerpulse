@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, Briefcase, Check, CheckCircle2, CreditCard, FileText, Home, Infinity as InfinityIcon, Loader2, Pencil, Plus, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
+import { AlertTriangle, Briefcase, Check, CheckCircle2, CreditCard, FileText, Home, Infinity as InfinityIcon, KeyRound, Loader2, Pencil, Plus, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
 import {
   BUSINESS_ONLY_TYPES,
   BUSINESS_TYPE_LABELS,
@@ -157,10 +157,11 @@ function PlanCategoryCard() {
   );
 }
 
-function planLabel(isPro: boolean, status: string | null | undefined): string {
+function planLabel(isPro: boolean, status: string | null | undefined, expiresAt: string | null | undefined): string {
   if (!isPro) return "Free";
   if (status === "admin") return "Pro · Admin";
   if (status === "promo") return "Pro · VIP access";
+  if (status === "vip") return expiresAt ? `Pro · VIP until ${new Date(expiresAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}` : "Pro · VIP access";
   return "Pro";
 }
 
@@ -201,7 +202,7 @@ function SubscriptionCard() {
       <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3">
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
           <dt className="text-xs uppercase tracking-wide text-slate-500">Plan</dt>
-          <dd className="mt-1 font-medium">{planLabel(isPro, profile?.subscriptionStatus)}</dd>
+          <dd className="mt-1 font-medium">{planLabel(isPro, profile?.subscriptionStatus, profile?.proExpiresAt)}</dd>
         </div>
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
           <dt className="text-xs uppercase tracking-wide text-slate-500">Status</dt>
@@ -249,6 +250,9 @@ function SubscriptionCard() {
               <Sparkles className="h-4 w-4" /> Upgrade to Pro (${PRICING.proMonthlyUsd}/mo or ${PRICING.proAnnualUsd}/yr)
             </button>
           </PlanCard>
+          <button type="button" onClick={() => setPlansOpen(true)} disabled={!!busy} className="inline-flex items-center gap-1.5 text-sm text-amber-200 hover:text-amber-100 sm:col-span-2">
+            <KeyRound className="h-4 w-4" aria-hidden /> Have a VIP access code? Redeem it here
+          </button>
         </div>
       )}
       {plansOpen && (

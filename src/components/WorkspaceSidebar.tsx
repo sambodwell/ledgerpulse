@@ -153,7 +153,7 @@ function SidebarContent({ documents, onOpenWorkspaceSettings, onCreate, onNaviga
   return (
     <div className="flex min-h-full flex-1 flex-col gap-5 px-4 py-5">
       <Link href="/dashboard" onClick={onNavigate} aria-label="Sumhaven home" className="flex items-center px-1">
-        <BrandLogo height={30} preload />
+        <BrandLogo height={30} />
       </Link>
 
       {/* Which book you're in */}
