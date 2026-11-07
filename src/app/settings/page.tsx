@@ -227,13 +227,13 @@ function SubscriptionCard() {
         <div>
           <p className="font-medium text-slate-100">What is a full-report credit?</p>
           <p className="mt-0.5 text-slate-400">
-            Every analysis starts as a free preview (totals and the top audit flag). One credit upgrades one analysis to the full audit: every flag with
-            its savings estimate, the 12-month projection and the downloadable Executive PDF report. Credits are bought one at a time (${PRICING.reportUnlockUsd}{" "}
+            Analyses need Pro or a one-time Executive Report credit. One credit pays for one analysis with the full audit: every flag with
+            its savings estimate, the 12-month projection and the downloadable, shareable Executive PDF report. Credits are bought one at a time (${PRICING.reportUnlockUsd}{" "}
             each), never expire and work in any workspace.
             {isPro ? " Pro includes unlimited full reports, so your credits are kept untouched while you're subscribed." : ""}
           </p>
           {!isPro && !!profile?.reportUnlocks && (
-            <p className="mt-1 text-xs text-indigo-200">You have {creditsLabel(profile.reportUnlocks)}. Use one from any free preview on the dashboard.</p>
+            <p className="mt-1 text-xs text-indigo-200">You have {creditsLabel(profile.reportUnlocks)}. It&apos;s used automatically on your next analysis.</p>
           )}
         </div>
       </div>

@@ -35,6 +35,7 @@ import {
   CalendarDays,
   LineChart as LineChartIcon,
   Settings2,
+  Share2,
   ShieldAlert,
   ShieldCheck,
   BadgeCheck,
@@ -116,7 +117,8 @@ import { StatementMonthPicker, statementMonthOptions } from "@/components/dashbo
 import { DocumentsHub } from "@/components/dashboard/DocumentsHub";
 import { AuditDeepDive } from "@/components/dashboard/AuditDeepDive";
 import { BrandLogo } from "@/components/BrandLogo";
-import { CheckoutModal, type CheckoutBusy, type CheckoutKind } from "@/components/CheckoutModal";
+import { CheckoutModal, type CheckoutBusy, type CheckoutKind, type PaywallReason } from "@/components/CheckoutModal";
+import { ShareReportModal } from "@/components/dashboard/ShareReportModal";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "@/lib/formDraft";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
 import { useApp } from "@/components/AppProvider";
@@ -126,6 +128,7 @@ import { AppShell } from "@/components/WorkspaceSidebar";
 import { LEGAL_DISCLAIMER } from "@/components/Footer";
 import { CHART, COLOR, ChartTooltip, axisProps, esc, monthTick, printHtml, signedUsd } from "@/components/dashboard/chartKit";
 import { downloadHtmlAsPdf, pdfFileName } from "@/lib/pdfDownload";
+import { REPORT_CSS } from "@/lib/reportShare";
 import { ForecastControls, SeasonalityHelp } from "@/components/dashboard/ForecastControls";
 import { ScenarioPanel, scenarioExamples } from "@/components/dashboard/ScenarioPanel";
 import { FiscalYearTracker, ImplementedToggle, toggleImplemented, type GoalReport } from "@/components/dashboard/FiscalYearTracker";
@@ -423,8 +426,14 @@ export default function DashboardPage() {
   const [paywallMsg, setPaywallMsg] = useState<string | null>(null);
   const [pendingUnlock, setPendingUnlock] = useState<{ sealed: string; wsKey: string } | null>(null);
   const [confirmingCheckout, setConfirmingCheckout] = useState(false);
-  /** The post-analysis paywall modal. Opens on its own when a free account's analysis comes back as a preview. */
+  /** The paywall modal. Opens before an analysis for accounts without Pro or a report credit (strict paywall). */
   const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [checkoutReason, setCheckoutReason] = useState<PaywallReason>("analyze");
+  const openPaywall = useCallback((reason: PaywallReason) => {
+    setCheckoutReason(reason);
+    setCheckoutOpen(true);
+  }, []);
+  const [shareOpen, setShareOpen] = useState(false);
   const [checkoutNotice, setCheckoutNotice] = useState<string | null>(null);
   /**
    * Projection start month + horizon + seasonality / inflation, shared by the baseline chart, scenarios, KPIs and the
@@ -504,6 +513,10 @@ export default function DashboardPage() {
   const inputsOpen = inputsOverride ?? (!hydrating && !hasSavedData);
 
   const { setUiHints, refreshProfile } = app;
+  /** Strict paywall: Pro (incl. admin / access code) or an unspent one-time report credit is needed to analyze. */
+  const paidPlan = DEV_UNLOCK || app.profile?.tier === "pro";
+  const reportCredits = app.profile?.reportUnlocks ?? 0;
+  const canAnalyze = paidPlan || reportCredits > 0;
   useEffect(
     () =>
       setUiHints({
@@ -559,6 +572,7 @@ export default function DashboardPage() {
   };
   /** "Upload More Documents": opens the file picker right away (inside the click) and brings the uploader / review into view. */
   const uploadMore = () => {
+    if (!canAnalyze) return openPaywall("analyze");
     uploadMoreRef.current?.();
     revealUploader();
   };
@@ -580,12 +594,19 @@ export default function DashboardPage() {
       setPaywallMsg(null);
       try {
         const res = await post(init);
+        if (res.status === 402) {
+          // Strict paywall: no Pro and no report credit. Nothing was analyzed or charged.
+          const msg = await errorMessage(res);
+          if (!opts.quiet) openPaywall("analyze");
+          throw new Error(msg);
+        }
         if (!res.ok) throw new Error(await errorMessage(res));
         const data: unknown = await res.json();
         if (!isAnalysisResponse(data)) throw new Error("Received an unexpected response from the analysis service.");
         setResults((r) => ({ ...r, [targetKey]: data }));
-        // High-intent moment: the preview is on screen, the Pro dashboard behind it is locked.
-        if (!opts.quiet && data.access.level === "teaser" && data.access.tier !== "pro") setCheckoutOpen(true);
+        // A one-time report credit was spent on this run: pick up the new balance.
+        if (data.access.tier !== "pro") void refreshProfile();
+        if (!opts.quiet && data.access.level === "teaser" && data.access.tier !== "pro") openPaywall("preview");
         // Every run is kept as its own version; the previous report stays restorable from Report history.
         recordVersion(targetKey, data, {
           source: opts.source ?? "analysis",
@@ -615,7 +636,7 @@ export default function DashboardPage() {
         setLoading(false);
       }
     },
-    [post, recordVersion],
+    [post, recordVersion, openPaywall, refreshProfile],
   );
 
   /**
@@ -654,7 +675,9 @@ export default function DashboardPage() {
   );
   const rebuildSource = activeWsId ? rebuildPayload(activeWsId) : null;
   const canRebuild = !!rebuildSource;
+  // Background rebuilds are Pro-only: for a one-time-report account each run would silently spend a credit.
   useEffect(() => {
+    if (!paidPlan) return;
     if (!activeWsId || current || loading || reportStatus[activeWsId] !== "ok" || !(activeWsId in docsByWs) || rebuildTried.current.has(activeWsId)) return;
     // Saved documents first; otherwise even one or two logged months (from any point in the year) build the report, so
     // the overview, forecast and executive report never sit empty while the workspace has data. Logged months are only
@@ -663,7 +686,7 @@ export default function DashboardPage() {
     if (!fromDocs && !(tracker.workspaceId === activeWsId && trackerActuals && payloadFromActuals(trackerActuals, formDefaultType))) return;
     const t = setTimeout(() => void rebuildFromDocuments(activeWsId), 0);
     return () => clearTimeout(t);
-  }, [activeWsId, current, loading, reportStatus, docsByWs, formDefaultType, rebuildFromDocuments, tracker.workspaceId, trackerActuals]);
+  }, [paidPlan, activeWsId, current, loading, reportStatus, docsByWs, formDefaultType, rebuildFromDocuments, tracker.workspaceId, trackerActuals]);
 
   /** "Re-analyze all N months": one fresh report across every saved document, kept as a new version. */
   const reanalyzeAll = async () => {
@@ -935,7 +958,7 @@ export default function DashboardPage() {
         checkout,
         openCheckout: () => {
           setPaywallMsg(null);
-          setCheckoutOpen(true);
+          openPaywall(current.access.level === "teaser" ? "preview" : "upgrade");
         },
         unlock: () => {
           if (!app.user) return app.openAuth("signin");
@@ -1270,8 +1293,17 @@ export default function DashboardPage() {
         )}
 
         <div id="analysis-inputs" className={cn(!inputsOpen && "hidden")}>
+          {!canAnalyze && (
+            <AnalysisLocked
+              signedIn={!!app.user}
+              onUpgrade={() => {
+                setPaywallMsg(null);
+                openPaywall("analyze");
+              }}
+            />
+          )}
           {/* Input selector: tabs on small screens, side-by-side on large */}
-          <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden", reviewing && "hidden")}>
+          <div role="tablist" aria-label="Input method" className={cn(glass, "mb-4 inline-flex p-1 lg:hidden", (reviewing || !canAnalyze) && "hidden")}>
             {(
               [
                 ["form", "Guided Input Form", ClipboardList],
@@ -1291,7 +1323,7 @@ export default function DashboardPage() {
           </div>
 
           {/* items-start: a long parsed statement in one column must not stretch (and reflow) the other. */}
-          <section className="grid gap-6 lg:grid-cols-2 lg:items-start">
+          <section className={cn("grid gap-6 lg:grid-cols-2 lg:items-start", !canAnalyze && "hidden")}>
             {/* While a statement is under review the guided form steps aside so the review can use both columns. */}
             <div className={cn("min-w-0", reviewing ? "hidden" : tab !== "form" && "hidden lg:block")}>
               <PanelBoundary title="Guided form">
@@ -1391,9 +1423,14 @@ export default function DashboardPage() {
                   <Lock className="h-4 w-4" /> Download Executive PDF Report
                 </button>
               ) : (
-                <button onClick={() => void downloadReport()} disabled={reportDownloading} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
-                  {reportDownloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} {reportDownloading ? "Preparing PDF…" : "Download Executive PDF Report"}
-                </button>
+                <>
+                  <button type="button" onClick={() => setShareOpen(true)} className={cn(secondaryBtn, "text-slate-200")}>
+                    <Share2 className="h-4 w-4" /> Share report
+                  </button>
+                  <button onClick={() => void downloadReport()} disabled={reportDownloading} className={cn(primaryBtn, "shadow-lg shadow-indigo-500/25")}>
+                    {reportDownloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} {reportDownloading ? "Preparing PDF…" : "Download Executive PDF Report"}
+                  </button>
+                </>
               )}
               </div>
             </div>
@@ -1570,6 +1607,7 @@ export default function DashboardPage() {
                 ) : (
                   <ReportPreview
                     html={resultsTab === "report" ? reportHtml(analysis, forecast, goalReport, inflationLabel, reportExtras) : ""}
+                    onShare={() => setShareOpen(true)}
                     onDownload={() => void downloadReport()}
                     downloading={reportDownloading}
                     hasGoal={!!goalReport}
@@ -1754,6 +1792,16 @@ export default function DashboardPage() {
           }}
           lockedFlagCount={current?.access.level === "teaser" ? current.access.lockedFlagCount : 0}
           report={current?.access.level === "teaser" ? { credits: current.access.reportUnlocks, onUseCredit: teaserCreditUnlock } : undefined}
+          reason={checkoutReason}
+        />
+      )}
+      {shareOpen && analysis && !teaser && (
+        <ShareReportModal
+          onClose={() => setShareOpen(false)}
+          buildHtml={() => reportHtml(analysis, forecast, goalReport, inflationLabel, reportExtras)}
+          fileName={pdfFileName("Sumhaven Executive Report", ws?.name ?? null, new Date().toISOString().slice(0, 10))}
+          title={`Executive Report${ws ? ` · ${ws.name}` : ""}`}
+          workspaceId={ws?.id ?? null}
         />
       )}
     </div>
@@ -2760,7 +2808,7 @@ function ResultsTabs({ value, onChange }: { value: ResultsTab; onChange: (t: Res
 }
 
 /** Live preview of the executive PDF (same HTML that prints), in a sandboxed frame. */
-function ReportPreview({ html, onDownload, downloading, hasGoal, onSetGoal }: { html: string; onDownload: () => void; downloading: boolean; hasGoal: boolean; onSetGoal: () => void }) {
+function ReportPreview({ html, onShare, onDownload, downloading, hasGoal, onSetGoal }: { html: string; onShare: () => void; onDownload: () => void; downloading: boolean; hasGoal: boolean; onSetGoal: () => void }) {
   return (
     <div className={cn(glass, "p-4 sm:p-6")}>
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -2777,9 +2825,14 @@ function ReportPreview({ html, onDownload, downloading, hasGoal, onSetGoal }: { 
             </button>
           )}
         </div>
-        <button type="button" onClick={onDownload} disabled={downloading} className={primaryBtn}>
-          {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} {downloading ? "Preparing PDF…" : "Download PDF"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={onShare} className={secondaryBtn}>
+            <Share2 className="h-4 w-4" /> Share
+          </button>
+          <button type="button" onClick={onDownload} disabled={downloading} className={primaryBtn}>
+            {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} {downloading ? "Preparing PDF…" : "Download PDF"}
+          </button>
+        </div>
       </div>
       <div className="mt-4 overflow-hidden rounded-xl border border-white/10 bg-white">
         <iframe title="Executive report preview" srcDoc={html} sandbox="" className="h-[70vh] min-h-[28rem] w-full" />
@@ -5355,6 +5408,28 @@ function TeaserBanner({ paywall }: { paywall: Paywall }) {
 }
 
 /** Blurred, non-interactive placeholder with an overlay CTA. Placeholders contain no real data. */
+/** Strict paywall: shown in place of the guided form and uploader for accounts without Pro or a report credit. */
+function AnalysisLocked({ signedIn, onUpgrade }: { signedIn: boolean; onUpgrade: () => void }) {
+  return (
+    <div className={cn(glass, "flex flex-col items-start gap-4 border-amber-300/25 bg-gradient-to-br from-amber-400/[0.07] via-transparent to-indigo-500/[0.07] p-6 sm:flex-row sm:items-center sm:justify-between")}>
+      <div className="flex items-start gap-3">
+        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-amber-400/15">
+          <Lock className="h-5 w-5 text-amber-200" aria-hidden />
+        </span>
+        <div>
+          <h2 className="text-lg font-semibold">Upgrade to analyze your finances</h2>
+          <p className="mt-1 max-w-xl text-sm text-slate-400">
+            Statement uploads, AI analyses, the full audit and the Executive Report are part of Sumhaven Pro (${PRICING.proMonthlyUsd}/month or ${PRICING.proAnnualUsd}/year). Need just one? Buy a single Executive Report for ${PRICING.reportUnlockUsd}.
+          </p>
+        </div>
+      </div>
+      <button type="button" onClick={onUpgrade} className={cn(primaryBtn, "shrink-0 shadow-lg shadow-indigo-500/25")}>
+        <Sparkles className="h-4 w-4" /> {signedIn ? "See plans" : "Sign in to upgrade"}
+      </button>
+    </div>
+  );
+}
+
 function LockedSection({ title, paywall, placeholder, proOnly = false }: { title: string; paywall: Paywall; placeholder: ReactNode; proOnly?: boolean }) {
   return (
     <div className={cn(glass, "relative overflow-hidden p-6")}>
@@ -6316,17 +6391,7 @@ function reportHtml(a: FinancialAnalysis, settings: ForecastSettings, goal: Goal
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sumhaven Executive Report ${new Date().toISOString().slice(0, 10)}</title>
-<style>
-body{font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#111;max-width:860px;margin:40px auto;padding:0 20px}
-h1{font-size:24px;margin:0}h2{font-size:16px;margin:28px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}
-.muted{color:#666}.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:20px}
-.kpi{border:1px solid #ddd;border-radius:8px;padding:12px}.kpi b{display:block;font-size:18px;font-variant-numeric:tabular-nums}
-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}td,th{padding:6px 8px;border-bottom:1px solid #eee;text-align:right}
-td:first-child,th:first-child{text-align:left}.neg{color:#b42318}.pos{color:#047857}.warn{color:#b54708}li{margin-bottom:6px}.kpi .muted{font-size:11px}
-.pace-banner{margin-top:20px;border:2px solid;border-radius:10px;padding:14px 16px;break-inside:avoid}.pace-good{border-color:#047857;background:#ecfdf5}.pace-bad{border-color:#b42318;background:#fef3f2}
-.pace-head{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}.pace-good .pace-head{color:#047857}.pace-bad .pace-head{color:#b42318}
-@page{margin:16mm}@media print{body{margin:0;max-width:none}}
-</style></head><body>
+<style>${REPORT_CSS}</style></head><body>
 <h1>Sumhaven Executive Report</h1>
 <p class="muted">${esc(BUSINESS_TYPE_LABELS[a.businessType])} · Generated ${esc(generated)} · ${esc(macro)}</p>
 <div class="kpis">

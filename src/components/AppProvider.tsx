@@ -16,6 +16,7 @@ import {
 import type { BusinessType, UserProfile, WorkspaceMode, WorkspaceProfile } from "@/lib/schemas";
 import { AuthDialog } from "@/components/AuthDialog";
 import { DEV_UNLOCK } from "@/lib/devUnlock";
+import { captureAttribution } from "@/lib/attribution";
 
 /** Non-financial UI state shared with the chat assistant so it can talk about what's on screen. */
 export interface UiHints {
@@ -34,6 +35,8 @@ interface AppState {
   ready: boolean;
   user: User | null;
   profile: UserProfile | null;
+  /** True for ADMIN_EMAILS accounts (decided server-side); shows the admin links. Admin routes re-check it themselves. */
+  isAdmin: boolean;
   workspaces: WorkspaceProfile[];
   activeWorkspace: WorkspaceProfile | null;
   setActiveWorkspaceId: (id: string | null) => void;
@@ -54,12 +57,21 @@ interface AppState {
   setUiHints: (h: Partial<UiHints>) => void;
 }
 
-/** Best-effort: never blocks sign-in if the route is unavailable. */
-async function syncEntitlements(): Promise<void> {
+interface ServerEntitlement {
+  tier: "free" | "pro";
+  admin: boolean;
+}
+
+/** Best-effort: never blocks sign-in if the route is unavailable. Returns the server's view of the caller's plan. */
+async function syncEntitlements(): Promise<ServerEntitlement | null> {
   try {
-    await fetch("/api/account/sync", { method: "POST", headers: await authHeaders() });
+    const res = await fetch("/api/account/sync", { method: "POST", headers: await authHeaders() });
+    if (!res.ok) return null;
+    const v = (await res.json()) as { tier?: unknown; admin?: unknown };
+    return { tier: v.tier === "pro" ? "pro" : "free", admin: v.admin === true };
   } catch {
     /* offline or route unavailable: the stored profile is used as-is */
+    return null;
   }
 }
 
@@ -89,12 +101,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
     goalMetric: null,
   });
   const loadedFor = useRef<string | null | undefined>(undefined);
+  const [isAdmin, setIsAdmin] = useState(false);
+  /** Admin accounts are Pro by server decision, even before (or without) the profile row being updated. */
+  const adminPro = useRef(false);
+
+  useEffect(() => captureAttribution(), []);
 
   const refreshProfile = useCallback(async () => {
     try {
       const fetched = await fetchProfile();
-      // Local testing (NEXT_PUBLIC_DEV_UNLOCK=1): present every account as Pro, matching the server override.
-      const p = DEV_UNLOCK && fetched ? { ...fetched, tier: "pro" as const } : fetched;
+      // Local testing (NEXT_PUBLIC_DEV_UNLOCK=1) and ADMIN_EMAILS accounts: present as Pro, matching the server.
+      const p = (DEV_UNLOCK || adminPro.current) && fetched ? { ...fetched, tier: "pro" as const } : fetched;
       setProfile(p);
       return p;
     } catch (e) {
@@ -123,6 +140,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const load = async (u: User | null) => {
       setUser(u);
       if (!u) {
+        adminPro.current = false;
+        setIsAdmin(false);
         setProfile(null);
         setWorkspaces([]);
         setActiveId(null);
@@ -130,7 +149,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return;
       }
       // Server-side entitlement sync first (e.g. ADMIN_EMAILS accounts are made Pro), so the profile read below reflects it.
-      await syncEntitlements();
+      const ent = await syncEntitlements();
+      adminPro.current = !!ent?.admin;
+      setIsAdmin(!!ent?.admin);
       const [p, ws] = await Promise.all([refreshProfile(), refreshWorkspaces()]);
       if (cancelled) return;
       setActiveId((cur) => (cur && ws.some((w) => w.id === cur) ? cur : p?.defaultWorkspaceId && ws.some((w) => w.id === p.defaultWorkspaceId) ? p.defaultWorkspaceId : ws[0]?.id ?? null));
@@ -200,6 +221,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       ready,
       user,
       profile,
+      isAdmin,
       workspaces,
       activeWorkspace: workspaces.find((w) => w.id === activeId) ?? null,
       setActiveWorkspaceId,
@@ -213,7 +235,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       uiHints,
       setUiHints,
     }),
-    [ready, user, profile, workspaces, activeId, setActiveWorkspaceId, refreshProfile, refreshWorkspaces, removeWorkspace, createFreshWorkspace, freshWorkspaceId, clearFreshWorkspace, uiHints, setUiHints],
+    [ready, user, profile, isAdmin, workspaces, activeId, setActiveWorkspaceId, refreshProfile, refreshWorkspaces, removeWorkspace, createFreshWorkspace, freshWorkspaceId, clearFreshWorkspace, uiHints, setUiHints],
   );
 
   return (

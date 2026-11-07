@@ -16,10 +16,12 @@ export interface Viewer {
   userId: string | null;
   tier: SubscriptionTier;
   reportUnlocks: number;
+  /** ADMIN_EMAILS account (always Pro). */
+  admin: boolean;
   db: SupabaseClient | null;
 }
 
-const GUEST: Viewer = { userId: null, tier: "free", reportUnlocks: 0, db: null };
+const GUEST: Viewer = { userId: null, tier: "free", reportUnlocks: 0, admin: false, db: null };
 
 /** Verifies the bearer JWT with Supabase and loads the caller's billing columns. */
 export async function resolveViewer(request: Request): Promise<Viewer> {
@@ -40,10 +42,10 @@ async function lookupViewer(request: Request): Promise<Viewer> {
     const profile = await fetchProfile(db, data.user.id);
     // Admin override: ADMIN_EMAILS accounts are permanently Pro, whatever the stored row says.
     if (admin && profile?.tier !== "pro") await persistAdminPro(data.user.id);
-    return { userId: data.user.id, tier: admin ? "pro" : profile?.tier ?? "free", reportUnlocks: profile?.reportUnlocks ?? 0, db };
+    return { userId: data.user.id, tier: admin ? "pro" : profile?.tier ?? "free", reportUnlocks: profile?.reportUnlocks ?? 0, admin, db };
   } catch (err) {
     console.error("[entitlements] profile lookup failed", err instanceof Error ? err.message : err);
-    return { userId: data.user.id, tier: admin ? "pro" : "free", reportUnlocks: 0, db };
+    return { userId: data.user.id, tier: admin ? "pro" : "free", reportUnlocks: 0, admin, db };
   }
 }
 
@@ -53,6 +55,19 @@ async function persistAdminPro(userId: string): Promise<void> {
   if (!adminDb) return; // still Pro server-side via resolveViewer; the badge just won't show until the key is set
   const { error } = await adminDb.from("profiles").update({ subscription_tier: "pro", subscription_status: "admin" }).eq("id", userId);
   if (error) console.error("[entitlements] admin Pro override failed", error.message);
+}
+
+/**
+ * Strict paywall: reading statements and generating analyses / reports needs Pro (monthly, annual, admin, or an access
+ * code) or an unspent one-time Executive Report credit. Checked before any model call so free accounts cost nothing.
+ */
+export type AnalysisGate = { ok: true; via: "pro" | "credit" } | { ok: false; status: 401 | 402; error: string };
+
+export function analysisGate(viewer: Viewer): AnalysisGate {
+  if (!viewer.userId) return { ok: false, status: 401, error: "Sign in or create an account to analyze your finances." };
+  if (viewer.tier === "pro") return { ok: true, via: "pro" };
+  if (viewer.reportUnlocks > 0) return { ok: true, via: "credit" };
+  return { ok: false, status: 402, error: "Upgrade to Sumhaven Pro, or buy a one-time Executive Report, to analyze your statements." };
 }
 
 /** Atomically spends one report unlock. */

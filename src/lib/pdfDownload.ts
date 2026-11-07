@@ -80,6 +80,18 @@ function slicePages(total: number, pagePx: number, breaks: number[]): [number, n
 
 /** Renders `html` (a complete document) to a multi-page PDF and downloads it as `fileName`. */
 export async function downloadHtmlAsPdf(html: string, fileName: string): Promise<void> {
+  const pdf = await renderPdf(html, fileName);
+  // jsPDF.save() builds a Blob and clicks a download link: a direct file download, no print dialog.
+  pdf.save(fileName);
+}
+
+/** Renders `html` to a PDF File (for the Web Share API, which can hand the file to Mail, Messages, AirDrop…). */
+export async function htmlToPdfFile(html: string, fileName: string): Promise<File> {
+  const pdf = await renderPdf(html, fileName);
+  return new File([pdf.output("blob")], fileName, { type: "application/pdf" });
+}
+
+async function renderPdf(html: string, fileName: string) {
   const [{ jsPDF }, { default: html2canvas }] = await Promise.all([import("jspdf"), import("html2canvas")]);
   const frame = await loadFrame(html);
   try {
@@ -126,8 +138,7 @@ export async function downloadHtmlAsPdf(html: string, fileName: string): Promise
       pdf.setTextColor(140);
       pdf.text(`Page ${i + 1} of ${pages.length}`, PAGE.w - PAGE.margin, PAGE.h - 16, { align: "right" });
     });
-    // jsPDF.save() builds a Blob and clicks a download link: a direct file download, no print dialog.
-    pdf.save(fileName);
+    return pdf;
   } finally {
     frame.remove();
   }

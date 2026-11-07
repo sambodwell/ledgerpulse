@@ -9,6 +9,7 @@
 
 import { createClient, type Session, type SupabaseClient, type User } from "@supabase/supabase-js";
 import { clearAllDrafts } from "@/lib/formDraft";
+import { signupMetadata } from "@/lib/attribution";
 import {
   isAnalysisResponse,
   isBusinessType,
@@ -98,9 +99,63 @@ export function onAuthChange(cb: (user: User | null) => void): () => void {
   return () => data.subscription.unsubscribe();
 }
 
+/**
+ * Turns a Supabase auth error (or a raw network failure) into a sentence a person can act on. Supabase reports a
+ * request that never reached it as `AuthRetryableFetchError("Failed to fetch", status 0)`, which used to be shown as-is.
+ */
+export function friendlyAuthError(err: unknown, action: "signin" | "signup" | "resend" = "signin"): string {
+  const e = (err && typeof err === "object" ? err : {}) as { message?: unknown; code?: unknown; status?: unknown; name?: unknown };
+  const message = typeof e.message === "string" ? e.message : "";
+  const code = typeof e.code === "string" ? e.code : "";
+  const status = typeof e.status === "number" ? e.status : undefined;
+  const name = typeof e.name === "string" ? e.name : "";
+
+  // Never reached the auth server: offline, DNS, an ad/tracker blocker, or a misconfigured Supabase URL.
+  if (name === "AuthRetryableFetchError" || status === 0 || /failed to fetch|networkerror|load failed|network request failed/i.test(message)) {
+    if (status && status >= 500) return "The sign-in service is temporarily unavailable. Please try again in a minute.";
+    return "We couldn't reach the sign-in service. Check your internet connection (or pause any ad or privacy blocker for this site) and try again.";
+  }
+  switch (code) {
+    case "invalid_credentials":
+      // Supabase doesn't say which half was wrong (so accounts can't be probed); the password is the usual culprit.
+      return "Password incorrect. Check your password, and that this is the email you signed up with.";
+    case "email_not_confirmed":
+      return "Confirm your email first: click the link we sent you, then sign in.";
+    case "user_already_exists":
+    case "email_exists":
+      return "An account with this email already exists. Sign in instead.";
+    case "weak_password":
+      return message || "Choose a stronger password.";
+    case "over_request_rate_limit":
+    case "over_email_send_rate_limit":
+      return action === "resend" ? "Too many emails sent. Wait a minute before requesting another." : "Too many attempts. Wait a minute and try again.";
+    case "email_address_invalid":
+      return "That email address isn't valid.";
+    case "signup_disabled":
+      return "New sign-ups are paused right now.";
+    case "user_banned":
+      return "This account has been suspended. Contact support.";
+  }
+  if (/invalid login credentials/i.test(message)) return "Password incorrect. Check your password, and that this is the email you signed up with.";
+  return message || "Something went wrong. Please try again.";
+}
+
+/** Runs an auth call, retrying once on a network blip, and throws a friendly Error on failure. */
+async function authCall<T extends { error: unknown }>(fn: () => Promise<T>, action: "signin" | "signup" | "resend"): Promise<T> {
+  let res: T;
+  try {
+    res = await fn();
+    const err = res.error as { name?: string } | null;
+    if (err?.name === "AuthRetryableFetchError") res = await fn();
+  } catch (err) {
+    throw new Error(friendlyAuthError(err, action));
+  }
+  if (res.error) throw new Error(friendlyAuthError(res.error, action));
+  return res;
+}
+
 export async function signInWithPassword(email: string, password: string) {
-  const { error } = await requireClient().auth.signInWithPassword({ email, password });
-  if (error) throw new Error(error.message);
+  await authCall(() => requireClient().auth.signInWithPassword({ email: email.trim(), password }), "signin");
 }
 
 /**
@@ -127,24 +182,34 @@ export function safeNextPath(next: string | null | undefined, fallback = "/dashb
 /** Returns true when the project requires email confirmation before first sign-in. */
 export async function signUpWithPassword(email: string, password: string, next = "/dashboard"): Promise<{ needsConfirmation: boolean }> {
   const site = getSiteUrl();
-  const { data, error } = await requireClient().auth.signUp({
-    email,
-    password,
-    options: { emailRedirectTo: site ? `${site}/auth/callback?next=${encodeURIComponent(safeNextPath(next))}` : undefined },
-  });
-  if (error) throw new Error(error.message);
+  const { data } = await authCall(
+    () =>
+      requireClient().auth.signUp({
+        email: email.trim(),
+        password,
+        options: {
+          emailRedirectTo: site ? `${site}/auth/callback?next=${encodeURIComponent(safeNextPath(next))}` : undefined,
+          // First-touch attribution (utm / ref / referrer), read by the admin signups dashboard. No financial data.
+          data: signupMetadata(),
+        },
+      }),
+    "signup",
+  );
   return { needsConfirmation: !data.session };
 }
 
 /** Re-sends the sign-up confirmation email (Supabase rate-limits this server-side too). */
 export async function resendSignupEmail(email: string, next = "/dashboard") {
   const site = getSiteUrl();
-  const { error } = await requireClient().auth.resend({
-    type: "signup",
-    email,
-    options: { emailRedirectTo: site ? `${site}/auth/callback?next=${encodeURIComponent(safeNextPath(next))}` : undefined },
-  });
-  if (error) throw new Error(`Couldn't resend the confirmation email: ${error.message}`);
+  await authCall(
+    () =>
+      requireClient().auth.resend({
+        type: "signup",
+        email: email.trim(),
+        options: { emailRedirectTo: site ? `${site}/auth/callback?next=${encodeURIComponent(safeNextPath(next))}` : undefined },
+      }),
+    "resend",
+  );
 }
 
 export async function signOut() {

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Briefcase, CreditCard, Home, LogIn, LogOut, User as UserIcon } from "lucide-react";
+import { BarChart3, Briefcase, CreditCard, Home, LogIn, LogOut, User as UserIcon } from "lucide-react";
 import { signOut } from "@/lib/supabase";
 import { useApp } from "@/components/AppProvider";
 import { cn, glass } from "@/components/ui";
@@ -94,6 +94,11 @@ export function ProfileMenu() {
             <Link href="/settings" role="menuitem" onClick={() => setOpen(false)} className="flex items-center gap-2 rounded-lg px-3 py-2 hover:bg-white/5">
               <CreditCard className="h-4 w-4 text-slate-400" /> Account &amp; subscription
             </Link>
+            {app.isAdmin && (
+              <Link href="/admin" role="menuitem" onClick={() => setOpen(false)} className="flex items-center gap-2 rounded-lg px-3 py-2 hover:bg-white/5">
+                <BarChart3 className="h-4 w-4 text-slate-400" /> Admin: signups &amp; feedback
+              </Link>
+            )}
             {app.user ? (
               <button
                 role="menuitem"

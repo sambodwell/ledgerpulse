@@ -33,7 +33,7 @@ import {
 import { isSupabaseConfigured } from "@/lib/supabase";
 import { detectStatementPeriod, periodFromModel, type StatementPeriod } from "@/lib/statementPeriod";
 import { DOCUMENT_KINDS, REVIEW_FLAG_KINDS, type ReviewFlag } from "@/lib/batchStatements";
-import { buildAccess, consumeAiQuery, consumeReportUnlock, redactForTeaser, resolveViewer, seal, unseal, type Viewer } from "@/lib/server/entitlements";
+import { analysisGate, buildAccess, consumeAiQuery, consumeReportUnlock, resolveViewer, unseal, type Viewer } from "@/lib/server/entitlements";
 
 /**
  * POST /api/analyze
@@ -779,12 +779,17 @@ async function handleExtract(document: DocumentInput) {
   return json({ items, period, months: [], ...meta });
 }
 
-function respondWithAnalysis(full: FinancialAnalysis, viewer: Viewer) {
-  if (viewer.tier === "pro") {
-    return json({ analysis: full, access: buildAccess(full, viewer, "full", null) } satisfies AnalysisResponse);
+/**
+ * Strict paywall: there is no free teaser any more. Pro gets the full analysis; an account with a one-time Executive
+ * Report credit spends it here, only once the analysis has succeeded (a failed run never costs a credit).
+ */
+async function respondWithAnalysis(full: FinancialAnalysis, viewer: Viewer) {
+  if (viewer.tier !== "pro") {
+    const spent = await consumeReportUnlock(viewer);
+    if (!spent) throw new HttpError(402, "Upgrade to Sumhaven Pro, or buy a one-time Executive Report, to generate this analysis.");
+    viewer = { ...viewer, reportUnlocks: Math.max(0, viewer.reportUnlocks - 1) };
   }
-  const sealed = seal(full, viewer.userId);
-  return json({ analysis: redactForTeaser(full), access: buildAccess(full, viewer, "teaser", sealed) } satisfies AnalysisResponse);
+  return json({ analysis: full, access: buildAccess(full, viewer, "full", null) } satisfies AnalysisResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -911,7 +916,11 @@ export async function POST(request: Request) {
     if (!viewer.userId) throw new HttpError(401, "Sign in or create an account to analyze your finances.");
     const input = await readInput(request);
 
+    // Previews sealed before the strict paywall can still be opened with Pro or a credit.
     if (input.kind === "unlock") return await handleUnlock(input.sealed, viewer);
+    // Everything else (reading statements, analyses, scenarios) is paid-only, checked before any model call.
+    const gate = analysisGate(viewer);
+    if (!gate.ok) throw new HttpError(gate.status, gate.error);
     if (input.kind === "scenario") return await handleScenario(input.prompt, input.baseline, input.horizon, input.start, viewer);
 
     const textLength = input.kind === "text" ? input.text.length : input.kind === "extract" && input.document.kind === "text" ? input.document.text.length : 0;
@@ -926,7 +935,7 @@ export async function POST(request: Request) {
       schema: EXTRACTION_SCHEMA,
       maxTokens: 32000,
     });
-    return respondWithAnalysis(assemble(normalizeExtraction(extraction), input), viewer);
+    return await respondWithAnalysis(assemble(normalizeExtraction(extraction), input), viewer);
   } catch (err) {
     if (err instanceof HttpError) {
       return json({ error: err.message }, err.status);

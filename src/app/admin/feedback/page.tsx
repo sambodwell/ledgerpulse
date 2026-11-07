@@ -118,6 +118,12 @@ export default function AdminFeedbackPage() {
             <MessageSquareText className="h-6 w-6 text-indigo-300" /> Feedback Hub
           </h1>
           <p className="mt-1 text-sm text-slate-400">Every rating and comment from the in-app feedback widget. Visible only to the Sumhaven team.</p>
+          <nav className="mt-3 flex gap-2 text-sm" aria-label="Admin">
+            <Link href="/admin" className="rounded-lg px-3 py-1.5 text-slate-400 hover:bg-white/5 hover:text-slate-200">
+              Overview
+            </Link>
+            <span className="rounded-lg bg-white/10 px-3 py-1.5 text-slate-100">Feedback Hub</span>
+          </nav>
         </div>
         <ProfileMenu />
       </header>

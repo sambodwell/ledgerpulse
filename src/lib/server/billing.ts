@@ -5,7 +5,7 @@
  *   STRIPE_SECRET_KEY            sk_live_… / sk_test_…
  *   STRIPE_WEBHOOK_SECRET        whsec_… for /api/stripe/webhook (the legacy /api/billing/webhook path still works)
  *   STRIPE_PRICE_PRO_MONTHLY     price_… recurring $39/mo
- *   STRIPE_PRICE_PRO_ANNUAL      price_… recurring $399/yr
+ *   STRIPE_PRICE_ID_ANNUAL       price_… recurring $399/yr (STRIPE_PRICE_PRO_ANNUAL is accepted too)
  *   STRIPE_PRICE_REPORT_UNLOCK   price_… one-time $29
  *   SUPABASE_SERVICE_ROLE_KEY    lets the webhook write billing columns
  */
@@ -22,12 +22,13 @@ export const isProKind = (k: CheckoutKind) => k !== "report";
 /** Shown on card statements for Pro subscription charges (set on the Stripe Product; max 22 chars). */
 export const PRO_STATEMENT_DESCRIPTOR = "SUMHAVEN PRO";
 
-const PRICE_ENV: Record<CheckoutKind, string> = {
-  pro: "STRIPE_PRICE_PRO_MONTHLY",
-  pro_annual: "STRIPE_PRICE_PRO_ANNUAL",
-  report: "STRIPE_PRICE_REPORT_UNLOCK",
+/** Env names checked in order for each price id (the first one set wins). */
+const PRICE_ENV: Record<CheckoutKind, readonly string[]> = {
+  pro: ["STRIPE_PRICE_PRO_MONTHLY"],
+  pro_annual: ["STRIPE_PRICE_ID_ANNUAL", "STRIPE_PRICE_PRO_ANNUAL"],
+  report: ["STRIPE_PRICE_REPORT_UNLOCK"],
 };
-export const priceEnvName = (kind: CheckoutKind) => PRICE_ENV[kind];
+export const priceEnvName = (kind: CheckoutKind) => PRICE_ENV[kind].join(" / ");
 
 let stripe: Stripe | null = null;
 
@@ -40,7 +41,7 @@ export function getStripe(): Stripe | null {
 
 /** Returns the configured Stripe price id, or null if it's missing or not a `price_…` id (e.g. a `prod_…` id pasted by mistake). */
 export function priceFor(kind: CheckoutKind): string | null {
-  const id = process.env[PRICE_ENV[kind]]?.trim();
+  const id = PRICE_ENV[kind].map((name) => process.env[name]?.trim()).find(Boolean);
   return id && /^price_[A-Za-z0-9]+$/.test(id) ? id : null;
 }
 
